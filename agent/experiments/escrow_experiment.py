@@ -17,6 +17,7 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, ROOT)
+import cast_core as cc  # 下沉的 C++ escrow 内核
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -48,14 +49,14 @@ def run_strict_cas(C, N, q):
 
 
 def run_escrow(C, N, q):
-    remaining = C
-    committed = 0
+    # 下沉：约束可交换扣减由 C++ 内核 cast_core.EscrowAccount 执行（O'Neil escrow，守下界 0）。
+    # 预留可交换、互不阻塞、不重跑；任何使剩余<下界的预留被拒（不超卖）。
+    acct = cc.EscrowAccount(C, 0)
     for _ in range(N):
-        if remaining >= q:           # 原子预留（可交换、不看版本、不重跑）
-            remaining -= q
-            committed += 1
-        # 否则额度不足 → 拒绝（不超卖、不重跑）
-    return {"committed": committed, "final": remaining, "oversold": remaining < 0, "wasted": 0.0, "correct": remaining >= 0}
+        acct.reserve(q)              # 剩余-下界>=q 则授予(扣减)，否则拒绝；均不重跑
+    remaining = acct.remaining()
+    return {"committed": acct.granted(), "final": remaining,
+            "oversold": acct.oversold(), "wasted": 0.0, "correct": not acct.oversold()}
 
 
 def main():

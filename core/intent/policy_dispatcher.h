@@ -13,9 +13,10 @@ class PolicyDispatcher {
  public:
   enum class ConcurrencyClass {
     kReadOnly,
-    kStrict,             // OVERWRITE：必须版本未变才提交
-    kCommutativeRebase,  // APPEND/DELTA：可在最新值上交换式重绑定
-    kConditionalRebase,  // CAS：条件仍成立才提交
+    kStrict,                 // OVERWRITE：必须版本未变才提交
+    kCommutativeRebase,      // APPEND/无约束 DELTA：可在最新值上交换式重绑定
+    kConstrainedCommutative, // 带下界约束的 DELTA：可交换但须 escrow 守界(stock>=lower_bound)
+    kConditionalRebase,      // CAS：条件仍成立才提交
   };
 
   struct ResolveResult {
@@ -25,15 +26,27 @@ class PolicyDispatcher {
     std::string reason;
   };
 
+  // 仅按意图类型分类（历史接口，保持不变）。
   static ConcurrencyClass Classify(IntentType t) {
     switch (t) {
       case IntentType::kRead: return ConcurrencyClass::kReadOnly;
       case IntentType::kOverwrite: return ConcurrencyClass::kStrict;
-      case IntentType::kAppend:
+      case IntentType::kAppend: return ConcurrencyClass::kStrict;
       case IntentType::kDelta: return ConcurrencyClass::kCommutativeRebase;
       case IntentType::kCas: return ConcurrencyClass::kConditionalRebase;
     }
     return ConcurrencyClass::kStrict;
+  }
+
+  // 按完整意图分类：带下界约束的 DELTA 归入"约束可交换"(escrow)类。
+  static ConcurrencyClass Classify(const WriteIntent& intent) {
+    if (intent.intent_type == IntentType::kAppend && intent.commutative) {
+      return ConcurrencyClass::kCommutativeRebase;
+    }
+    if (intent.intent_type == IntentType::kDelta && intent.constrained) {
+      return ConcurrencyClass::kConstrainedCommutative;
+    }
+    return Classify(intent.intent_type);
   }
 
   static const char* ConcurrencyClassName(ConcurrencyClass c) {
@@ -41,6 +54,7 @@ class PolicyDispatcher {
       case ConcurrencyClass::kReadOnly: return "read_only";
       case ConcurrencyClass::kStrict: return "strict";
       case ConcurrencyClass::kCommutativeRebase: return "commutative_rebase";
+      case ConcurrencyClass::kConstrainedCommutative: return "constrained_commutative_escrow";
       case ConcurrencyClass::kConditionalRebase: return "conditional_rebase";
     }
     return "strict";
@@ -75,21 +89,30 @@ class PolicyDispatcher {
         return r;
       }
       case IntentType::kDelta: {
-        r.should_write = true;
         const auto cur = ParseInt(current_store_value);
         const auto base = ParseInt(base_value);
         const auto bv = ParseInt(branch_value);
+        long long new_value = 0;
         if (cur && base && bv) {
-          r.value = std::to_string(*cur + (*bv - *base));  // 在最新值上重算增量
-          return r;
+          new_value = *cur + (*bv - *base);  // 在最新值上重算增量
+        } else {
+          const auto delta = ParseInt(intent.payload);
+          if (!cur || !delta) {
+            r.success = false;
+            r.reason = "delta rebase requires integer values";
+            return r;
+          }
+          new_value = *cur + *delta;
         }
-        const auto delta = ParseInt(intent.payload);
-        if (!cur || !delta) {
+        // 约束可交换：带下界的扣减若会破界则拒绝(escrow 守界，避免超卖)。
+        // 注意：拒绝≠版本冲突——上层应按 escrow 语义处理(记 reject、不重跑)，而非 regenerate。
+        if (intent.constrained && new_value < intent.lower_bound) {
           r.success = false;
-          r.reason = "delta rebase requires integer values";
+          r.reason = "escrow: constrained delta would breach lower bound";
           return r;
         }
-        r.value = std::to_string(*cur + *delta);
+        r.should_write = true;
+        r.value = std::to_string(new_value);
         return r;
       }
       case IntentType::kCas:

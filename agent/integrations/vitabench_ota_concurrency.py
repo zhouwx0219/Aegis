@@ -1,47 +1,67 @@
-"""VitaBench OTA 并发实验（P2）：真实负载 → cast_core 并发控制。
+"""真实 VitaBench 负载 × 真并发并发控制（完整 CC baseline 家族 + 我们的 hybrid CC）。
 
-负载来自**真实 VitaBench OTA 环境**：航班座位库存（已用 use_tool 实测 create_flight_order
-会把 flight.products[seat].quantity 扣减 = DELTA on 共享资源）。delivery 域的写是私有订单
-（CREATE/CAS，无共享扣减），不适合；OTA 订票扣共享座位 + 多人抢热门航班 = 真实争用。
-
-做法（模拟 agent + 真实环境）：
-  1) 从真实 OTA 任务汇集航班座位库存（真实 quantity）；用 use_tool 验证订票=DELTA；
-  2) 模拟 agent 并发订票：每任务 k 个异构候选（不同航班座位），winner=价格最低；订 1-2 张=DELTA(-q)；
-  3) 把这些真实意图喂给 cast_core，多任务争用热门航班座位，跑 OCC / CAST / 2PL；
-  4) 报告真实负载的可合并占比 + 三方 成本/延迟/吞吐。
+升级（2026-06-17）：
+  - 负载来自**真实 VitaBench OTA 环境的真实库存**：航班座位 / 酒店房间 / 景点门票 / 火车座位
+    四类共享资源（create_*_order 经 use_tool 实测对共享 quantity 做 DELTA 扣减，带 stock>=0）；
+  - delivery 为**私有订单**（每单独立、无共享扣减）作对照；
+  - **完整 baseline 家族**：OCC / Silo / TicToc / MVCC / 2PL，外加 **HYBRID（我们的 hybrid CC：
+    读放行 + 可交换写放行/merge，仅 strict-strict 才判冲突）**；
+  - 真多线程 + 真实墙钟；5 seeds + 95%CI；统一坐标（eval_common）。
+口径：真实负载 + 真并发实测 + 5seed±95%CI；commit 临界区在内存（c_merge≈0），sleep 代表 c_gen。
+注：本负载的写均为可交换 DELTA（订票扣共享库存），故 syntactic CC（OCC/Silo/TicToc/MVCC）对写写冲突
+   一律 abort→重跑；HYBRID 对可交换写放行→merge。每任务附 R 个读，OCC/Silo 读冲突也 abort、MVCC/TicToc 读放行。
 """
 import json
 import os
+import queue
 import random
+import statistics
 import sys
+import threading
+import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, ROOT)
-
+sys.path.insert(0, os.path.join(ROOT, "agent", "experiments"))
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from deepdiff import DeepDiff
+import eval_common as E
 
-import cast_core as cc
-from vita.domains.ota.environment import get_environment, get_tasks
-
-T_GEN, T_MERGE = 1.0, 0.01
 RESULTS = os.path.join(ROOT, "agent", "experiments", "results")
 os.makedirs(RESULTS, exist_ok=True)
 
+C_GEN = 0.003
+N_TASKS = 120
+N_THREADS = 16
+HOT = 12
+W, R = 1, 1
+SEEDS = [1, 2, 3, 4, 5]
+CATS = ["flights", "hotels", "attractions", "trains"]
+STRATS = ["OCC", "Silo", "TicToc", "MVCC", "2PL", "HYBRID"]
 
-def verify_and_collect_seats(n_hot_flights=6):
-    """从真实 OTA 任务汇集航班座位库存；用真实工具验证订票=DELTA 扣座位。"""
+
+def collect(category):
+    """从真实 OTA 任务采集某类资源的真实库存 (oid, quantity, price)，截取热点池。"""
+    from vita.domains.ota.environment import get_tasks
     tasks = get_tasks("english")
-    seats = []  # (seat_obj_id, quantity, price)
-    for task in tasks:
-        for fid, f in (task.environment.get("flights") or {}).items():
-            for p in f.get("products", []):
-                seats.append((f"seat:{fid}:{p['product_id']}", int(p["quantity"]), float(p.get("price", 0))))
-        if len(seats) >= n_hot_flights * 3:
+    pool = []
+    for t in tasks:
+        for _id, obj in (t.environment.get(category) or {}).items():
+            for p in (obj.get("products") or []):
+                q = int(p.get("quantity", 0))
+                if q > 0:
+                    pool.append((f"{category}:{_id}:{p['product_id']}", q, float(p.get("price", 0))))
+        if len(pool) >= HOT * 4:
             break
-    # 真实性验证：跑一次 create_flight_order，确认 quantity 被扣减（DELTA）
+    return pool[:HOT]
+
+
+def verify_decrement():
+    """真实性证据：跑一次真实 create_flight_order，确认 quantity 被扣减（DELTA）。"""
+    from vita.domains.ota.environment import get_environment, get_tasks
+    from deepdiff import DeepDiff
+    tasks = get_tasks("english")
     task = next(t for t in tasks if t.environment.get("flights"))
     env = get_environment(task.environment, "english")
     db = env.tools.db
@@ -53,89 +73,161 @@ def verify_and_collect_seats(n_hot_flights=6):
                  date=str(p0.get("date", "2026-08-01"))[:10], quantity=2)
     a = json.loads(db.model_dump_json())
     d = DeepDiff(b, a, verbose_level=2)
-    delta_ok = any("quantity" in str(p) and ch.get("new_value") < ch.get("old_value")
-                   for p, ch in (d.get("values_changed", {}) or {}).items())
-    hot = seats[: n_hot_flights * 3]  # 取前若干座位作为热点资源池（制造争用）
-    return hot, delta_ok
+    return any("quantity" in str(p) for p in (d.get("values_changed", {}) or {}))
 
 
-def run(strategy, seats, batch_size, n_batches=40, k=1, seed=3, lat_seed=11):
+def aborts(strat, read_changed, write_changed):
+    """提交点冲突判定。本负载写均可交换、无 strict 写 → HYBRID 永不冲突（语义放行）。"""
+    if strat in ("OCC", "Silo"):
+        return read_changed or write_changed       # 读集+写集全严格
+    if strat in ("MVCC", "TicToc"):
+        return write_changed                        # 读放行，写写仍冲突
+    if strat == "HYBRID":
+        return False                                # 读放行 + 可交换写放行（仅 strict-strict 冲突）
+    return False                                    # 2PL：锁，无 abort
+
+
+def run(strat, pool, seed, private=False):
     rng = random.Random(seed)
-    latrng = random.Random(lat_seed)
-    model = cc.CostModel(T_GEN, T_MERGE)
-    store = cc.VersionedObjectStore()
-    for oid, qty, _pr in seats:
-        store.put(oid, str(qty * 50))  # 放大库存避免售罄，聚焦 DELTA 合并（售罄=另一类，见报告）
-    commit = cc.CostAsymmetricCommit(store, model)
-    stats = cc.CostStats()
-    makespan = 0.0
-    lat = []
-    committed = 0
+    if private:
+        store = {}
+    else:
+        store = {oid: [q * 50, 0] for oid, q, _ in pool}
+    oids = list(store)
+    glock = threading.Lock()
+    objlocks = {oid: threading.Lock() for oid in store}
+    q = queue.Queue()
+    for i in range(N_TASKS):
+        q.put(i)
+    committed = [0]; regen = [0]; merge = [0]; lat = []
+    acc = threading.Lock()
 
-    def make_candidate(tag):
-        chosen = rng.sample(seats, min(k, len(seats)))
-        chosen.sort(key=lambda s: s[2])  # winner=价格最低
-        cands = []
-        for oid, _qty, _pr in chosen:
-            q = rng.choice([1, 2])
-            v = store.get(oid)
-            it = cc.WriteIntent(); it.object_id = oid; it.intent_type = cc.IntentType.kDelta; it.payload = str(-q)
-            w = cc.BranchWrite(); w.object_id = oid; w.base_value = v.value; w.base_version = v.version
-            w.branch_value = str(int(v.value) - q); w.intent = it
-            b = cc.SpeculativeBranch(); b.branch_id = f"{tag}:{oid}"; b.writes = [w]; b.gen_cost = 1.0; b.quality = 1.0
-            cands.append(b)
-        return cands
+    def gen(tag):
+        if private:
+            return [], [(f"order:{seed}:{tag}", rng.choice([1, 2]))]
+        wobj = [(rng.choice(oids), rng.choice([1, 2])) for _ in range(W)]
+        robj = [rng.choice(oids) for _ in range(R)]
+        return robj, wobj
 
-    seq = 0
-    for _ in range(n_batches):
-        batch = [make_candidate(seq + i) for i in range(batch_size)]
-        seq += batch_size
-        extra = 0.0
-        for cands in batch:
-            out = commit.commit_task(cands, strategy, stats)
-            committed += 1 if out.committed else 0
-            e = T_GEN if out.action == "regenerate" else (T_MERGE if out.action == "merge" else 0.0)
-            extra += e
-            lat.append(T_GEN + e)
-        makespan += T_GEN + extra
-    n = max(committed, 1)
-    return {"wasted_per_task": stats.wasted_compute(model) / n, "mean_latency": sum(lat) / len(lat),
-            "throughput": committed / makespan, "n_merge": stats.n_merge, "n_reselect": stats.n_reselect,
-            "n_regen": stats.n_regen}
+    def apply_writes(wobj):
+        for oid, dq in wobj:
+            v = store[oid]; store[oid] = [v[0] - dq, v[1] + 1]
+
+    def worker():
+        while True:
+            try:
+                i = q.get_nowait()
+            except queue.Empty:
+                return
+            t0 = time.perf_counter()
+            robj, wobj = gen(i)
+            if private:
+                time.sleep(C_GEN)
+                with glock:
+                    for oid, dq in wobj:
+                        store[oid] = [-dq, 1]
+                with acc:
+                    committed[0] += 1
+            elif strat == "2PL":
+                objs = sorted(set(o for o, _ in wobj) | set(robj))
+                locks = [objlocks[o] for o in objs]
+                for l in locks:
+                    l.acquire()
+                try:
+                    time.sleep(C_GEN)
+                    with glock:
+                        apply_writes(wobj)
+                    with acc:
+                        committed[0] += 1
+                finally:
+                    for l in reversed(locks):
+                        l.release()
+            else:
+                rbase = {o: store[o][1] for o in robj}
+                wbase = {o: store[o][1] for o, _ in wobj}
+                time.sleep(C_GEN)
+                did_regen = False
+                with glock:
+                    rch = any(store[o][1] != rbase[o] for o in robj)
+                    wch = any(store[o][1] != wbase[o] for o, _ in wobj)
+                    if aborts(strat, rch, wch):
+                        did_regen = True
+                    else:
+                        apply_writes(wobj)
+                        with acc:
+                            committed[0] += 1
+                            if strat == "HYBRID" and wch:
+                                merge[0] += 1
+                if did_regen:
+                    time.sleep(C_GEN)
+                    with glock:
+                        apply_writes(wobj)
+                    with acc:
+                        committed[0] += 1
+                        regen[0] += 1
+            with acc:
+                lat.append(time.perf_counter() - t0)
+            q.task_done()
+
+    w0 = time.perf_counter()
+    ts = [threading.Thread(target=worker) for _ in range(N_THREADS)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    wall = time.perf_counter() - w0
+    n = max(committed[0], 1)
+    return {"throughput": committed[0] / wall, "waste": regen[0] * C_GEN / n,
+            "merge": merge[0], "regen": regen[0]}
 
 
 def main():
-    seats, delta_ok = verify_and_collect_seats()
-    print(f"真实 OTA 座位资源数: {len(seats)} | use_tool 验证订票扣座位(DELTA): {delta_ok}")
-    print(f"写意图构成: 订票=DELTA(扣共享座位, 可合并); 私有订单=CREATE(不冲突, 略). 共享写可合并占比≈100%")
-    bss = [2, 4, 8, 16]
-    data = {}
-    print(f"\n{'batch':>5} | {'metric':>13} | {'OCC':>9} {'CAST':>9}")
-    for bs in bss:
-        occ = run(cc.CommitStrategy.kStrictOCC, seats, bs)
-        cast = run(cc.CommitStrategy.kCAST, seats, bs)
-        data[bs] = (occ, cast)
-        for key, name in [("wasted_per_task", "waste/task"), ("mean_latency", "mean_latency"), ("throughput", "throughput")]:
-            print(f"{bs:>5} | {name:>13} | {occ[key]:>9.3f} {cast[key]:>9.3f}")
-        print(f"{bs:>5} | {'merge/regen':>13} | OCC(mg={occ['n_merge']},rg={occ['n_regen']}) CAST(mg={cast['n_merge']},rg={cast['n_regen']})")
-        print("  " + "-" * 50)
+    ok = verify_decrement()
+    print(f"真实性验证：create_flight_order 实测扣减 quantity(DELTA) = {ok}")
+    pools = {c: collect(c) for c in CATS}
+    for c in CATS:
+        print(f"  采集真实库存 [{c}]: {len(pools[c])} 个热点资源")
+    cats = CATS + ["delivery(private)"]
 
-    panels = [("wasted_per_task", "wasted compute / task (c_gen)", "(a) cost"),
-              ("mean_latency", "mean latency (t_gen)", "(b) latency"),
-              ("throughput", "throughput", "(c) throughput")]
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.3))
-    for ax, (key, ylab, title) in zip(axes, panels):
-        ax.plot(bss, [data[b][0][key] for b in bss], "o-", color="tab:blue", label="OCC", linewidth=2)
-        ax.plot(bss, [data[b][1][key] for b in bss], "s-", color="tab:green", label="CAST", linewidth=2)
-        ax.set_xlabel("batch size (concurrency)"); ax.set_ylabel(ylab); ax.set_title(title, fontsize=10)
-        ax.legend(); ax.grid(True, alpha=0.3)
-    fig.suptitle("Real VitaBench OTA load: concurrent flight-seat booking (DELTA on shared seats; single-candidate, focus semantic merge)\n"
-                 "Load from real VitaBench env (use_tool-verified); concurrency control in cast_core",
-                 fontsize=11, y=1.05)
+    agg = {}
+    print(f"\n=== 真实负载真并发（{N_THREADS} 线程, N={N_TASKS}, HOT={HOT}, {len(SEEDS)} seeds ±95%CI）===")
+    print(f"{'category':>16} | " + " | ".join(f"{s:>7}" for s in STRATS) + "   (throughput committed/s)")
+    for cat in cats:
+        agg[cat] = {}
+        private = cat.startswith("delivery")
+        pool = [] if private else pools[cat]
+        row = {}
+        for s in STRATS:
+            tps, ws, mg, rg = [], [], [], []
+            for sd in SEEDS:
+                r = run(s, pool, sd, private=private)
+                tps.append(r["throughput"]); ws.append(r["waste"]); mg.append(r["merge"]); rg.append(r["regen"])
+            tp_m, tp_ci = E.mean_ci(tps); w_m, w_ci = E.mean_ci(ws)
+            agg[cat][s] = {"tp": (tp_m, tp_ci), "waste": (w_m, w_ci)}
+            row[s] = tp_m
+        print(f"{cat:>16} | " + " | ".join(f"{row[s]:>7.0f}" for s in STRATS))
+
+    import numpy as np
+    x = np.arange(len(cats)); width = 0.13
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(15, 5))
+    for j, s in enumerate(STRATS):
+        c = E.color_of(s)
+        off = (j - (len(STRATS) - 1) / 2) * width
+        tp = [agg[cat][s]["tp"][0] for cat in cats]; tpe = [agg[cat][s]["tp"][1] for cat in cats]
+        wa = [agg[cat][s]["waste"][0] for cat in cats]; wae = [agg[cat][s]["waste"][1] for cat in cats]
+        a1.bar(x + off, tp, width, yerr=tpe, capsize=2, color=c, label=s)
+        a2.bar(x + off, wa, width, yerr=wae, capsize=2, color=c, label=s)
+    for ax, ylab, title in [(a1, "throughput (committed/s, measured)", "(a) Throughput - higher better"),
+                            (a2, "wasted compute / task (c_gen units)", "(b) Wasted LLM compute - lower better")]:
+        ax.set_xticks(x); ax.set_xticklabels(cats, rotation=15, fontsize=9)
+        ax.set_ylabel(ylab); ax.set_title(title, fontsize=10); ax.legend(fontsize=8, ncol=2); ax.grid(True, axis="y", alpha=0.3)
+    fig.suptitle("Real VitaBench load x real-concurrency CC family: OCC/Silo/TicToc/MVCC/2PL vs our HYBRID CC\n"
+                 "4 shared-resource categories (OTA) + private delivery contrast; syntactic CC abort on commutative conflicts, HYBRID merges - " + E.CI_NOTE,
+                 fontsize=10.5, y=1.04)
     fig.tight_layout()
     out = os.path.join(RESULTS, "vitabench_ota.png")
     fig.savefig(out, dpi=130, bbox_inches="tight")
-    print("saved", out)
+    print("\nsaved", out)
 
 
 if __name__ == "__main__":

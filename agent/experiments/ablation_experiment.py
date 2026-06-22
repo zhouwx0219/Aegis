@@ -21,6 +21,7 @@ sys.path.insert(0, ROOT)
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import eval_common as E
 
 RESULTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
 os.makedirs(RESULTS, exist_ok=True)
@@ -102,31 +103,31 @@ def run(rule, k, seed):
 
 def main():
     variants = [("V0 OCC", "ww_rw", 1), ("V1 +read-pass", "ww", 1),
-                ("V2 +merge", "sww", 1), ("V3 +reselect (=CAST)", "sww", 4)]
-    seeds = [1, 2, 3]
-    names, tps = [], []
-    print("=== 统一消融（中等冲突 n_obj=24, k(V3)=4, 真并发, 3 seeds）===")
+                ("V2 +merge", "sww", 1), ("V3 +reselect (=HYBRID)", "sww", 4)]
+    seeds = [1, 2, 3, 4, 5]
+    names, tps, cis = [], [], []
+    print("=== 统一消融（中等冲突 n_obj=24, k(V3)=4, 真并发, 5 seeds, ±95%CI）===")
     prev = None
     for name, rule, k in variants:
         vals = [run(rule, k, sd) for sd in seeds]
-        m = statistics.mean(vals)
-        names.append(name); tps.append(m)
+        m, half = E.mean_ci(vals)
+        names.append(name); tps.append(m); cis.append(half)
         delta = f"  (+{m - prev:.0f})" if prev is not None else ""
-        print(f"  {name:24} throughput = {m:7.0f}{delta}")
+        print(f"  {name:24} throughput = {m:7.0f} ± {half:4.0f}{delta}")
         prev = m
-    print(f"  => 总提升 OCC→CAST: +{tps[-1] - tps[0]:.0f}（{(tps[-1]/tps[0]-1)*100:.0f}%）")
+    print(f"  => 总提升 OCC→HYBRID: +{tps[-1] - tps[0]:.0f}（{(tps[-1]/tps[0]-1)*100:.0f}%）")
 
     fig, ax = plt.subplots(figsize=(8, 4.5))
     colors = ["tab:blue", "tab:olive", "tab:purple", "tab:green"]
-    bars = ax.bar(range(len(names)), tps, color=colors)
+    bars = ax.bar(range(len(names)), tps, yerr=cis, capsize=4, color=colors)
     for i, (b, v) in enumerate(zip(bars, tps)):
         ax.text(b.get_x() + b.get_width() / 2, v + 10, f"{v:.0f}", ha="center", fontsize=9)
         if i > 0:
             ax.text(b.get_x() + b.get_width() / 2, v / 2, f"+{tps[i]-tps[i-1]:.0f}", ha="center", color="white", fontsize=9, fontweight="bold")
     ax.set_xticks(range(len(names))); ax.set_xticklabels(names, rotation=12, fontsize=9)
     ax.set_ylabel("throughput (committed/s, measured)")
-    ax.set_title("Ablation: contribution of each CAST mechanism (real concurrency)\n"
-                 "OCC → +read-pass → +semantic-merge → +multi-candidate reselect", fontsize=10)
+    ax.set_title("Ablation: contribution of each HYBRID mechanism (real concurrency)\n"
+                 "OCC → +read-pass → +semantic-merge → +multi-candidate reselect  (" + E.CI_NOTE + ")", fontsize=10)
     ax.grid(True, axis="y", alpha=0.3)
     fig.tight_layout()
     out = os.path.join(RESULTS, "ablation.png"); fig.savefig(out, dpi=130, bbox_inches="tight"); print("saved", out)

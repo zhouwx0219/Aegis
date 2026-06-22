@@ -1,113 +1,209 @@
-# cast-das
+# ASTRA: Agent-Side Transactions
 
-**论文 A 的实现骨架**：Data Agent System 中的统一对象事务与成本不对称投机提交（CAST）。
+ASTRA is a research prototype for **agent-side transaction execution and semantic-aware concurrency control** in data agent systems.
 
-> 设计依据：`../docs/paperA_unified_object_txn_system_design.md`
-> 这是阶段 0（端到端骨架）：C++ 事务内核 + pybind11 桥接 + Python 模拟算子，
-> 已能跑出"CAST 用语义合并替代昂贵重跑、浪费算力远低于 strict OCC"的核心结果。
+The project targets the AI-OLTP gap: recent data-agent systems such as Palimpzest focus on read-heavy AI-OLAP workloads, while many agent tasks also write shared state such as seats, inventory, counters, order status, and text. ASTRA moves the transaction boundary to the agent side, where object semantics and generated candidates are still visible.
 
-## 架构（混合栈）
+## Naming
+
+| Name | Meaning in the paper | Code / artifact |
+|---|---|---|
+| **ASTRA** | The full system: Agent-Side Transactions | This repository and paper narrative |
+| **CAST** | ASTRA's cost-asymmetric commit protocol | `core/txn/cost_asymmetric_commit.h` |
+| **HYBRID** | The experimental label for ASTRA's semantic-aware CC strategy | Figures and CSV results |
+| **CSI-SS** | The mixed correctness boundary | `docs/ISOLATION_LEVELS.md`, `docs/PROOFS.md` |
+
+We no longer use CAST as the whole-system name. CAST is the commit protocol inside ASTRA: `direct -> merge -> reselect -> regenerate`.
+
+## What Is Implemented
 
 ```text
-Python 层（agent/）          —— 算子、调度、workload、实验
-   • MockOperator：可配置成本/冲突的模拟算子（确定性、可复现）
-        │  pybind11（进程内）
-C++ 核（core/）              —— 事务/并发/提交，性能与正确性
-   • 统一对象 + 版本化存储 + 写意图与并发类 + 成本模型
-   • 成本不对称提交协议（merge / reselect / regenerate）
+Python agent/runtime layer
+  - AgentTransactionManager: begin -> snapshot/read -> model/tool calls
+    -> candidate branches -> commit/reject trace
+  - Mock and DeepSeek OTA candidate generators
+  - Synthetic, true-concurrency, VitaBench-style, and LLM-in-the-loop experiments
+
+pybind11
+  - In-process bridge to the C++ kernel (`cast_core`)
+
+C++ kernel
+  - VersionedObjectStore: minimal versioned KV reference store
+  - WriteIntent + PolicyDispatcher: typed intents and semantic rebase
+  - CostAsymmetricCommit: CAST direct/merge/reselect/regenerate
+  - HybridDispatcher: per-object/intent HYBRID CC policy
+  - EscrowAccount: constrained commutative reservation, no oversell
 ```
 
-所有事务/并发/提交都在 C++ 核完成；Python 只负责产生候选、声明写意图、提供成本数字。
+Important scope decision for the CCFA paper: **real persistent DB backend**, **crash recovery**, and an **adaptive optimizer for choosing `k` or policy** are future work. They are not required for the current transaction/CC contribution.
 
-## 目录
+## Repository Layout
 
 ```text
 cast-das/
-├── core/                                  # C++ 事务内核（header-only）
-│   ├── object/unified_object.h            # 统一对象类型 + 版本化值
-│   ├── intent/intent.h                    # 五类写意图
-│   ├── intent/policy_dispatcher.h         # 并发类分类 + 语义 rebase（核心复用）
-│   ├── storage/versioned_object_store.h   # 版本化对象存储（最小 KV 边界）
-│   ├── cost/cost_model.h                  # 成本模型与统计（浪费算力）
-│   ├── branch/speculative_branch.h        # 成本标注的投机分支
-│   ├── txn/cost_asymmetric_commit.h       # ★成本不对称提交协议（CAST 核心）
-│   └── bindings/cast_bindings.cpp         # pybind11 桥接
-├── agent/                                 # Python 层
-│   ├── operators/mock_operator.py         # 可配置模拟算子
-│   └── experiments/demo_e2e.py            # 端到端 demo：CAST vs strict OCC
-├── build.sh                               # 编译脚本（生成 cast_core 扩展）
-└── README.md
+├── core/                         # C++ transaction / concurrency kernel
+│   ├── storage/                  # versioned KV reference boundary
+│   ├── intent/                   # write-intent classification and rebase
+│   ├── txn/                      # CAST commit protocol
+│   ├── concurrency/              # HYBRID dispatcher and escrow
+│   └── bindings/                 # pybind11 module
+├── agent/
+│   ├── runtime/                  # upper transaction lifecycle
+│   ├── llm/                      # DeepSeek OTA agent operator
+│   ├── workloads/                # synthetic / VitaBench-style workloads
+│   ├── experiments/              # experiments and paper figure generator
+│   └── integrations/             # VitaBench OTA integration
+├── docs/                         # paper skeleton, proofs, artifact guide
+├── scripts/                      # smoke and reproduction entrypoints
+├── figures/                      # schematic figures
+└── build.sh                      # build `cast_core`
 ```
 
-## 构建与运行
+## Quick Start
 
-依赖：g++ (C++17)、python3、pybind11（`pip install pybind11`）。
+On WSL/Linux:
 
 ```bash
-bash build.sh                          # 编译 cast_core 扩展模块
-python3 agent/experiments/demo_e2e.py  # 运行端到端 demo
+python3 -m pip install -r requirements.txt   # needed for legacy PNG scripts
+bash build.sh
+bash scripts/smoke.sh
 ```
 
-## 当前 demo 展示什么
+`bash scripts/smoke.sh` builds the C++ extension, imports `cast_core`, runs the transaction lifecycle checks, runs the end-to-end CAST demo, verifies the correctness boundary, and regenerates the paper-facing SVG figures.
 
-- **场景1（可合并冲突）**：候选对 counter 做 `DELTA`、对 text 做 `APPEND`，并发任务抢先改了两者。
-  strict OCC 必须 `regenerate`（浪费一次昂贵生成）；CAST 用语义 rebase `merge`（仅 KV 操作）。
-  结果：CAST 浪费算力比 OCC 低约 98%。
-- **场景2（strict 冲突，诚实边界）**：候选对 row 做 `OVERWRITE`，并发抢先覆盖。
-  OVERWRITE 不可合并，CAST 退化到与 OCC 相同——说明优势来自语义可合并的写。
+If `matplotlib` is unavailable, the smoke path still works because `agent/experiments/paper_figures.py` uses only the Python standard library.
 
-## 与现有 Data-Agent-System 的关系
+## Core Paper Figures
 
-本骨架移植/复用了上层 `data_agent_system/` 的核心思想：版本化 KV 边界、五类写意图、
-`PolicyDispatcher` 的并发类与语义 rebase、统一对象缓存（ObjectType）。
-新增的是成本模型、成本不对称提交协议，以及 Python 算子层与桥接。
+The CCFA-facing figure set is generated into:
 
-## 阶段 1 进展
+```text
+agent/experiments/results/paper_figures/
+```
 
-### 受控负载扫描与三方对比（OCC vs SCC-kS vs CAST）
+Regenerate from existing CSV/JSON results:
 
-组件：
-- `agent/workloads/synthetic_contention.py`：确定性 task-plan + 批内并发争用模型。
-- `agent/scheduler/candidate_scheduler.py`：候选生成统一入口，决定投机度 k（当前 k=1 规则版）。
-- `agent/experiments/sweep_contention.py`：真跑 OCC/CAST + SCC-kS 解析成本模型，扫并发度/可合并占比/成本不对称度。
-- `agent/experiments/plot_sweeps.py`：画三方对比图 `results/sweeps3.png`（早期两方图 `results/sweeps.png` 保留）。
-
-SCC-kS 解析模型：`waste = (k-1)*c_gen*n_tasks + #(冲突深度 d>=k)*c_gen`；SCC-1S == OCC，用于对齐验证。
-task-plan 让"真跑 OCC/CAST"与"SCC 解析/结构性冲突深度"读同一访问序列 —— alignment 全部 PASS
-（OCC 实测 regen == 结构冲突任务数，OCC 浪费 == SCC-1S 解析）。
-
-核心结论（人均浪费，单位 c_gen/任务，见 `results/sweeps3.png`）：
-- **CAST 完胜**：可合并写场景浪费比 OCC 低 >97%（高并发下约 0.02 vs 0.9）。
-- **SCC 投机反而更差**：SCC-2S 每任务先付 1 份冗余 shadow，浪费约 1.6 > OCC 的 0.83；
-  且 SCC-best 在 k=1..8 的最优是 k\*=1（退化成 OCC）—— agent 成本下投机 shadow 永不划算。
-- **CAST 的诚实边界**：优势来自"可合并写占比高 + 成本不对称"；p_mergeable=0（全 strict）时 CAST≈OCC；
-  c_merge 接近 c_gen（交叉点≈0.4）后 CAST 反而更差。
-
-运行：
 ```bash
-python3 agent/experiments/sweep_contention.py   # 三方 CSV: results/sweep3_*.csv
-python3 agent/experiments/plot_sweeps.py        # 三方图: results/sweeps3.png
+python3 agent/experiments/paper_figures.py
 ```
 
-### 多维对比：成本 × 延迟 × 吞吐（Step A，含 2PL / MVCC）
+Current core figures:
 
-`agent/experiments/timed_experiment.py` → `results/timed.png`。引入时间模型后四方对比，batch=16：
-- 浪费/任务：OCC 0.66 / 2PL 0.00 / CAST 0.02
-- 平均延迟（t_gen）：OCC 1.66 / 2PL 2.38 / CAST 1.02
-- 吞吐（提交/墙钟）：OCC 1.4 / 2PL 3.0 / CAST 12.0
+1. `fig1_cost_asymmetry.svg`: cost asymmetry, mergeability, and boundary cases.
+2. `fig2_true_concurrency.svg`: measured throughput/latency under true concurrency.
+3. `fig3_semantic_reselect.svg`: semantic validation and multi-candidate reselect.
+4. `fig4_escrow_correctness.svg`: constrained commutative writes and no oversell.
+5. `fig5_llm_in_loop.svg`: real DeepSeek trace evidence and replay comparison.
+6. `fig6_baseline_family.svg`: OCC/Silo/TicToc/MVCC/2PL/HYBRID baseline family.
+7. `fig7_scale_out.svg`: larger task counts and thread scale-out.
+8. `fig8_agent_aware_baselines.svg`: OCC+K, HYBRID-K1, merge-all, and safety-aware baselines.
+9. `fig9_hotspot_mixed.svg`: hotspot mixed-object workload with throughput and generation-call efficiency.
+10. `fig10_vitabench_authoritative.svg`: VitaBench environment-derived OTA write workload over real shared resources.
+11. `fig11_rigorous_vitabench.svg`: large-scale benchmark reporting throughput, P95 latency, and SLA success rate.
 
-=> **CAST 三维全赢**；2PL 不重跑但锁串行化→延迟/吞吐受压；MVCC-SI 写密集下 ≡ OCC。
+See `docs/CCFA_ARTIFACT_GUIDE.md` for the claim-to-figure mapping.
 
-### 探索式多候选的独立收益（纯 strict，与语义合并正交）
+## Reproduction
 
-`agent/experiments/explore_experiment.py` → `results/explore.png`。纯 strict 独占资源负载（CAS，全程 n_merge=0）+ 对数正态 LLM 延迟。每任务 k=4 异构候选，winner 被占→CAST 免费 reselect、OCC 重探索。batch=16：
-- 浪费/任务：OCC 1.34 / CAST 0.03；平均延迟 OCC 2.34 / CAST 1.77；吞吐 OCC 2.55 / CAST 4.83。
-- CAST reselect 随并发增长（10→32→76→136），**首次实证多候选机制**（此前 k=1 时恒为 0）。
-- 与语义合并正交：可合并写靠 merge，strict 写靠异构多候选 reselect，两条独立收益来源。
+Curated CCFA reproduction flow:
 
-## 仍待做（阶段 2）
+```bash
+bash scripts/reproduce_ccfa.sh
+```
 
-1. **真实 LLM-in-the-loop VitaBench**：用真实 t_gen 与真实冲突分布复现结论。
-2. **CandidateScheduler 自适应 k**：strict 写多时增开候选用 reselect 兜底。
-3. **读密集/写偏斜负载**：让 MVCC-SI 的"读不阻塞"优势显现，区分 MVCC vs OCC。
-4. **SCC order-shadow 真实现** 与 **隔离级别形式化**。
+From Windows PowerShell:
+
+```powershell
+.\scripts\reproduce_ccfa.ps1
+```
+
+The script always rebuilds the kernel, runs dependency-light checks, reruns the cost-asymmetry sweep, runs the CCFA baseline/scale/agent-aware/hotspot extension experiments, and regenerates the SVG figure set. If `matplotlib` is installed, it also reruns the legacy PNG experiments.
+
+The default quick profile covers the expanded baseline family, up to 32 worker threads, up to 10k synthetic tasks, and 5k booking tasks. Use `bash scripts/reproduce_ccfa.sh large` for the larger stress profile with up to 64 worker threads, 50k synthetic tasks, and 10k booking tasks.
+
+Real DeepSeek calls are intentionally not run by default:
+
+```bash
+DEEPSEEK_API_KEY=... python3 agent/experiments/llm_in_the_loop.py all --tasks 60 --k 3 --conc 8
+```
+
+The current real run uses DeepSeek `deepseek-chat` with 60 OTA tasks, `K=3`, API
+concurrency 8, replay threads 8, 3 replay seeds, and `speed=20`. It produced 0
+API errors, mean real generation latency 1.32s, 100% tasks with at least two
+alternatives, live HYBRID `oversell=0`, and same-trace replay HYBRID throughput
+8.2% above OCC+K and 3.05x 2PL. See
+`agent/experiments/results/llm_analysis.md`.
+
+For a no-key dry run:
+
+```bash
+bash scripts/reproduce_ccfa.sh llm-mock
+```
+
+VitaBench-derived authoritative write workload:
+
+```bash
+bash scripts/reproduce_vitabench.sh
+```
+
+This command installs the external VitaBench package into `/tmp/vb`, verifies that an official OTA order tool decrements shared `quantity`, runs the CC benchmark on real VitaBench OTA resources, and regenerates `fig10_vitabench_authoritative.svg`.
+
+DBx1000-backed in-memory Vita workload:
+
+```bash
+bash scripts/reproduce_dbx1000_vita.sh
+```
+
+This builds the vendored DBx1000 ASTRA/Vita runner and compares DBx-style OCC/MVCC/TicToc/Silo/2PL baselines with ASTRA-HYBRID on the same VitaBench-derived shared-resource workload. The vendored DBx1000 tree also registers `CC_ALG=HYBRID` as a native compile-time CC option. See `docs/DBX1000_INTEGRATION.md` for scope, parameters, and caveats.
+
+Additional DBx1000-backed sensitivity sweeps:
+
+```bash
+bash scripts/reproduce_dbx1000_vita_sensitivity.sh
+```
+
+This varies candidate count and worker threads under high contention and writes `agent/experiments/results/dbx1000_vita_sensitivity_summary.csv`.
+
+DBx1000-backed hot-resource stress:
+
+```bash
+bash scripts/reproduce_dbx1000_vita_stress.sh
+```
+
+This reports speedup against the best safe DBx1000 baseline, not only OCC+K. The current stress result is the only DBx1000/Vita setting in this artifact with a 50%+ throughput improvement; see `docs/DBX1000_RESEARCH_STORY.md` for the exact scope and caveats.
+
+Full DBx1000-backed `K x contention` matrix:
+
+```bash
+bash scripts/reproduce_dbx1000_vita_matrix.sh
+```
+
+This runs `K=1/4/8` across low, medium, and high contention and writes `agent/experiments/results/dbx1000_vita_matrix_summary.csv`. See `docs/DBX1000_MATRIX_EXPERIMENTS.md` for parameters, CC policy definitions, and the current results.
+
+Real DeepSeek `K x contention` matrix:
+
+```bash
+DEEPSEEK_API_KEY=... bash scripts/reproduce_llm_matrix.sh
+```
+
+This runs real DeepSeek calls for `K=1/4/8` across low, medium, and high contention. It distinguishes the traditional branch-per-transaction baseline from the stronger agent-aware OCC ablation. See `docs/REAL_LLM_MATRIX_AND_BASELINES.md`.
+
+Large-scale rigorous benchmark:
+
+```bash
+bash scripts/reproduce_rigorous.sh large
+```
+
+This runs 30k tasks per seed, 5 seeds, up to 64 worker threads, and regenerates `fig11_rigorous_vitabench.svg`.
+
+## Main Evidence
+
+- CAST replaces expensive regeneration with semantic merge or candidate reuse.
+- HYBRID reduces false conflicts compared with syntactic OCC/MVCC-style checks.
+- Escrow preserves lower-bound constraints while keeping commutative concurrency.
+- The expanded CCFA experiments add OCC/Silo/TicToc/MVCC/2PL baselines, agent-aware OCC+K/HYBRID-K1 controls, larger workload sweeps, and a hotspot mixed-object workload where HYBRID reduces generation calls per task close to 1.0.
+- The VitaBench-derived benchmark collects real OTA shared resources and confirms official order-tool quantity decrements; HYBRID improves throughput while keeping zero oversell.
+- The rigorous benchmark reports throughput, P95/P99 latency, commit rate, and SLA success rate; at 64 threads HYBRID improves throughput by 54.7% over OCC+K and raises SLA success from 25.5% to 83.4%.
+- In real DeepSeek OTA traces, calls are seconds-scale and every task produced multiple alternatives in the recorded run, validating the reselect premise; the current 60-task run has mean c_gen 1.32s and HYBRID replay throughput 8.2% above OCC+K with zero oversell.
+
+The current artifact is close to a CCFA paper prototype: the remaining work is mostly paper writing, final claim selection, and presentation polish rather than missing core mechanisms.

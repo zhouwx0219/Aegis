@@ -25,6 +25,7 @@ sys.path.insert(0, ROOT)
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import eval_common as E
 
 RESULTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
 os.makedirs(RESULTS, exist_ok=True)
@@ -34,7 +35,7 @@ N_TASKS = 120
 W = 2          # 写/候选
 R = 1          # 读/候选
 P_MERGE = 0.6
-STRATS = ["OCC", "Silo", "TicToc", "MVCC", "2PL", "CAST"]
+STRATS = ["OCC", "Silo", "TicToc", "MVCC", "2PL", "HYBRID"]
 
 
 def make_store(n_obj):
@@ -65,7 +66,7 @@ def aborts(strat, RS, WS_objs, sWS_objs, changed):
         return ww or rw            # 读集+写集全严格
     if strat in ("TicToc", "MVCC"):
         return ww                  # 读放行（TicToc 挪 ts / MVCC 快照），写写仍冲突
-    if strat == "CAST":
+    if strat == "HYBRID":
         return sww                 # 读放行 + 可交换写放行，仅 strict-strict
     return False                   # 2PL：锁，无 abort
 
@@ -162,18 +163,22 @@ def run(strat, n_obj, k, seed):
 
 
 def sweep(param_name, values, fixed):
-    seeds = [1, 2]
-    data = {s: {"tp": [], "abort": []} for s in STRATS}
-    print(f"\n=== 扫 {param_name} (固定 {fixed}) ===")
+    seeds = [1, 2, 3, 4, 5]
+    data = {s: {"tp": [], "tp_ci": [], "abort": []} for s in STRATS}
+    print(f"\n=== 扫 {param_name} (固定 {fixed}, {len(seeds)} seeds, ±95%CI) ===")
     print(f"{param_name:>10} | " + " | ".join(f"{s:>8}" for s in STRATS) + "   (throughput)")
     for v in values:
         line = {}
         for s in STRATS:
             kw = dict(fixed); kw[param_name] = v
-            tps = [run(s, kw["n_obj"], kw["k"], sd)["throughput"] for sd in seeds]
-            ar = [run(s, kw["n_obj"], kw["k"], sd)["abort_rate"] for sd in seeds]
-            data[s]["tp"].append(statistics.mean(tps)); data[s]["abort"].append(statistics.mean(ar))
-            line[s] = statistics.mean(tps)
+            tps, ars = [], []
+            for sd in seeds:                       # 每 seed 只跑一次,同时取 tp 与 abort
+                r = run(s, kw["n_obj"], kw["k"], sd)
+                tps.append(r["throughput"]); ars.append(r["abort_rate"])
+            m, half = E.mean_ci(tps)
+            data[s]["tp"].append(m); data[s]["tp_ci"].append(half)
+            data[s]["abort"].append(statistics.mean(ars))
+            line[s] = m
         print(f"{v:>10} | " + " | ".join(f"{line[s]:>8.0f}" for s in STRATS))
     return data
 
@@ -185,23 +190,19 @@ def main():
     # 实验B：扫候选分支 k，固定中等冲突 n_obj=24
     dataB = sweep("k", [1, 2, 4, 8], {"n_obj": 24})
 
-    style = {"OCC": ("o-", "tab:blue"), "Silo": ("v-", "tab:cyan"), "TicToc": ("^-", "tab:purple"),
-             "MVCC": ("D-", "tab:olive"), "2PL": ("d-.", "tab:red"), "CAST": ("s-", "tab:green")}
     fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
     xa = [12, 24, 48, 96]
     for s in STRATS:
-        st, c = style[s]
-        axes[0].plot(xa, dataA[s]["tp"], st, color=c, label=s, linewidth=1.8)
+        axes[0].errorbar(xa, dataA[s]["tp"], yerr=dataA[s]["tp_ci"], **E.fmt(s))
     axes[0].set_xlabel("object-pool size (smaller = higher contention)"); axes[0].invert_xaxis()
     axes[0].set_ylabel("throughput (committed/s)"); axes[0].set_title("(a) vs contention level (k=2)"); axes[0].legend(fontsize=8); axes[0].grid(True, alpha=0.3)
     xb = [1, 2, 4, 8]
     for s in STRATS:
-        st, c = style[s]
-        axes[1].plot(xb, dataB[s]["tp"], st, color=c, label=s, linewidth=1.8)
+        axes[1].errorbar(xb, dataB[s]["tp"], yerr=dataB[s]["tp_ci"], **E.fmt(s))
     axes[1].set_xlabel("candidate branches k"); axes[1].set_ylabel("throughput (committed/s)")
     axes[1].set_title("(b) vs candidate branches (n_obj=24)"); axes[1].legend(fontsize=8); axes[1].grid(True, alpha=0.3)
-    fig.suptitle("Multi-CC comparison (real concurrency): OCC/Silo/TicToc/MVCC/2PL/CAST\n"
-                 "syntactic CC cluster together (abort on commutative conflicts); CAST's semantic merge is orthogonal gain", fontsize=9.5, y=1.05)
+    fig.suptitle("Multi-CC comparison (real concurrency): OCC/Silo/TicToc/MVCC/2PL/HYBRID\n"
+                 "syntactic CC cluster together (abort on commutative conflicts); HYBRID's semantic merge is orthogonal gain — " + E.CI_NOTE, fontsize=9.5, y=1.05)
     fig.tight_layout()
     out = os.path.join(RESULTS, "cc_comparison.png"); fig.savefig(out, dpi=130, bbox_inches="tight"); print("\nsaved", out)
 

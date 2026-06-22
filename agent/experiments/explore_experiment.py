@@ -21,6 +21,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import cast_core as cc
+import eval_common as E
 from agent.workloads.explore_workload import ExploreWorkload
 
 RESULTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
@@ -80,43 +81,50 @@ def run_explore(strategy, n_resources, batch_size, n_batches=40, k=4, seed=3, la
 
 def main():
     bss = [2, 4, 8, 16]
+    seed_pairs = [(3, 11), (4, 12), (5, 13), (6, 14), (7, 15)]   # (workload seed, latency seed) ×5
+    keys = ["waste_per_task", "mean_latency", "throughput", "mean_rounds", "reselects", "n_merge", "committed"]
     rows = []
-    print(f"=== 探索式多候选（纯 strict 独占资源, n_resources=2*batch, k=4, 每批重置）===")
-    print(f"{'batch':>5} | {'metric':>13} | {'OCC':>9} {'CAST':>9}")
-    data = {}
+    data = {}   # data[bs][strat][key] = (mean, ci_half)
+    print(f"=== 探索式多候选（纯 strict 独占资源, n_resources=2*batch, k=4, 每批重置, {len(seed_pairs)} seeds, ±95%CI）===")
+    print(f"{'batch':>5} | {'metric':>13} | {'OCC(mean±CI)':>20} {'HYBRID(mean±CI)':>20}")
     for bs in bss:
-        occ = run_explore(cc.CommitStrategy.kStrictOCC, 2 * bs, bs)
-        cast = run_explore(cc.CommitStrategy.kCAST, 2 * bs, bs)
-        data[bs] = (occ, cast)
+        data[bs] = {}
+        for sname, strat in [("OCC", cc.CommitStrategy.kStrictOCC), ("HYBRID", cc.CommitStrategy.kCAST)]:
+            runs = [run_explore(strat, 2 * bs, bs, seed=sd, lat_seed=ls) for sd, ls in seed_pairs]
+            agg = {k: E.mean_ci([r[k] for r in runs]) for k in keys}
+            data[bs][sname] = agg
+            rows.append({"batch_size": bs, "strategy": sname,
+                         **{k: round(agg[k][0], 4) for k in keys},
+                         **{k + "_ci": round(agg[k][1], 4) for k in keys}})
         for key, name in [("waste_per_task", "waste/task"), ("mean_latency", "mean_latency"),
                           ("throughput", "throughput"), ("mean_rounds", "explore_rounds")]:
-            print(f"{bs:>5} | {name:>13} | {occ[key]:>9.3f} {cast[key]:>9.3f}")
-        print(f"{bs:>5} | {'reselect/merge':>13} | OCC(rs={occ['reselects']},mg={occ['n_merge']}) "
-              f"CAST(rs={cast['reselects']},mg={cast['n_merge']})")
-        print("  " + "-" * 50)
-        for strat, m in [("OCC", occ), ("CAST", cast)]:
-            rows.append({"batch_size": bs, "strategy": strat, **{kk: round(vv, 4) for kk, vv in m.items()}})
+            o = data[bs]["OCC"][key]; c = data[bs]["HYBRID"][key]
+            print(f"{bs:>5} | {name:>13} | {o[0]:>12.3f}±{o[1]:<6.3f} {c[0]:>12.3f}±{c[1]:<6.3f}")
+        print("  " + "-" * 60)
 
     with open(os.path.join(RESULTS, "explore.csv"), "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         w.writeheader()
         w.writerows(rows)
 
-    # 三面板：waste / latency / throughput vs batch
+    # 三面板：waste / latency / throughput vs batch（带 95%CI 误差棒）
     panels = [("waste_per_task", "wasted compute / task (c_gen)", "(a) cost — lower better"),
               ("mean_latency", "mean task latency (t_gen units)", "(b) latency — lower better"),
               ("throughput", "throughput (committed / wall-time)", "(c) throughput — higher better")]
+    labels = {"OCC": "OCC (re-explore)", "HYBRID": "HYBRID (heterogeneous reselect)"}
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.3))
     for ax, (key, ylab, title) in zip(axes, panels):
-        ax.plot(bss, [data[b][0][key] for b in bss], "o-", color="tab:blue", label="OCC (re-explore)", linewidth=2)
-        ax.plot(bss, [data[b][1][key] for b in bss], "s-", color="tab:green", label="CAST (heterogeneous reselect)", linewidth=2)
+        for sname in ("OCC", "HYBRID"):
+            ys = [data[b][sname][key][0] for b in bss]
+            es = [data[b][sname][key][1] for b in bss]
+            ax.errorbar(bss, ys, yerr=es, **{**E.fmt(sname), "label": labels[sname]})
         ax.set_xlabel("batch size (concurrency)")
         ax.set_ylabel(ylab)
         ax.set_title(title, fontsize=10)
         ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
-    fig.suptitle("Pure-strict exclusive-resource load — CAST advantage is purely from heterogeneous multi-candidate reselect (n_merge=0)\n"
-                 "LLM latency ~ lognormal; OCC must re-explore (re-run LLM), CAST reuses already-generated candidates",
+    fig.suptitle("Pure-strict exclusive-resource load — HYBRID advantage is purely from heterogeneous multi-candidate reselect (n_merge=0)\n"
+                 "LLM latency ~ lognormal; OCC must re-explore (re-run LLM), HYBRID reuses already-generated candidates — " + E.CI_NOTE,
                  fontsize=10, y=1.07)
     fig.tight_layout()
     out = os.path.join(RESULTS, "explore.png")

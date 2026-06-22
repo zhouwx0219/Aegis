@@ -73,36 +73,36 @@ def evaluate(strategy, plan):
 def main():
     N, B, NB, W, PM = 24, 8, 40, 2, 0.6
     reads = [0, 1, 2, 3]
-    data = {s: [] for s in ("OCC", "MVCC", "CAST")}
+    data = {s: [] for s in ("OCC", "MVCC", "HYBRID")}
     print(f"=== 语义验证分级（N={N}, batch={B}, write/任务={W}, 可合并占比={PM}）===")
-    print(f"{'read_size':>9} | {'OCC':>16} | {'MVCC':>16} | {'CAST':>16}   (abort率, 吞吐)")
+    print(f"{'read_size':>9} | {'OCC':>16} | {'MVCC':>16} | {'HYBRID':>16}   (abort率, 吞吐)")
     for r in reads:
         plan = gen_plan(N, NB, B, r, W, PM, seed=7)
         row = {}
-        for s in ("OCC", "MVCC", "CAST"):
+        for s in ("OCC", "MVCC", "HYBRID"):
             row[s] = evaluate(s, plan)
             data[s].append(row[s])
         print(f"{r:>9} | "
               f"{row['OCC']['abort_rate']:.2f},{row['OCC']['throughput']:.2f}      | "
               f"{row['MVCC']['abort_rate']:.2f},{row['MVCC']['throughput']:.2f}      | "
-              f"{row['CAST']['abort_rate']:.2f},{row['CAST']['throughput']:.2f}")
+              f"{row['HYBRID']['abort_rate']:.2f},{row['HYBRID']['throughput']:.2f}")
 
     with open(os.path.join(RESULTS, "semantic_validation.csv"), "w", newline="") as f:
         w = csv.writer(f); w.writerow(["read_size", "strategy", "abort_rate", "throughput"])
         for i, r in enumerate(reads):
-            for s in ("OCC", "MVCC", "CAST"):
+            for s in ("OCC", "MVCC", "HYBRID"):
                 w.writerow([r, s, round(data[s][i]["abort_rate"], 4), round(data[s][i]["throughput"], 4)])
 
     fig, (a1, a2) = plt.subplots(1, 2, figsize=(11, 4.3))
-    style = {"OCC": ("o-", "tab:blue"), "MVCC": ("^--", "tab:purple"), "CAST": ("s-", "tab:green")}
-    for s in ("OCC", "MVCC", "CAST"):
+    style = {"OCC": ("o-", "tab:blue"), "MVCC": ("^--", "tab:purple"), "HYBRID": ("s-", "tab:green")}
+    for s in ("OCC", "MVCC", "HYBRID"):
         st, c = style[s]
         a1.plot(reads, [d["abort_rate"] for d in data[s]], st, color=c, label=s, linewidth=2)
         a2.plot(reads, [d["throughput"] for d in data[s]], st, color=c, label=s, linewidth=2)
     a1.set_xlabel("read-set size per task"); a1.set_ylabel("conflict/abort rate"); a1.set_title("(a) conflicts — lower better"); a1.legend(); a1.grid(True, alpha=0.3)
     a2.set_xlabel("read-set size per task"); a2.set_ylabel("throughput"); a2.set_title("(b) throughput — higher better"); a2.legend(); a2.grid(True, alpha=0.3)
-    fig.suptitle("P3 semantic-aware validation: OCC (strict reads+writes) vs MVCC-SI (reads free) vs CAST (reads + commutative writes pass)\n"
-                 "CAST reduces conflicts at the validation stage (not just cheaper resolution) -> highest throughput", fontsize=9.5, y=1.05)
+    fig.suptitle("P3 semantic-aware validation: OCC (strict reads+writes) vs MVCC-SI (reads free) vs HYBRID (reads + commutative writes pass)\n"
+                 "HYBRID reduces conflicts at the validation stage (not just cheaper resolution) -> highest throughput", fontsize=9.5, y=1.05)
     fig.tight_layout()
     out = os.path.join(RESULTS, "semantic_validation.png")
     fig.savefig(out, dpi=130, bbox_inches="tight")

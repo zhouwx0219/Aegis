@@ -23,6 +23,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import cast_core as cc
+import eval_common as E
 
 C_GEN = 0.004   # 一次候选生成的真实耗时（秒，代表 LLM）；c_merge≈0（锁内 KV 操作）
 N_OBJ = 10
@@ -80,7 +81,7 @@ def run(strategy_name, n_threads, seed):
     latencies = []
     lat_lock = threading.Lock()
     committed = [0]
-    strat_enum = cc.CommitStrategy.kCAST if strategy_name == "CAST" else cc.CommitStrategy.kStrictOCC
+    strat_enum = cc.CommitStrategy.kCAST if strategy_name == "HYBRID" else cc.CommitStrategy.kStrictOCC
 
     def worker():
         while True:
@@ -128,12 +129,12 @@ def run(strategy_name, n_threads, seed):
 def main():
     RESULTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
     os.makedirs(RESULTS, exist_ok=True)
-    seeds = [1, 2, 3]
+    seeds = [1, 2, 3, 4, 5]
     threads_list = [1, 2, 4, 8]
-    strategies = ["OCC", "2PL", "CAST"]
+    strategies = ["OCC", "2PL", "HYBRID"]
     agg = {s: {"tp": [], "tp_sd": [], "lat": [], "lat_sd": []} for s in strategies}
     print(f"=== 真并发实测（N_TASKS={N_TASKS}, C_GEN={C_GEN}s, 写/任务={W}, 可合并={P_MERGE}, seeds={seeds}）===")
-    print(f"{'threads':>7} | {'strategy':>8} | {'throughput(±sd)':>18} | {'latency_ms(±sd)':>16} | regen/merge")
+    print(f"{'threads':>7} | {'strategy':>8} | {'throughput(±CI)':>18} | {'latency_ms(±CI)':>16} | regen/merge")
     rows = []
     for nt in threads_list:
         for s in strategies:
@@ -141,8 +142,8 @@ def main():
             for sd in seeds:
                 r = run(s, nt, sd)
                 tps.append(r["throughput"]); lats.append(r["mean_latency"]); regens.append(r["regen"]); merges.append(r["merge"])
-            tp_m, tp_s = statistics.mean(tps), (statistics.stdev(tps) if len(tps) > 1 else 0)
-            lat_m, lat_s = statistics.mean(lats), (statistics.stdev(lats) if len(lats) > 1 else 0)
+            tp_m, tp_s = E.mean_ci(tps)     # 均值 ± 95%CI 半宽
+            lat_m, lat_s = E.mean_ci(lats)
             agg[s]["tp"].append(tp_m); agg[s]["tp_sd"].append(tp_s); agg[s]["lat"].append(lat_m); agg[s]["lat_sd"].append(lat_s)
             rows.append({"threads": nt, "strategy": s, "throughput": round(tp_m, 1), "tp_sd": round(tp_s, 1),
                          "latency_ms": round(lat_m, 2), "lat_sd": round(lat_s, 2),
@@ -154,15 +155,13 @@ def main():
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys())); w.writeheader(); w.writerows(rows)
 
     fig, (a1, a2) = plt.subplots(1, 2, figsize=(11, 4.3))
-    style = {"OCC": ("o-", "tab:blue"), "2PL": ("d-.", "tab:red"), "CAST": ("s-", "tab:green")}
     for s in strategies:
-        st, c = style[s]
-        a1.errorbar(threads_list, agg[s]["tp"], yerr=agg[s]["tp_sd"], fmt=st, color=c, label=s, linewidth=2, capsize=3)
-        a2.errorbar(threads_list, agg[s]["lat"], yerr=agg[s]["lat_sd"], fmt=st, color=c, label=s, linewidth=2, capsize=3)
+        a1.errorbar(threads_list, agg[s]["tp"], yerr=agg[s]["tp_sd"], **E.fmt(s))
+        a2.errorbar(threads_list, agg[s]["lat"], yerr=agg[s]["lat_sd"], **E.fmt(s))
     a1.set_xlabel("concurrent agents (threads)"); a1.set_ylabel("throughput (committed/s, measured)"); a1.set_title("(a) throughput — higher better"); a1.legend(); a1.grid(True, alpha=0.3)
     a2.set_xlabel("concurrent agents (threads)"); a2.set_ylabel("mean latency (ms, measured)"); a2.set_title("(b) latency — lower better"); a2.legend(); a2.grid(True, alpha=0.3)
     fig.suptitle("gap1: REAL multi-threaded execution + wall-clock timing (not analytical)\n"
-                 "OCC/2PL/CAST run in the same concurrent framework; 3 seeds, mean±std", fontsize=10, y=1.05)
+                 "OCC/2PL/HYBRID run in the same concurrent framework; " + E.CI_NOTE, fontsize=10, y=1.05)
     fig.tight_layout()
     out = os.path.join(RESULTS, "concurrent.png"); fig.savefig(out, dpi=130, bbox_inches="tight"); print("saved", out)
 

@@ -64,6 +64,7 @@ class VitaBenchWorkload:
         intent = cc.WriteIntent()
         intent.object_id = oid
         intent.intent_type = intent_type
+        intent.commutative = intent_type == cc.IntentType.kAppend
         if intent_type == cc.IntentType.kDelta:
             intent.payload = "-1"
             branch_value = str(int(v.value) - 1)

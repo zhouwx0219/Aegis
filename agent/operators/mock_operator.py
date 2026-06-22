@@ -30,6 +30,7 @@ class MockOperator:
         intent = cc.WriteIntent()
         intent.object_id = object_id
         intent.intent_type = intent_type
+        intent.commutative = intent_type == cc.IntentType.kAppend
         intent.payload = payload
         if cas_expected is not None:
             cond = cc.Condition()

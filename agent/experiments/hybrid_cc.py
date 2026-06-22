@@ -23,6 +23,7 @@ sys.path.insert(0, ROOT)
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import eval_common as E
 
 RESULTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
 os.makedirs(RESULTS, exist_ok=True)
@@ -97,10 +98,10 @@ def run(commit_mode, n_threads, n_obj, seed):
 
 def main():
     threads_list = [1, 2, 4, 8, 16, 32]
-    seeds = [1, 2]
+    seeds = [1, 2, 3, 4, 5]
     N_OBJ = 64   # 中低冲突，给去中心化留并行空间
-    data = {"global": {"tp": [], "lat": []}, "per_object": {"tp": [], "lat": []}}
-    print(f"=== 混合CC：去中心化提交 vs 全局提交点（n_obj={N_OBJ}, t_commit={T_COMMIT}s, 2 seeds）===")
+    data = {"global": {"tp": [], "tp_ci": [], "lat": []}, "per_object": {"tp": [], "tp_ci": [], "lat": []}}
+    print(f"=== 混合CC：去中心化提交 vs 全局提交点（n_obj={N_OBJ}, t_commit={T_COMMIT}s, {len(seeds)} seeds, ±95%CI）===")
     print(f"{'threads':>7} | {'global tp':>10} {'lat(ms)':>8} | {'per-object tp':>13} {'lat(ms)':>8} | speedup")
     for nt in threads_list:
         row = {}
@@ -109,23 +110,25 @@ def main():
             for sd in seeds:
                 tp, la = run(mode, nt, N_OBJ, sd)
                 tps.append(tp); lats.append(la)
-            data[mode]["tp"].append(statistics.mean(tps)); data[mode]["lat"].append(statistics.mean(lats))
-            row[mode] = statistics.mean(tps)
+            m, half = E.mean_ci(tps)
+            data[mode]["tp"].append(m); data[mode]["tp_ci"].append(half)
+            data[mode]["lat"].append(statistics.mean(lats))
+            row[mode] = m
         sp = row["per_object"] / row["global"]
         print(f"{nt:>7} | {row['global']:>10.0f} {data['global']['lat'][-1]:>8.2f} | {row['per_object']:>13.0f} {data['per_object']['lat'][-1]:>8.2f} | {sp:>5.2f}x")
 
     fig, (a1, a2) = plt.subplots(1, 2, figsize=(11, 4.3))
-    a1.plot(threads_list, data["global"]["tp"], "o-", color="tab:red", label="global commit-lock (current CAST)", linewidth=2)
-    a1.plot(threads_list, data["per_object"]["tp"], "s-", color="tab:green", label="per-object decentralized (hybrid)", linewidth=2)
+    a1.errorbar(threads_list, data["global"]["tp"], yerr=data["global"]["tp_ci"], **{**E.fmt("global"), "label": "global commit-lock (centralized)"})
+    a1.errorbar(threads_list, data["per_object"]["tp"], yerr=data["per_object"]["tp_ci"], **{**E.fmt("per_object"), "label": "per-object decentralized (hybrid)"})
     a1.axhline(1.0 / T_COMMIT, ls=":", color="gray", label=f"global ceiling ≈ 1/t_commit = {1/T_COMMIT:.0f}/s")
     a1.set_xlabel("concurrent agents (threads)"); a1.set_ylabel("throughput (committed/s, measured)")
     a1.set_title("(a) throughput — decentralized commit removes the single-point ceiling"); a1.legend(fontsize=8); a1.grid(True, alpha=0.3)
-    a2.plot(threads_list, data["global"]["lat"], "o-", color="tab:red", label="global", linewidth=2)
-    a2.plot(threads_list, data["per_object"]["lat"], "s-", color="tab:green", label="per-object", linewidth=2)
+    a2.plot(threads_list, data["global"]["lat"], **{**E.fmt_plot("global"), "label": "global"})
+    a2.plot(threads_list, data["per_object"]["lat"], **{**E.fmt_plot("per_object"), "label": "per-object"})
     a2.set_xlabel("concurrent agents (threads)"); a2.set_ylabel("mean latency (ms)")
     a2.set_title("(b) latency"); a2.legend(fontsize=8); a2.grid(True, alpha=0.3)
     fig.suptitle("Hybrid CC: per-object decentralized commit vs single global commit-point\n"
-                 "t_commit models real-backend persist/validate cost; same CAST semantics on both (fair)", fontsize=9.5, y=1.05)
+                 "t_commit models real-backend persist/validate cost; same CAST semantics on both (fair) — " + E.CI_NOTE, fontsize=9.5, y=1.05)
     fig.tight_layout()
     out = os.path.join(RESULTS, "hybrid_cc.png"); fig.savefig(out, dpi=130, bbox_inches="tight"); print("\nsaved", out)
 

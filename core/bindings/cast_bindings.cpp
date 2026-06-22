@@ -1,11 +1,13 @@
 // pybind11 桥接：把 C++ 事务内核暴露为 Python 扩展模块 cast_core。
-// Python 层（算子/调度/workload）通过它构造候选并调用成本不对称提交。
+// Python 层（算子/调度/workload）通过它构造候选并调用成本不对称提交、escrow、混合分发器。
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
 #include <vector>
 
 #include "core/branch/speculative_branch.h"
+#include "core/concurrency/escrow.h"
+#include "core/concurrency/hybrid_dispatcher.h"
 #include "core/cost/cost_model.h"
 #include "core/intent/intent.h"
 #include "core/intent/policy_dispatcher.h"
@@ -17,7 +19,7 @@ namespace py = pybind11;
 using namespace cast;
 
 PYBIND11_MODULE(cast_core, m) {
-  m.doc() = "CAST: cost-asymmetric speculative transactions core (C++ kernel)";
+  m.doc() = "CAST/ASTRA: cost-asymmetric speculative transactions + hybrid CC core (C++ kernel)";
 
   py::enum_<object::ObjectType>(m, "ObjectType")
       .value("kGeneric", object::ObjectType::kGeneric)
@@ -52,7 +54,10 @@ PYBIND11_MODULE(cast_core, m) {
       .def_readwrite("object_id", &intent::WriteIntent::object_id)
       .def_readwrite("intent_type", &intent::WriteIntent::intent_type)
       .def_readwrite("payload", &intent::WriteIntent::payload)
-      .def_readwrite("condition", &intent::WriteIntent::condition);
+      .def_readwrite("commutative", &intent::WriteIntent::commutative)
+      .def_readwrite("condition", &intent::WriteIntent::condition)
+      .def_readwrite("constrained", &intent::WriteIntent::constrained)
+      .def_readwrite("lower_bound", &intent::WriteIntent::lower_bound);
 
   py::class_<storage::VersionedObjectStore>(m, "VersionedObjectStore")
       .def(py::init<>())
@@ -105,6 +110,7 @@ PYBIND11_MODULE(cast_core, m) {
 
   py::class_<txn::CommitOutcome>(m, "CommitOutcome")
       .def_readonly("committed", &txn::CommitOutcome::committed)
+      .def_readonly("rejected", &txn::CommitOutcome::rejected)
       .def_readonly("winner_branch_id", &txn::CommitOutcome::winner_branch_id)
       .def_readonly("action", &txn::CommitOutcome::action)
       .def_readonly("reason", &txn::CommitOutcome::reason);
@@ -119,4 +125,62 @@ PYBIND11_MODULE(cast_core, m) {
             return self.CommitTask(candidates, strategy, &stats);
           },
           py::arg("candidates"), py::arg("strategy"), py::arg("stats"));
+
+  // ===== 下沉的约束可交换(escrow) + 混合并发分发器 =====
+  py::class_<concurrency::EscrowAccount>(m, "EscrowAccount")
+      .def(py::init<>())
+      .def(py::init<long long, long long>(), py::arg("capacity"), py::arg("lower_bound") = 0)
+      .def("reserve", &concurrency::EscrowAccount::Reserve, py::arg("q"))
+      .def("release", &concurrency::EscrowAccount::Release, py::arg("q"))
+      .def("remaining", &concurrency::EscrowAccount::remaining)
+      .def("lower_bound", &concurrency::EscrowAccount::lower_bound)
+      .def("granted", &concurrency::EscrowAccount::granted)
+      .def("rejected", &concurrency::EscrowAccount::rejected)
+      .def("oversold", &concurrency::EscrowAccount::oversold);
+
+  py::enum_<concurrency::CCClass>(m, "CCClass")
+      .value("kRead", concurrency::CCClass::kRead)
+      .value("kCommFree", concurrency::CCClass::kCommFree)
+      .value("kCommConstr", concurrency::CCClass::kCommConstr)
+      .value("kStrict", concurrency::CCClass::kStrict);
+
+  py::enum_<concurrency::HybridPolicy>(m, "HybridPolicy")
+      .value("kOCC", concurrency::HybridPolicy::kOCC)
+      .value("kMVCC", concurrency::HybridPolicy::kMVCC)
+      .value("k2PL", concurrency::HybridPolicy::k2PL)
+      .value("kMergeAll", concurrency::HybridPolicy::kMergeAll)
+      .value("kHybrid", concurrency::HybridPolicy::kHybrid);
+
+  py::enum_<concurrency::TaskOutcome>(m, "TaskOutcome")
+      .value("kDirect", concurrency::TaskOutcome::kDirect)
+      .value("kReselect", concurrency::TaskOutcome::kReselect)
+      .value("kAllAborted", concurrency::TaskOutcome::kAllAborted);
+
+  py::class_<concurrency::AdaptiveCandidate>(m, "AdaptiveCandidate")
+      .def(py::init<>())
+      .def_readwrite("reads", &concurrency::AdaptiveCandidate::reads)
+      .def_readwrite("writes", &concurrency::AdaptiveCandidate::writes)
+      .def_readwrite("base", &concurrency::AdaptiveCandidate::base);
+
+  py::class_<concurrency::DispatchStats>(m, "DispatchStats")
+      .def_readonly("committed", &concurrency::DispatchStats::committed)
+      .def_readonly("reselect", &concurrency::DispatchStats::reselect)
+      .def_readonly("regen", &concurrency::DispatchStats::regen)
+      .def_readonly("merge", &concurrency::DispatchStats::merge)
+      .def_readonly("escrow_grant", &concurrency::DispatchStats::escrow_grant)
+      .def_readonly("escrow_reject", &concurrency::DispatchStats::escrow_reject)
+      .def_readonly("oversell", &concurrency::DispatchStats::oversell);
+
+  py::class_<concurrency::HybridDispatcher>(m, "HybridDispatcher")
+      .def(py::init<concurrency::HybridPolicy>(), py::arg("policy"))
+      .def("init_strict", &concurrency::HybridDispatcher::init_strict, py::arg("o"))
+      .def("init_counter", &concurrency::HybridDispatcher::init_counter, py::arg("o"))
+      .def("init_stock", &concurrency::HybridDispatcher::init_stock, py::arg("o"), py::arg("s0"))
+      .def("init_read", &concurrency::HybridDispatcher::init_read, py::arg("o"))
+      .def("snapshot", &concurrency::HybridDispatcher::snapshot, py::arg("objs"))
+      .def("commit_task", &concurrency::HybridDispatcher::commit_task, py::arg("cands"))
+      .def("commit_regen", &concurrency::HybridDispatcher::commit_regen, py::arg("c"))
+      .def("commit_2pl", &concurrency::HybridDispatcher::commit_2pl, py::arg("c"))
+      .def("stats", &concurrency::HybridDispatcher::stats)
+      .def("value_of", &concurrency::HybridDispatcher::value_of, py::arg("o"));
 }

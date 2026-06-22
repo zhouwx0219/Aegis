@@ -1,8 +1,8 @@
 #pragma once
-// 成本不对称提交协议（CAST 的核心）。
-// 与 strict OCC 的根本区别：遇到提交冲突时不默认 abort→重跑(昂贵)，
-// 而是优先用语义可合并性 rebase 合并(merge)或改提交已有候选(reselect)，
-// 把昂贵的 regenerate 压到最后手段。目标：最小化浪费的算力。
+// Cost-asymmetric commit protocol.
+// Resolution order: direct -> semantic rebase -> reselect -> regenerate.
+// Semantic rejection (for example exhausted escrow or failed CAS) is not a
+// version conflict and therefore must not trigger an expensive regeneration.
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -15,14 +15,15 @@
 namespace cast::txn {
 
 enum class CommitStrategy {
-  kStrictOCC,  // baseline：任何版本冲突 → abort → regenerate
-  kCAST,       // ours：commutative/conditional 冲突先 rebase 合并；再 reselect；最后才 regenerate
+  kStrictOCC,
+  kCAST,
 };
 
 struct CommitOutcome {
   bool committed = false;
+  bool rejected = false;
   std::string winner_branch_id;
-  std::string action;  // "direct" | "merge" | "reselect" | "regenerate" | "abort"
+  std::string action;  // direct | merge | reselect | regenerate | reject | abort
   std::string reason;
 };
 
@@ -31,7 +32,6 @@ class CostAsymmetricCommit {
   CostAsymmetricCommit(storage::VersionedObjectStore& store, cost::CostModel model)
       : store_(store), model_(model) {}
 
-  // 提交一个任务：从若干候选中选 winner 提交；按 strategy 处理冲突；统计成本。
   CommitOutcome CommitTask(std::vector<branch::SpeculativeBranch>& candidates,
                            CommitStrategy strategy, cost::CostStats* stats) {
     CommitOutcome out;
@@ -43,59 +43,88 @@ class CostAsymmetricCommit {
     stats->candidates_generated += candidates.size();
     stats->n_tasks += 1;
 
-    // winner = 质量最高
     std::size_t winner_idx = 0;
     for (std::size_t i = 1; i < candidates.size(); ++i) {
       if (candidates[i].quality > candidates[winner_idx].quality) winner_idx = i;
     }
 
-    // 第一轮尝试提交 winner
-    TryResult tr = TryCommit(candidates[winner_idx], strategy);
-    if (tr.committed) {
-      stats->n_merge += tr.merges;
+    TryResult first = TryCommit(candidates[winner_idx], strategy);
+    if (first.committed) {
+      stats->n_merge += first.merges;
       out.committed = true;
       out.winner_branch_id = candidates[winner_idx].branch_id;
-      out.action = tr.action;
+      out.action = first.action;
       return out;
     }
 
-    // CAST：先试 reselect 其他已生成候选（零额外生成成本）
+    bool has_conflict = first.failure == FailureKind::kConflict;
+    std::size_t retry_idx = winner_idx;
+    std::string reject_reason =
+        first.failure == FailureKind::kSemanticReject ? first.reason : "";
+
     if (strategy == CommitStrategy::kCAST) {
       for (std::size_t i = 0; i < candidates.size(); ++i) {
         if (i == winner_idx) continue;
-        TryResult tr2 = TryCommit(candidates[i], strategy);
-        if (tr2.committed) {
-          stats->n_merge += tr2.merges;
+        TryResult tr = TryCommit(candidates[i], strategy);
+        if (tr.committed) {
+          stats->n_merge += tr.merges;
           stats->n_reselect += 1;
           out.committed = true;
           out.winner_branch_id = candidates[i].branch_id;
           out.action = "reselect";
           return out;
         }
+        if (!has_conflict && tr.failure == FailureKind::kConflict) {
+          has_conflict = true;
+          retry_idx = i;
+        }
+        if (tr.failure == FailureKind::kSemanticReject && reject_reason.empty()) {
+          reject_reason = tr.reason;
+        }
       }
     }
 
-    // 最后手段：regenerate（重读最新基线后重试，必成功）——这是唯一花 c_gen 的路径
+    // All alternatives failed a business condition. Regeneration cannot create
+    // inventory or make a false CAS condition true, so reject without paying c_gen.
+    if (!has_conflict) {
+      out.rejected = true;
+      out.action = "reject";
+      out.reason = reject_reason.empty() ? "semantic condition rejected" : reject_reason;
+      return out;
+    }
+
     stats->n_regen += 1;
-    RefreshBaseline(candidates[winner_idx]);
-    TryResult tr3 = TryCommit(candidates[winner_idx], strategy);
-    stats->n_merge += tr3.merges;
-    out.committed = tr3.committed;
-    out.winner_branch_id = candidates[winner_idx].branch_id;
-    out.action = "regenerate";
-    if (!tr3.committed) out.reason = "regenerate still failed";
+    std::string refresh_reason;
+    if (!RefreshBaseline(candidates[retry_idx], &refresh_reason)) {
+      out.rejected = true;
+      out.action = "reject";
+      out.reason = refresh_reason;
+      return out;
+    }
+
+    TryResult retried = TryCommit(candidates[retry_idx], strategy);
+    stats->n_merge += retried.merges;
+    out.committed = retried.committed;
+    out.rejected = retried.failure == FailureKind::kSemanticReject;
+    out.winner_branch_id = candidates[retry_idx].branch_id;
+    out.action = out.rejected ? "reject" : "regenerate";
+    if (!retried.committed) {
+      out.reason = retried.reason.empty() ? "regenerate still failed" : retried.reason;
+    }
     return out;
   }
 
  private:
+  enum class FailureKind { kNone, kConflict, kSemanticReject };
+
   struct TryResult {
     bool committed = false;
     std::size_t merges = 0;
-    std::string action;  // "direct" | "merge"
+    std::string action;
+    FailureKind failure = FailureKind::kNone;
+    std::string reason;
   };
 
-  // 尝试把一个候选原子提交。CAST 对 commutative/conditional 冲突做 rebase；
-  // strict 冲突或 OCC 策略下任何版本变化都视作冲突。
   TryResult TryCommit(const branch::SpeculativeBranch& b, CommitStrategy strategy) {
     std::vector<storage::VersionCheck> checks;
     std::vector<storage::WriteOp> writes;
@@ -104,54 +133,89 @@ class CostAsymmetricCommit {
 
     for (const auto& w : b.writes) {
       const auto cur = store_.Get(w.object_id);
+      const auto cls = intent::PolicyDispatcher::Classify(w.intent);
+
+      if (cls == intent::PolicyDispatcher::ConcurrencyClass::kReadOnly) continue;
+
       if (cur.version == w.base_version) {
-        // 版本未变：CAS 仍需校验条件（避免 regenerate 强行对齐版本后绕过条件 -> 重复占用）
-        if (w.intent.intent_type == intent::IntentType::kCas &&
-            w.intent.condition.type == intent::ConditionType::kValueEquals &&
-            cur.value != w.intent.condition.expected_value) {
-          return TryResult{false, 0, ""};
+        // CAS and constrained DELTA are business predicates, not merely version
+        // checks. Re-evaluate them even on the fast/direct path.
+        if (cls == intent::PolicyDispatcher::ConcurrencyClass::kConditionalRebase ||
+            cls == intent::PolicyDispatcher::ConcurrencyClass::kConstrainedCommutative) {
+          const auto rr = intent::PolicyDispatcher::ResolveWrite(
+              w.base_value, w.branch_value, w.intent, cur.value);
+          if (!rr.success) {
+            return TryResult{false, 0, "", FailureKind::kSemanticReject, rr.reason};
+          }
+          if (rr.should_write) {
+            checks.push_back({w.object_id, cur.version});
+            writes.push_back({w.object_id, rr.value});
+          }
+        } else {
+          checks.push_back({w.object_id, w.base_version});
+          writes.push_back({w.object_id, w.branch_value});
         }
-        // 否则直接用分支缓冲值
-        checks.push_back({w.object_id, w.base_version});
-        writes.push_back({w.object_id, w.branch_value});
         continue;
       }
-      // 版本已变：是否可语义重绑定？
-      const auto cls = intent::PolicyDispatcher::Classify(w.intent.intent_type);
+
       const bool rebindable =
           strategy == CommitStrategy::kCAST &&
           (cls == intent::PolicyDispatcher::ConcurrencyClass::kCommutativeRebase ||
+           cls == intent::PolicyDispatcher::ConcurrencyClass::kConstrainedCommutative ||
            cls == intent::PolicyDispatcher::ConcurrencyClass::kConditionalRebase);
       if (!rebindable) {
-        return TryResult{false, 0, ""};  // strict 冲突或 OCC：整体冲突
+        return TryResult{false, 0, "", FailureKind::kConflict, "version conflict"};
       }
-      const auto rr = intent::PolicyDispatcher::ResolveWrite(w.base_value, w.branch_value,
-                                                             w.intent, cur.value);
+
+      const auto rr = intent::PolicyDispatcher::ResolveWrite(
+          w.base_value, w.branch_value, w.intent, cur.value);
       if (!rr.success) {
-        return TryResult{false, 0, ""};  // 如 CAS 条件不再成立
+        return TryResult{false, 0, "", FailureKind::kSemanticReject, rr.reason};
       }
-      checks.push_back({w.object_id, cur.version});
-      writes.push_back({w.object_id, rr.value});
+      if (rr.should_write) {
+        checks.push_back({w.object_id, cur.version});
+        writes.push_back({w.object_id, rr.value});
+      }
       used_rebase = true;
-      if (cls == intent::PolicyDispatcher::ConcurrencyClass::kCommutativeRebase) merges += 1;
+      if (cls == intent::PolicyDispatcher::ConcurrencyClass::kCommutativeRebase ||
+          cls == intent::PolicyDispatcher::ConcurrencyClass::kConstrainedCommutative) {
+        ++merges;
+      }
     }
 
     if (store_.BatchPutIfVersion(checks, writes)) {
-      return TryResult{true, merges, used_rebase ? "merge" : "direct"};
+      return TryResult{true, merges, used_rebase ? "merge" : "direct",
+                       FailureKind::kNone, ""};
     }
-    return TryResult{false, 0, ""};
+    return TryResult{false, 0, "", FailureKind::kConflict,
+                     "atomic version check failed"};
   }
 
-  // 模拟"基于最新状态重新生成候选"：把基线对齐到当前 store，并把目标值重绑定到最新值。
-  void RefreshBaseline(branch::SpeculativeBranch& b) {
+  bool RefreshBaseline(branch::SpeculativeBranch& b, std::string* reason) {
     for (auto& w : b.writes) {
       const auto cur = store_.Get(w.object_id);
-      const auto rr = intent::PolicyDispatcher::ResolveWrite(w.base_value, w.branch_value,
-                                                             w.intent, cur.value);
+      const auto cls = intent::PolicyDispatcher::Classify(w.intent);
+
+      // Regenerating an ordered APPEND means replaying its declared payload on
+      // the newest value. OVERWRITE keeps its generated target value.
+      const bool recompute =
+          w.intent.intent_type == intent::IntentType::kAppend ||
+          cls == intent::PolicyDispatcher::ConcurrencyClass::kCommutativeRebase ||
+          cls == intent::PolicyDispatcher::ConcurrencyClass::kConstrainedCommutative ||
+          cls == intent::PolicyDispatcher::ConcurrencyClass::kConditionalRebase;
+      if (recompute) {
+        const auto rr = intent::PolicyDispatcher::ResolveWrite(
+            w.base_value, w.branch_value, w.intent, cur.value);
+        if (!rr.success) {
+          if (reason) *reason = rr.reason;
+          return false;
+        }
+        if (rr.should_write) w.branch_value = rr.value;
+      }
       w.base_value = cur.value;
       w.base_version = cur.version;
-      if (rr.success) w.branch_value = rr.value;
     }
+    return true;
   }
 
   storage::VersionedObjectStore& store_;

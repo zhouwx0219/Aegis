@@ -94,7 +94,7 @@ def evaluate(batch_size, n_batches=40, seed=7):
     cast = timed_optimistic(cc.CommitStrategy.kCAST, VitaBenchWorkload(seed=seed), plan)
     twopl = timed_2pl(VitaBenchWorkload(seed=seed), plan)
     mvcc = occ  # 写密集负载下 MVCC-SI ≡ OCC（见模块注释）
-    return {"batch_size": batch_size, "OCC": occ, "MVCC": mvcc, "2PL": twopl, "CAST": cast}
+    return {"batch_size": batch_size, "OCC": occ, "MVCC": mvcc, "2PL": twopl, "HYBRID": cast}
 
 
 def main():
@@ -105,28 +105,28 @@ def main():
         w = csv.writer(f)
         w.writerow(["batch_size", "strategy", "wasted_per_task", "mean_latency", "throughput", "makespan"])
         for d in data:
-            for s in ("OCC", "MVCC", "2PL", "CAST"):
+            for s in ("OCC", "MVCC", "2PL", "HYBRID"):
                 m = d[s]
                 w.writerow([d["batch_size"], s, round(m["wasted_per_task"], 4),
                             round(m["mean_latency"], 4), round(m["throughput"], 4), round(m["makespan"], 4)])
 
     print("=== Step A 多维对比 (VitaBench-derived, 40 批) ===")
-    print(f"{'batch':>5} | {'metric':>13} | {'OCC':>8} {'2PL':>8} {'MVCC':>8} {'CAST':>8}")
+    print(f"{'batch':>5} | {'metric':>13} | {'OCC':>8} {'2PL':>8} {'MVCC':>8} {'HYBRID':>8}")
     for d in data:
         for key, name in [("wasted_per_task", "wasted/task"), ("mean_latency", "mean_latency"), ("throughput", "throughput")]:
             print(f"{d['batch_size']:>5} | {name:>13} | {d['OCC'][key]:>8.3f} {d['2PL'][key]:>8.3f} "
-                  f"{d['MVCC'][key]:>8.3f} {d['CAST'][key]:>8.3f}")
+                  f"{d['MVCC'][key]:>8.3f} {d['HYBRID'][key]:>8.3f}")
         print("  " + "-" * 60)
 
     # 三面板图：wasted / mean_latency / throughput vs batch_size
     styles = {"OCC": ("o-", "tab:blue"), "2PL": ("d-.", "tab:red"),
-              "MVCC": ("x:", "tab:purple"), "CAST": ("s-", "tab:green")}
+              "MVCC": ("x:", "tab:purple"), "HYBRID": ("s-", "tab:green")}
     panels = [("wasted_per_task", "wasted compute / task (c_gen)", "(a) cost — lower better"),
               ("mean_latency", "mean task latency (t_gen units)", "(b) latency — lower better"),
               ("throughput", "throughput (committed / wall-time)", "(c) throughput — higher better")]
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.3))
     for ax, (key, ylab, title) in zip(axes, panels):
-        for s in ("OCC", "2PL", "MVCC", "CAST"):
+        for s in ("OCC", "2PL", "MVCC", "HYBRID"):
             st, c = styles[s]
             lbl = s + (" (≈OCC)" if s == "MVCC" else "")
             ax.plot([d["batch_size"] for d in data], [d[s][key] for d in data], st, color=c, label=lbl, linewidth=2, markersize=6)
@@ -136,7 +136,7 @@ def main():
         ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
     fig.suptitle("Step A — cost × latency × throughput on VitaBench-derived load\n"
-                 "CAST wins on all three; 2PL avoids waste but serializes (latency/throughput collapse under contention)",
+                 "HYBRID wins on all three; 2PL avoids waste but serializes (latency/throughput collapse under contention)",
                  fontsize=11, y=1.06)
     fig.tight_layout()
     out = os.path.join(RESULTS, "timed.png")

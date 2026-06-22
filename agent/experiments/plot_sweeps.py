@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 
 RESULTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
 STYLE = {"OCC": ("o-", "tab:blue"), "SCC_2S": ("^--", "tab:orange"), "CAST": ("s-", "tab:green")}
-LABEL = {"OCC": "OCC (= SCC-1S)", "SCC_2S": "SCC-2S (speculation on)", "CAST": "CAST (ours)"}
+LABEL = {"OCC": "OCC (= SCC-1S)", "SCC_2S": "SCC-2S (speculation on)", "CAST": "HYBRID (ours)"}
 
 
 def load(name):
@@ -48,7 +48,7 @@ for ax, (name, xlabel, logx, title) in zip(axes, SPECS):
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
-fig.suptitle("CAST vs strict OCC vs SCC-kS under the agent cost structure (lower is better)\n"
+fig.suptitle("HYBRID vs strict OCC vs SCC-kS under the agent cost structure (lower is better)\n"
              "SCC-best collapses to k*=1 (=OCC): speculation never pays when every shadow is an expensive generation",
              fontsize=11, y=1.06)
 fig.tight_layout()

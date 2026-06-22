@@ -22,6 +22,7 @@
   真多线程 + 真实墙钟；sleep 代表 c_gen(秒级 LLM)，commit 临界区在内存(≈0)；
   每任务必提交一个候选，冲突→reselect 其他候选(≈0)→都不行→regenerate(再花 c_gen)。
   吞吐=committed/wall，延迟=每任务墙钟均值；waste=regen 次数×c_gen；多 seed 报均值。
+  提交内核(解析/验证/escrow/计数)已下沉至 C++ cast_core.HybridDispatcher；Python 仅管线程/生成/计时。
 """
 import os
 import queue
@@ -33,9 +34,11 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, ROOT)
+import cast_core as cc  # 下沉的 C++ 混合并发分发器
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import eval_common as E
 
 RESULTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
 os.makedirs(RESULTS, exist_ok=True)
@@ -47,7 +50,7 @@ R = 1                  # 读/候选
 K = 3                  # 候选分支数（乐观策略用，2PL 不投机）
 # 异构对象群混合占比：strict / 无约束可交换 / 带约束可交换 / 只读
 MIX = {"strict": 0.30, "commfree": 0.30, "commconstr": 0.25, "read": 0.15}
-POLICIES = ["OCC", "MVCC", "2PL", "CAST-all", "HYBRID"]
+POLICIES = ["OCC", "MVCC", "2PL", "merge-all", "HYBRID"]
 
 
 def build_pool(n_obj, seed):
@@ -60,7 +63,7 @@ def build_pool(n_obj, seed):
     rng.shuffle(classes)
     cls = {f"o{i}": classes[i] for i in range(n_obj)}
     n_constr = sum(1 for c in classes if c == "commconstr")
-    # 每个约束对象的预期提交扣减量；S0 设成约 0.5× → 需求约 2× 库存，CAST-all 必超卖
+    # 每个约束对象的预期提交扣减量；S0 设成约 0.5× → 需求约 2× 库存，merge-all 必超卖
     demand_per = (N_TASKS * W * MIX["commconstr"]) / max(1, n_constr)
     s0 = max(3, int(0.5 * demand_per))
     store = {}
@@ -87,68 +90,49 @@ def gen_candidates(rng, store, cls, k):
     return cands
 
 
-def snap(store, cand):
-    objs = list(cand["reads"]) + cand["writes"]
-    return {o: store[o][1] for o in objs}
+# === 提交内核已下沉至 C++ ===
+# per-object/intent 自适应解析(apply)、验证层冲突判定(would_abort)、escrow 守界、
+# winner/reselect 选择与所有 CC 计数(merge/escrow/oversell)均由 cast_core.HybridDispatcher 执行。
+# Python 仅保留 agent 运行时：线程、候选生成、sleep 代表 c_gen、重试编排(regen 第二次 sleep)。
+POL = {
+    "OCC": "kOCC", "MVCC": "kMVCC", "2PL": "k2PL",
+    "merge-all": "kMergeAll", "HYBRID": "kHybrid",
+}
 
 
-def apply_write(store, o, cls, policy, ctr):
-    """按对象类 + 策略落库；返回是否真正应用了写。记 ctr 的 merge/escrow/oversell。"""
-    c = cls[o]
-    val, ver = store[o]
-    if c == "strict":
-        store[o] = ["set", ver + 1]
-        return True
-    if c == "commfree":                       # 无约束可交换 → 合并(累加)，永远安全
-        store[o] = [val + 1, ver + 1]
-        ctr["merge"] += 1
-        return True
-    if c == "commconstr":                     # 带下界约束的扣减
-        if policy == "CAST-all":              # 盲并：不查下界 → 可超卖
-            nv = val - 1
-            if nv < 0:
-                ctr["oversell"] += 1          # 违反 stock>=0（正确性事故）
-            store[o] = [nv, ver + 1]
-            ctr["merge"] += 1
-            return True
-        # HYBRID=escrow / OCC / MVCC / 2PL：带守卫的扣减（库存耗尽则正确拒绝，不超卖）
-        if val > 0:
-            store[o] = [val - 1, ver + 1]
-            if policy == "HYBRID":
-                ctr["escrow_grant"] += 1
-            return True
-        if policy == "HYBRID":
-            ctr["escrow_reject"] += 1         # 正确的缺货拒绝：非浪费、非超卖
-        return True
-    return True                               # read：不写
+def build_dispatcher(policy, cls, s0):
+    """把异构对象群按意图类注册进 C++ 分发器（catalog + 初始库存）。"""
+    disp = cc.HybridDispatcher(getattr(cc.HybridPolicy, POL[policy]))
+    for o, cname in cls.items():
+        if cname == "commfree":
+            disp.init_counter(o)          # 无约束可交换计数器
+        elif cname == "commconstr":
+            disp.init_stock(o, s0)        # 带下界约束库存(escrow 容量)
+        elif cname == "strict":
+            disp.init_strict(o)           # 覆盖写
+        else:
+            disp.init_read(o)             # 只读
+    return disp
 
 
-def aborts(policy, cand, changed, cls):
-    """提交点是否判该候选冲突（需 reselect/regen）。"""
-    RS = cand["reads"]
-    WS = set(cand["writes"])
-    sWS = {o for o in cand["writes"] if cls[o] == "strict"}
-    if policy == "OCC":
-        return bool((RS | WS) & changed)      # 读集+写集全严格
-    if policy == "MVCC":
-        return bool(WS & changed)             # 读放行(快照)，写写仍冲突
-    if policy in ("CAST-all", "HYBRID"):
-        return bool(sWS & changed)            # 读放行 + 可交换写放行，仅 strict-strict
-    return False                              # 2PL 在锁内提交，无 abort
+def to_cc(cand, disp):
+    """把 Python 生成的候选转成 C++ 候选，并在【生成时】拍下版本基线快照。"""
+    k = cc.AdaptiveCandidate()
+    k.reads = list(cand["reads"])
+    k.writes = list(cand["writes"])
+    k.base = disp.snapshot(k.reads + k.writes)
+    return k
 
 
 def run(policy, n_obj, n_threads, seed):
-    rng_pool = random.Random(seed)
     store, cls, s0 = build_pool(n_obj, seed)
-    store_lock = threading.Lock()
-    obj_locks = {o: threading.Lock() for o in store}
+    objs_all = list(store)                          # 仅取对象名；真实状态保存在 C++ 分发器内
+    disp = build_dispatcher(policy, cls, s0)
+    obj_locks = {o: threading.Lock() for o in objs_all}
     q = queue.Queue()
     for i in range(N_TASKS):
         q.put(i)
-    committed = [0]
     lat = []
-    ctr = {"regen": 0, "reselect": 0, "merge": 0, "escrow_grant": 0,
-           "escrow_reject": 0, "oversell": 0}
     acc = threading.Lock()
     rng_local = threading.local()
 
@@ -158,15 +142,6 @@ def run(policy, n_obj, n_threads, seed):
             r = rng_local.r = random.Random(seed * 1009 + threading.get_ident() % 9973)
         return r
 
-    def commit_one(cand, base):
-        # base 是【生成时】拍下的版本快照；c_gen 期间并发提交会让它过时 → 真实冲突
-        changed = {o for o, v in base.items() if store[o][1] != v}
-        if aborts(policy, cand, changed, cls):
-            return False
-        for o in cand["writes"]:
-            apply_write(store, o, cls, policy, ctr)
-        return True
-
     def worker():
         while True:
             try:
@@ -174,43 +149,27 @@ def run(policy, n_obj, n_threads, seed):
             except queue.Empty:
                 return
             t0 = time.perf_counter()
-            if policy == "2PL":                       # 悲观：锁住涉及对象→生成→提交（串行化热点）
+            if policy == "2PL":                       # 悲观：锁住涉及对象→生成→C++ 提交(串行化热点)
                 cand = gen_candidates(rng(), store, cls, 1)[0]
+                k = to_cc(cand, disp)
                 objs = sorted(set(cand["writes"]) | cand["reads"])
                 locks = [obj_locks[o] for o in objs]
                 for l in locks:
                     l.acquire()
                 try:
                     time.sleep(C_GEN)
-                    with store_lock:
-                        for o in cand["writes"]:
-                            apply_write(store, o, cls, policy, ctr)
-                    with acc:
-                        committed[0] += 1
+                    disp.commit_2pl(k)                # 锁内无冲突，C++ 直接提交
                 finally:
                     for l in reversed(locks):
                         l.release()
             else:
                 cands = gen_candidates(rng(), store, cls, K)
-                bases = [snap(store, c) for c in cands]   # 生成时拍快照（提交前会过时→真冲突）
-                time.sleep(C_GEN)                     # 生成 K 候选（并发重叠）
-                done = False
-                with store_lock:
-                    for idx, c in enumerate(cands):   # winner + reselect 其他候选(≈0)
-                        if commit_one(c, bases[idx]):
-                            done = True
-                            with acc:
-                                committed[0] += 1
-                                if idx > 0:
-                                    ctr["reselect"] += 1
-                            break
-                if not done:                          # 全冲突 → regenerate（再花 c_gen）
-                    time.sleep(C_GEN)
-                    with store_lock:
-                        commit_one(cands[0], snap(store, cands[0]))  # 重读最新基线，必不冲突
-                        with acc:
-                            committed[0] += 1
-                            ctr["regen"] += 1
+                kcands = [to_cc(c, disp) for c in cands]   # 生成时各自拍快照(提交前会过时→真冲突)
+                time.sleep(C_GEN)                     # 生成 K 候选(并发重叠, sleep 释放 GIL)
+                outcome = disp.commit_task(kcands)    # winner→reselect 全在 C++ 一把锁内原子完成
+                if outcome == cc.TaskOutcome.kAllAborted:
+                    time.sleep(C_GEN)                 # 全冲突 → regenerate(再花 c_gen)
+                    disp.commit_regen(kcands[0])      # 重读最新基线，必提交(C++)
             dt = time.perf_counter() - t0
             with acc:
                 lat.append(dt)
@@ -223,20 +182,21 @@ def run(policy, n_obj, n_threads, seed):
     for t in ts:
         t.join()
     wall = time.perf_counter() - w0
+    st = disp.stats()                                 # 所有 CC 计数由 C++ 内核维护
     return {
-        "throughput": committed[0] / wall,
+        "throughput": st.committed / wall,
         "latency_ms": statistics.mean(lat) * 1000 if lat else 0.0,
-        "regen": ctr["regen"], "reselect": ctr["reselect"], "merge": ctr["merge"],
-        "escrow_grant": ctr["escrow_grant"], "escrow_reject": ctr["escrow_reject"],
-        "oversell": ctr["oversell"], "s0": s0,
+        "regen": st.regen, "reselect": st.reselect, "merge": st.merge,
+        "escrow_grant": st.escrow_grant, "escrow_reject": st.escrow_reject,
+        "oversell": st.oversell, "s0": s0,
     }
 
 
 def main():
     n_obj = 24
     threads_list = [1, 2, 4, 8, 16]
-    seeds = [1, 2, 3]
-    agg = {p: {"tp": [], "lat": [], "oversell": []} for p in POLICIES}
+    seeds = [1, 2, 3, 4, 5]
+    agg = {p: {"tp": [], "tp_ci": [], "lat": [], "oversell": [], "oversell_ci": []} for p in POLICIES}
     detail8 = {}   # 8 线程处的动作分解 + 正确性（取均值）
 
     print(f"=== 混合CC：per-object/intent 自适应分发 vs 统一单协议（n_obj={n_obj}, "
@@ -253,10 +213,12 @@ def main():
                 m = run(p, n_obj, nt, sd)
                 tps.append(m["throughput"]); las.append(m["latency_ms"])
                 ovs.append(m["oversell"]); runs.append(m)
-            agg[p]["tp"].append(statistics.mean(tps))
+            tp_m, tp_ci = E.mean_ci(tps)
+            ov_m, ov_ci = E.mean_ci(ovs)
+            agg[p]["tp"].append(tp_m); agg[p]["tp_ci"].append(tp_ci)
             agg[p]["lat"].append(statistics.mean(las))
-            agg[p]["oversell"].append(statistics.mean(ovs))
-            row[p] = statistics.mean(tps)
+            agg[p]["oversell"].append(ov_m); agg[p]["oversell_ci"].append(ov_ci)
+            row[p] = tp_m
             if nt == 8:
                 detail8[p] = {k: statistics.mean([r[k] for r in runs])
                               for k in ("regen", "reselect", "merge",
@@ -272,7 +234,7 @@ def main():
         "OCC": "正确但慢(可交换写全重跑)",
         "MVCC": "正确但慢(写写重跑,读放行)",
         "2PL": "正确但延迟高(锁串行)",
-        "CAST-all": "快但【超卖→错误】",
+        "merge-all": "快但【超卖→错误】",
         "HYBRID": "★ 快 且 正确(零超卖)",
     }
     for p in POLICIES:
@@ -282,27 +244,22 @@ def main():
               f"{d['escrow_grant']:>8.0f} {d['escrow_reject']:>9.0f}  | {verdict[p]}")
 
     # ---- 4 面板出版风格图 ----
-    style = {"OCC": ("o-", "tab:blue"), "MVCC": ("D-", "tab:olive"),
-             "2PL": ("d-.", "tab:red"), "CAST-all": ("^--", "tab:orange"),
-             "HYBRID": ("s-", "tab:green")}
     fig, ax = plt.subplots(2, 2, figsize=(13, 9))
 
     # (a) throughput vs threads
     for p in POLICIES:
-        st, c = style[p]
-        ax[0, 0].plot(threads_list, agg[p]["tp"], st, color=c, label=p, linewidth=2, markersize=6)
+        ax[0, 0].errorbar(threads_list, agg[p]["tp"], yerr=agg[p]["tp_ci"], **E.fmt(p))
     ax[0, 0].set_xlabel("concurrent agents (threads)")
     ax[0, 0].set_ylabel("throughput (committed/s, measured)")
-    ax[0, 0].set_title("(a) Throughput — HYBRID matches CAST-all, beats OCC/MVCC/2PL")
+    ax[0, 0].set_title("(a) Throughput — HYBRID matches merge-all, beats OCC/MVCC/2PL")
     ax[0, 0].legend(fontsize=8); ax[0, 0].grid(True, alpha=0.3)
 
     # (b) oversell (correctness) vs threads
     for p in POLICIES:
-        st, c = style[p]
-        ax[0, 1].plot(threads_list, agg[p]["oversell"], st, color=c, label=p, linewidth=2, markersize=6)
+        ax[0, 1].errorbar(threads_list, agg[p]["oversell"], yerr=agg[p]["oversell_ci"], **E.fmt(p))
     ax[0, 1].set_xlabel("concurrent agents (threads)")
     ax[0, 1].set_ylabel("oversell events (stock < 0)  [lower=correct]")
-    ax[0, 1].set_title("(b) Correctness — only CAST-all violates the inventory bound")
+    ax[0, 1].set_title("(b) Correctness — only merge-all violates the inventory bound")
     ax[0, 1].legend(fontsize=8); ax[0, 1].grid(True, alpha=0.3)
 
     # (c) action breakdown @8 threads (stacked)
@@ -326,7 +283,7 @@ def main():
 
     # (d) Pareto: throughput vs oversell @8 threads
     for p in POLICIES:
-        st, c = style[p]
+        c = E.color_of(p)
         ax[1, 1].scatter(detail8[p]["oversell"], detail8[p]["throughput"],
                          s=140, color=c, edgecolor="black", zorder=3, label=p)
         ax[1, 1].annotate(p, (detail8[p]["oversell"], detail8[p]["throughput"]),
@@ -339,7 +296,7 @@ def main():
 
     fig.suptitle("Hybrid concurrency control: per-object / per-intent adaptive protocol selection\n"
                  "heterogeneous object pool (strict / commutative / constrained-inventory / read-only); "
-                 "real multi-threaded, wall-clock measured", fontsize=11, y=0.98)
+                 "real multi-threaded, wall-clock measured (" + E.CI_NOTE + ")", fontsize=11, y=0.98)
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     out = os.path.join(RESULTS, "hybrid_cc_adaptive.png")
     fig.savefig(out, dpi=130, bbox_inches="tight")
