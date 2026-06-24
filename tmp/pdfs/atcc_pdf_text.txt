@@ -1,0 +1,1948 @@
+
+
+===== PAGE 1 =====
+ATCC: Adaptive Concurrency Control for Unforeseen Agentic
+Transactions
+Weixing Zhou, Zhiyou Wang, Zeshun Peng, Hetian Chen, Yanfeng Zhang, Ge Yu
+Northeastern University, China;
+{zhouwx1,wangzy80,pengzs,chenht3}@mails.neu.edu.cn,{zhangyf,yuge}@mail.neu.edu.cn
+ABSTRACT
+Data agents, empowered by Large Language Models (LLMs), intro-
+duce a new paradigm in transaction processing. Unlike traditional
+applications with fixed patterns, data agents run online-generated
+APPs
+workflows that repeatedly issue SQL statements, reason over inter-
+mediate results, and revise subsequent plans. To ensure data consis- Reasoning Loop
+Database
+tency, these SQL statements issued by an agent should be integrated
+ACID Context
+into a transaction, referred to as agentic transactions. Agentic Probe ..
+Agent
+transactions exhibit unforeseen characteristics, including long exe-
+cution times, irregular execution intervals, and non-deterministic Refine SQL
+access patterns, breaking the assumptions underlying concurrency
+control (CC) (e.g., short-lived, predefined). Traditional CC schemes,
+which rely on fixed policies, fail to capture such dynamic behavior,
+resulting in inadequate performance.
+This paper introduces ATCC, an adaptive Concurrency Control
+for Agentic Transactions. ATCC continuously monitors and inter-
+prets the runtime behavior of each agentic transaction, evaluates
+its interactive phases, and dynamically adapts optimistic or pes-
+simistic execution for each transaction. To ensure precise timing for
+adaptive switches, ATCC employs a reinforcement learning-based
+policy to balance immediate blocking against future abort costs. Ad-
+ditionally, to mitigate contention-induced tail latency and wasted
+reasoning cost caused by abort, a cost-aware priority-based lock
+scheduling is integrated to prioritize expensive or latency-sensitive
+transactions. Experimental results under agentic-like YCSB and
+TPC-C workloads demonstrate that ATCC improves the through-
+put of agentic transactions by up to four orders of magnitude and
+reduces tail latency by up to 90% compared to state-of-the-art CC
+schemes.
+1 INTRODUCTION
+Powered by advances in Large Language Models (LLMs) [7, 25, 32,
+42], the emergence of data agents [27, 37, 38] represents a funda-
+mental shift in the paradigm of data management. These agents,
+equipped with advanced perception, reasoning, and learning capa-
+bilities, can interpret high-level user goals and compile them into
+precise executable workflows (e.g., text2SQL [13, 14, 16, 18, 19, 21,
+22, 29, 35, 43]. As illustrated in Figure 1, traditional applications
+issue a fixed set of SQL statements through predefined functions. In
+contrast, given a high-level intent, an agent can autonomously plan
+and execute tasks. By examining the intermediate results, the agent
+iteratively revises its plan until the task is completed. This agent-
+driven execution reduces user effort and enables more complex,
+personalized workflows by adapting task generation and decision
+logic to user preferences and context.
+Agents run online-generated workflows that iteratively gener-
+ate SQL statements and dynamically adjust their decisions based
+... ...
+Traditional Paradigm SQL Statement Data Operation
+Predefined Functions
+APIs
+Client Fixed Operation/SQL Sequence
+NL ...
+Query .
+Client
+Irregular Intervals
+Agentic Paradigm
+Figure 1: Comparison of traditional predefined transaction
+processing (TP) and agentic TP with dynamic SQL generation.
+on real-time feedback. In high-stakes domains such as finance, e-
+commerce settlement, and supply chains, ensuring a consistent
+data view and atomic state transitions is crucial during agent task
+execution. Without transactional guarantees, the agent may read
+inconsistent snapshots or lost partial updates, leading to incorrect
+decisions. Consequently, the data operations issued by an agent to
+complete a task should be encapsulated as a single transaction to
+ensure correctness. This emerging class of agent-driven transac-
+tions, referred to as agentic transactions, introduces a new type
+of transactional behavior.
+An example. Consider a digital banking scenario where an
+agent adjusts the credit limit of a corporate customer. The agent
+first queries historical records to build the customer’s profile, then
+retrieves the customer’s latest financial status (e.g., recent payment
+behavior, market conditions), and finally updates the credit limit.
+Without ACID guarantees, the agent may approve a credit adjust-
+ment based on stale or incorrect status. This can lead to incorrect
+limit assignments, compliance violations, and financial risks.
+Agentic transactions execute in a sequence of phases, leading to
+execution characteristics that fundamentally differ from traditional
+transactions. While traditional OLTP transactions feature inter-
+leaved read/write operations, agentic transactions exhibit a distinct
+phase structure with shifting read/write intent: (i) a read-intensive
+explore phase to gather context, (ii) a refine phase to narrow down
+candidate plans, and (iii) a write-intensive commit phase to apply
+final updates. Consequently, this phased execution model may lead
+to (i) long execution times, (ii) irregular execution intervals,
+and (iii) non-deterministic access patterns. During the refine
+phase, agents perform multiple rounds of reasoning to refine their
+execution plans and dynamically adjust SQL statements to better
+align with user intent. This causes SQL structures and execution
+order to change dynamically. Since the duration and number of
+reasoning rounds depend on the accuracy of intermediate results,
+6202
+raM
+41
+]BD.sc[
+1v60931.3062:viXra
+
+
+===== PAGE 2 =====
+the timing of SQL statement execution is inherently irregular. Con- Plan-Execute-Replan Loop
+SQL
+sequently, this iterative reasoning process may result in extended
+transaction lifetimes. A detailed analysis is presented in Section 2.1.
+However, these characteristics break the static assumption (e.g., Reasoning (>100ms)
+predefined access patterns, short-lived transactions) of the underly-
+Explore Phase Refine Phase
+ing traditional concurrency control (CC). Consequently, existing (Flights/Airlines) (Preference Filtering)
+Commit Phase
+CC schemes adopted by mainstream databases fail to handle agentic (Book Seats)
+workloads efficiently: (i) Pessimistic Concurrency Control (PCC) Broad Read Scope Narrowing Candidates Conflict Hotspot 5s+
+[6, 23, 26, 41] prevents conflicts via locking but leads to long block-
+ing and inflated tail latency. (ii) Optimistic Concurrency Control Figure 2: An execution illustration of agentic transactions.
+(OCC) [10, 20, 33, 39, 40] avoids blocking but incurs high abort
+rates under frequent conflicts and stale reads. (iii) Hybrid schemes
+[8, 9, 31, 34, 36, 44] attempt to apply PCC/OCC to hot and cold data locking timing and a priority-based locking scheme to enable
+partitions, or mix optimistic reads with pessimistic writes to achieve efficient execution for agentic transactions.
+efficient transaction execution. However, the irregular execution • We implement ATCC on openGauss [2] and compare it with
+intervals and evolving access patterns cause contention windows SoTA methods on agentic workloads. Experiments show ATCC
+and hotspots to shift during execution. improves the performance of agentic transactions up to 4 orders
+Therefore, agentic CC must go beyond static OCC/PCC and of magnitude higher throughput and 90% lower tail latency.
+instead observe and react to runtime behavior.
+In this paper, we propose ATCC, an adaptive concurrency control
+2 MOTIVATION
+algorithm that dynamically applies optimistic or pessimistic ap-
+LLM-based agents offer an effective way to offload complex decision-
+proaches for transactions. ATCC continuously estimates transaction
+making from end users to automated workflows. To ensure data
+states (e.g., execution phases, conflict and abort risk) from transac-
+consistency, the agent workflow should be encapsulated as a single
+tion runtime features and the current system state, and selectively
+acquires locks on data items, thereby reducing blocks and aborts of transaction, forming an agentic transaction. However, because
+SQL statements are generated during LLM reasoning, agentic trans-
+agentic transactions with minimal impact on system performance.
+actions are inherently unpredictable and violate the static assump-
+In ATCC, accurately assessing transaction states and locking tim-
+tions (e.g., definitions and predictable access patterns) of traditional
+ing is crucial. Premature locking causes long blocking, while de-
+database workloads.
+layed locking increases stale reads and abort risk. For agentic trans-
+To characterize the features of agentic transactions, we imple-
+actions, the unforeseen characteristics make fixed heuristics infea-
+ment an agentic flight-booking workload. Starting from an intent
+sible. Learning-based approaches [17, 24, 28], which can associate
+(e.g., departure city, destination, budget, or time constraints), the
+observed execution context with downstream outcomes and adapt
+agent autonomously explores candidates, refines constraints, and
+from runtime feedback under dynamic and stochastic behavior, are
+finalizes a reservation (see Section 6 for details on workloads).
+better suitable for agentic transactions. Thus, we use a reinforce-
+ment learning (RL) model to learn locking decisions, capturing the
+delayed trade-off between immediate blocking and future abort 2.1 Features of Agentic Transactions
+cost. By leveraging the distinctive phase structure of agentic trans- Agentic transactions exhibit several distinctive characteristics that
+actions, ATCC learns a phase-aware adaptive locking policy that differ from traditional OLTP workloads:
+appropriately employs locks, balancing optimistic execution with Long and highly variable lifetimes. As shown in Figure 2,
+targeted locking to reduce aborts without excessive blocking. the agent interleaves SQL execution with multiple reasoning and
+Even with adaptive locking, agentic transactions still face block- replanning steps. The additional reasoning steps extend end-to-end
+ing or aborting due to lock contention. Blocking long-running or lifetimes by 4–5 orders of magnitude compared (∼ 20 s in average)
+repeatedly re-executed transactions exacerbates tail latency, while to backend transactions (∼ 0.3 ms).
+aborting transactions that have already incurred multiple reason- Irregular intervals. Unlike traditional OLTP transactions that
+ing and extensive data operations wastes substantial computation execute SQL statements within milliseconds, the execution inter-
+resources and increases user costs. To address this, ATCC integrates vals of agentic transactions are dominated by reasoning time and
+priority-based locking to guide lock scheduling under contention. additional agent-side data operations, which vary significantly. This
+Specifically, ATCC derives a transaction priority by jointly consider- leads to the execution time spans a wide range for OCC, from 10 s
+ing runtime factors such as execution time and estimated reasoning to 60 s in Figure 3a.
+cost, and uses this priority to optimize lock scheduling. This ap- Non-deterministic and evolving access patterns. Data agents
+proach prioritizes critical transactions, accelerates their processing, refine the execution plans based on intermediate results, issuing
+and reduces tail latency. In summary: 4-20 SQLs compared to 3 for backend transactions (Figure 3b). More-
+over, even under the same user intent, the plan overlap across runs
+• We identify the specific characteristics of agentic transactions is below 50%, with significant variability in query sequences. This
+and reveal their distinct phase structure, enabling adaptive CC. divergence is driven by environment dynamics (e.g., changing flight
+• We present ATCC, an adaptive concurrency control mechanism availability/prices) and LLM-induced variability in query construc-
+that integrates with an RL-based policy that learns phase-aware tion and candidate selection.
+2
+
+
+===== PAGE 3 =====
+(a) Agentic transaction latency distribution (b) SQL per agentic transaction
+5
+4
+3
+2
+1
+0
+8 16 24 32 40 48
+(c) Workflow phases & data access patterns (d) Token consumption & waste
+)m(tsoC
+nekoT
+200
+150
+100
+50
+0
+# of Workers
+noitcasnart
+citnegA
+100
+80
+60
+40
+20
+0
+Number of SQLs per Agentic txn
+noitcasnart
+citnegA
+WW Silo WW Waste Silo Waste ATCC Framework
+Storage
+States Collector
+Off-line Learning
+Update RL Training
+Total execution time(s)
+Explore
+22.66% 27.69%
+Refine
+Commit
+49.65%
+Proportion of SQL by phase
+58.82% 38.16%
+Proportion of data rows by phase 3.02%
+Figure 3: Experimental results of an agentic flight-booking
+workload.
+Phase structure with shifting read/write. In the early explore
+phase, the agent performs coarse, scan-intensive reads with broad
+predicates targeting metadata that is rarely updated, accounting
+for about 49% of all SQLs and 58% of all accessed row data items. In
+the mid refine phase, agents tighten predicates to retrieve accurate
+details and generate a refined shortlist, contributing 27% of SQLs
+and 38% of rows. In the commit phase, the agent executes booking
+logic, with 22% of queries but over 90% of writes, accessing just 3%
+of rows. This phased read then write pattern contrasts sharply with
+traditional OLTP transactions, where reads and writes are typically
+interleaved within short, predefined workflows.
+Substantially high abort costs. Aborting traditional transac-
+tions typically wastes only a few milliseconds of execution time.
+In contrast, aborting agentic transactions invalidates the entire
+multi-round reasoning process. In our evaluation, recovering from
+a failure often requires re-executing more than 8 − 15 SQL state-
+ments and, in the worst cases, wasting up to 100.3𝐾 LLM tokens. As
+a result, the per-abort cost for agentic transactions is much higher.
+As shown in Figure 3d, the frequent aborts and retries under OCC
+(Silo) lead to substantially higher token costs.
+2.2 Challenge and Opportunity
+Agentic transactions, with unforeseen characteristics and high retry
+cost, pose significant challenges for CC schemes. The system must
+make appropriate CC decisions without prior knowledge of the
+complete access set to reduce aborts. A natural approach is to learn
+CC decisions via reinforcement learning (RL), as CC is an online
+sequential decision problem with delayed consequences. By learn-
+ing per-operation execution states (e.g., the sequence of executed
+operations, inter-transaction dependencies) from the performed
+…
+Agentic
+Txn Optimistic
+Adaptive CC
+(based on action)
+SQL Pessimistic Train Queries
+Priority Locking
+Features Action
+Phase-Aware Adaptive
+Switching Policy
+Figure 4: The overall architecture of ATCC.
+optimistic/pessimistic actions and the eventual commit/abort out-
+comes, RL can learn the trade-off between immediate blocking and
+future aborts under uncertainty.
+However, such operation-granularity RL is effective when ac-
+cess patterns are stable (e.g., predefined workloads). Under agentic
+workloads, the non-deterministic access patterns lead to an un-
+bounded state space and poor generalization. Moreover, agentic
+transactions are not entirely random. Our measurements reveal a
+distinct phase structure. This offers a key opportunity: the system
+can dynamically adapt CC strategies based on the inferred phase
+and the estimated conflict or abort costs. For example, the read-
+heavy exploration phase benefits from lightweight, non-blocking
+execution; the refinement phase, focused on protecting reads, en-
+sures data consistency; and the write-intensive commit phase favors
+comprehensive locking to prevent costly aborts.
+Building on this insight, ATCC models CC as a phase-aware se-
+quential decision-making problem. It uses RL to infer the current
+execution phase, contention level, and abort cost to decide when
+and what to lock. By dynamically adapting between optimistic and
+pessimistic execution, ATCC effectively reduces execution costs and
+is well-suited to the dynamic, evolving nature of agentic workloads.
+3 OVERVIEW
+In this section, we provide the design and overall architecture of
+ATCC. As illustrated in Figure 4, ATCC applies an adaptive concur-
+rency control framework that dynamically selects OCC or PCC for
+data operations. As discussed in Section 2.2, ATCC learns a phase-
+aware adaptive policy to evaluate the transaction’s current state
+(e.g., execution phases, the cost of abort) and obtains guidance ac-
+tions. Based on the inferred actions, ATCC adjusts the transaction’s
+execution strategy, including: (i) executing reads/writes optimisti-
+cally or pessimistically based on a selected locking range; and (ii)
+boosting the transaction’s priority to enable lock preempting with
+Wound-Wait Locking. Additionally, to better accommodate the dy-
+namic nature of agentic transactions and optimize system perfor-
+mance, ATCC periodically gathers execution statistics and re-trains
+offline to refine the adaptation policy.
+Phase-aware adaptive policy. Agentic transactions exhibit multi-
+round execution, during which their access patterns and conflict
+risk evolve over time. With RL models, ATCC adaptively blends op-
+timistic and pessimistic execution over the transaction lifetime to
+jointly optimize interactivity, throughput, and retry cost. Unlike
+operation-level RL policies that condition decisions on per-access
+3
+
+
+===== PAGE 4 =====
+identifiers that face an unbounded state space, ATCC leverages phase Table 1: Contention-driven actions in ATCC
+structure as the key generalizable signal under non-deterministic
+access patterns, shifts the RL problem from operation prediction Action Description and Rationale
+to phase inference estimation. With a phase-aware state repre- Remain in OCC Mode Continue under OCC
+sentation (Section 4.1), the RL state space remains compact and Hot Read set Cold Read set
+Locking Strategies
+Hot Write set Cold Write set
+consistent across diverse transaction access patterns, enabling the
+learned policy to be more efficient under agentic workloads. Prioritize Transaction Boost a transaction’s priority.
+Contention-oriented selective locking. With RL, ATCC can an-
+alyze the execution phases of transactions and adaptively apply query intervals) and (ii) contention indicators (e.g., retry count) to
+locks to avoid stale reads and conflicting concurrent writes. The apply optimistic or pessimistic execution adaptively.
+locking actions implemented for different stages of a transaction Phase-related signals. The following signals are designed to infer
+will affect system performance. When a transaction enters a critical the current execution phase of an agentic transaction.
+phase and directly locks all access data without considering the cur-
+• Query interval time. The elapsed time between the completion
+rent contention level, this leads to high lock management overhead
+of the previous SQL and the start of the current one, which is
+and unnecessary blocking. Further, such a locking strategy lacks
+used to estimate abort cost. Longer intervals indicate more LLM
+the flexibility to adapt to varying contention levels and execution
+reasoning time, and thus higher retry costs.
+phases. To balance learnability and effectiveness, ATCC employs • Read/write-set size delta. The increment of the read/write set size
+contention-oriented selective locking, dynamically adjusting lock
+per SQL round. In the explore phase, the read set expands rapidly.
+granularity based on the inferred phase and current contention
+In the refine phase, the read-set and write-set sizes are relatively
+level (Section 4.2).
+stable. In the commit phase, the write set expands rapidly.
+Abort-cost-aware priority scheduling with deferred updates. • Read/write-set overlap ratio. The overlap ratio of accessed rows be-
+Lock-based execution can introduce long blocking, deadlocks. In tween consecutive SQL rounds. A low overlap ratio indicates the
+such cases, randomly aborting a transaction with longer execution transaction is exploring new data, typically in the explore phase.
+times, multiple reasoning steps, or extensive read/write sets tends A high overlap ratio indicates the transaction is converging on a
+to incur higher abort and retry costs. To account for this, ATCC stable result set, typically in the refine or commit phase.
+integrates an abort-cost-aware, multi-level priority scheduling into • Consecutive writes. A signal detects whether the transaction has
+the Wound-Wait locking scheme, to prioritize critical transactions issued multiple writes. Indicates whether the transaction has
+(Section 4.2). Another consideration is that transactions may hold transitioned from the refine phase to the commit phase.
+write locks for long periods due to reasoning or lock blocking. This
+Contention indicators. The following signals are designed to
+will block backend readers. To mitigate this, ATCC uses deferred evaluate the transaction’s contention level and abort probability.
+updates to enable the latest committed version reading, achieving
+fast execution for backend transactions (Section 5.2). • Hotspot access ratio. The proportion of hotspot records in the
+read/write sets. Transactions are more likely to be aborted due
+to conflicts when accessing more hotspot records.
+4 PHASE-AWARE ADAPTIVE SWITCHING
+• Blocking time. The total time a transaction spends waiting for
+MODEL locks. A longer blocking time indicates higher data contention.
+Reinforcement learning (RL) learns a control policy through trial- • Retry Count and Signal. The total number of times a transaction
+and-error interaction with the environment to maximize numerical has restarted due to conflicts (e.g., OCC validation or PCC lock
+rewards. Its core components include: states (observations of the failures). Repeated failures indicate high contention and require
+environment), actions (decisions the RL agent can take), a policy a higher CC priority to reduce the risk of abort.
+(mapping observed environmental states to actions), a reward signal • Global metrics. Database metrics including the abort rate, through-
+(defining the optimization objective), and an environment (with put, average and tail latency, and lock-queue length. These met-
+which the RL agent interacts). At runtime, the RL agent observes a rics provide a global view of workload contention.
+state, takes an action, receives a reward, and transitions to a new
+state. When applying RL, the design of the state and action spaces, 4.2 Contention-Aware Switching Policy
+and the reward function, critically determines the effectiveness and
+Table 1 shows the action space. To achieve high performance when
+robustness of the learned policy.
+executing agentic transactions, the action space enables elastic CC
+In the following, we present the design of these components.
+switching from optimistic to a pessimistic mode based on phase-
+related signals. OCC enables high concurrency by allowing transac-
+4.1 Phase-Aware State Representation tions to execute without acquiring locks. All transactions initially
+A key challenge in designing an RL-based CC is capturing the char- start in OCC mode. This is because transactions are predominantly
+acteristics of agentic workloads. Different agentic workloads exhibit read-only in the explore phase. We can utilize deferred writes (see
+distinct access patterns, and even within the same transaction, exe- Section 5.2) to enable lock-free reads, avoiding locking overhead.
+cution phases vary significantly in abort costs and access contention. As transactions progress through multiple SQL rounds and tran-
+To enable the policy to make phase-specific CC decisions, we design sition into the refine and commit phases, the accumulated execution
+a state representation that captures (i) phase-related signals (e.g., cost makes transaction aborts increasingly expensive. Therefore,
+4
+
+
+===== PAGE 5 =====
+when transactions are likely to conflict (e.g., modifying hotspot periodic invocation Phase-Aware Adaptive
+Execution
+records), they are switched to a more pessimistic mode by acquir- Switching Model
+ing priority locks on accessed records, improving commit rates. data operation action change
+Lock granularity. To increase concurrency, pessimistic transac- switching new action
+tions do not lock all accessed rows. Instead, lock granularity is based on action ActionChange()
+dynamically adjusted based on workload patterns (read/write inten- optimistic pessimistic
+sity and hotspot frequency). ATCC can identify hotspot read/write
+tuples (see Section 5.1) and apply different locking strategies ac-
+OCC_R() OCC_W() Rlock() Wlock()
+cordingly. For example, under high contention, transactions can
+lock their entire write sets and hot read sets to reduce abort rates,
+Figure 5: The execution flow and function calls of adaptive
+while cold data remains unlocked to preserve concurrency.
+concurrency control.
+Lock priority. ATCC employs priority-based pessimistic locks to
+balance concurrency with the commit rate of critical transactions.
+To prevent starvation from lock blocking, we adopt the Wound- strategy: by learning phase boundaries, the system maps high-
+Wait locking strategy. Specifically, we maintain a priority score for dimensional, potentially unbounded runtime features into a finite
+each transaction 𝑇 to guide lock acquisition decisions. set of discrete states and compiles the learned policy into a com-
+pact lookup table. After completing a batch of operations, trans-
+Prio(𝑇 ) =⌊𝛼· SQL(𝑇 ) ⌋+⌊𝛽· Blocked(𝑇 ) ⌋+⌊𝜆·Retry(𝑇 ) ⌋+⌊𝜌· Interval(𝑇 ) ⌋ (1) actions combine their features into state keys and fetch actions
+Δ𝑠 Δ
+𝑏
+Δ𝑖
+through quick table lookups. Second, ATCC integrates an asynchro-
+As shown in Equation 1, SQL(𝑇 ) measures the accumulated data-
+nous model with real-time workload awareness to refine policy deci-
+base operation cost, reflecting work intensity; Blocked(𝑇 ) tracks the
+sions. After each transaction execution, the system asynchronously
+cumulative blocking time; and Retry(𝑇 ) counts abort-restart times.
+reports transaction characteristics to the model, which corrects the
+These metrics identify potential starvation and elevate priority to
+action obtained from the table lookup. This decouples model infer-
+reduce tail latency. Interval(𝑇 ) estimates the LLM reasoning time
+ence from transaction execution through asynchronous reasoning,
+between SQL rounds. In our setting, we estimate token consump-
+removing it from the critical path.
+tion from reasoning time, where longer reasoning times indicate
+higher abort costs. The parameters Δ , Δ , Δ are time quanta used
+𝑠 𝑏 𝑖 5 ADAPTIVE CONCURRENCY CONTROL
+to discretize each signal.
+5.1 Metadata for Fine-Grained Adaptation
+4.3 Cost-Aware Reward Design Our system maintains DRAM metadata for each transaction and
+The reward function must account for abort costs. Unlike traditional data item (i.e., a record) to enable adaptive execution.
+workloads, where transaction aborts only waste database resources, ATCC launches a worker thread for each transaction received
+aborting an agentic transaction discards both the database work from a client. Each worker thread maintains a context (ctx) that in-
+and the expensive LLM reasoning. These costs include not only cludes the worker ID (𝑤𝑖𝑑, 16-bit), the start timestamp (𝑠𝑡𝑎𝑟𝑡𝑇𝑆, 47-
+traditional workload metrics (e.g., throughput, latency) but also bit), and the transaction state (𝑠𝑡𝑎𝑡𝑢𝑠, 1-bit) to indicate whether the
+LLM reasoning overhead. ATCC incorporates these costs into the transaction is running or aborted (e.g., toggled under WOUND_WAIT
+reward function to accurately reflect the actual execution cost. for conflict resolution). The 𝑤𝑖𝑑, 𝑠𝑡𝑎𝑟𝑡𝑇𝑆, and 𝑠𝑡𝑎𝑡𝑢𝑠 together form
+At each decision step 𝑡, the reward 𝑟 𝑡 is defined in Equation 2. a 64-bit integer (transaction ID, 𝑡𝑖𝑑), which uniquely identifies the
+𝑟 =(𝛽1 · 1commit − 𝛽2 · 1abort) − 𝛼1 · ΔLatency 𝑡 + 𝛼2 · ΔTPS𝑡 current running transaction. The context also tracks state space
+SQL(𝑇 ) Interval(𝑇 ) (2) variables, including the transaction priority (𝑝𝑟𝑖𝑜𝑟𝑖𝑡𝑦) and the cur-
+− 𝛼3 · ΔAbortRate𝑡 + 𝛼1 ·
+Δ𝑠
++ 𝛼2 ·
+Δ𝑖 rent action (𝑎𝑐𝑡𝑖𝑜𝑛). The contexts of all worker threads are stored
+We explicitly model retry costs to determine whether to block in an array indexed by worker ID, which is globally accessible. The
+(using locks) or abort a transaction. Specifically, we use SQL(𝑇 ) to transaction execution results are stored in the read/write sets (𝑅𝑆
+measure the accumulated database execution cost and Interval(𝑇 ) and 𝑊 𝑆). In addition, we maintain the hot read/write sets (𝑅𝐻𝑆 and
+to estimate the LLM reasoning overhead between SQL rounds. Tra- 𝑊 𝐻𝑆) to perform action changes efficiently.
+ditional transaction metrics (1commit , 1abort ) and database metrics ATCC also maintains DRAM metadata for each data item, includ-
+(i.e., ΔTPS 𝑡 , ΔLatency 𝑡 , and ΔAbortRate 𝑡 ) are incorporated into the ing a data version, a read lock counter (𝑅_𝑐𝑜𝑢𝑛𝑡), and a write lock
+optimization objective to reflect the efficiency of global scheduling. owner (𝑊 _𝑜𝑤𝑛𝑒𝑟) that track the transactions holding read and
+write locks. A read list (𝑅_𝑙𝑖𝑠𝑡) is maintained to record active read
+4.4 Low-Latency Model Invocation transactions, while a lock queue (𝑙𝑜𝑐𝑘_𝑞𝑢𝑒𝑢𝑒) manages transactions
+Invoking the RL model takes several milliseconds. Because RL model waiting to acquire pessimistic locks. To manage optimistic valida-
+invocation lies on the critical path during transaction execution, it tion and pessimistic writes correctly, ATCC relocates the OCC latch
+significantly degrades transaction throughput. Moreover, massive bit (the committing latch) from the data version (in the traditional
+model invocations consume substantial resources, further impact- OCC prototype) to the write lock. When a transaction successfully
+ing transaction performance. acquires the write lock and enters the commit phase, it sets this
+To reduce model invocation overhead, ATCC proposes a two-layer latch bit to true, entering a non-preemptive committing state that
+invocation mechanism. First, ATCC applies a state discretization prevents lock preemption under the Wound–Wait policy (details are
+5
+
+
+===== PAGE 6 =====
+T1 T2
+emiT
+Init: A=1, B=1 W/R(X) write/read data item X R/W dependency Algorithm 1: Functions of Pessimistic Locking in ATCC
+T1 T2 T1 T2 Input: thread (transaction) context 𝑐𝑡𝑥
+W(A=2) W(A=2) WLock(A) Output: return true if success; false otherwise
+R(A) R(A=2) R(A=1)
+. . . . . 1 Function RLock(Row 𝑟𝑜𝑤):
+. . .
+. Blocking . Committing . Commit 2 if 𝑊 _𝑜𝑤𝑛𝑒𝑟 == 𝑡𝑖𝑑 or 𝑡𝑖𝑑 ∈ 𝑟𝑒𝑎𝑑𝑒𝑟_𝑙𝑖𝑠𝑡 then
+Commit Commit Blocking W(A=2) 3 return; //already get the lock.
+R(A=2) Committed Commit 4 if 𝑊 _𝑜𝑤𝑛𝑒𝑟 ≠ INVALID then
+𝑤𝑟𝑖𝑡𝑒𝑟 = ctx_arr[𝑊 _𝑜𝑤𝑛𝑒𝑟 .𝑤𝑖𝑑];
+(a) Basic 2PL (b) Early lock release (c) Delay write apply 5
+6 if 𝑤𝑟𝑖𝑡𝑒𝑟 .𝑝𝑟𝑖𝑜𝑟𝑖𝑡𝑦 < 𝑐𝑡𝑥.𝑝𝑟𝑖𝑜𝑟𝑖𝑡𝑦 then
+Figure 6: Comparison of transaction execution under differ- Abort(𝑤𝑟𝑖𝑡𝑒𝑟);
+7
+ent locking mechanisms: (a) basic 2PL, (b) early lock release,
+8 else
+and (c) delayed write apply. Insert(𝑙𝑜𝑐𝑘_𝑞𝑢𝑒𝑢𝑒, 𝑐𝑡𝑥, Read) and Wait;
+9
+//wait until get the lock or abort by other txn.
+10
+𝑟𝑒𝑎𝑑𝑒𝑟_𝑙𝑖𝑠𝑡.add(𝑐𝑡𝑥.𝑡𝑖𝑑);
+discussed in Section 5.4). To adaptively manage hotspots, ATCC uses 11
+𝑅_𝑐𝑜𝑢𝑛𝑡 += 1;
+Hot Flags (ℎ𝑜𝑡_𝑓 𝑙𝑎𝑔) to categorize data items as cold or hot and 12
+periodically evaluate access patterns to update the hotspot status. 13
+Insert(𝑟𝑜𝑤, 𝑐𝑡𝑥.𝑅𝑆/𝐻𝑅𝑆);
+14 Function WLock(Row 𝑟𝑜𝑤):
+15 if 𝑊 _𝑜𝑤𝑛𝑒𝑟 == 𝑡𝑖𝑑 then
+5.2 Hybrid Execution with Deferred Writes
+16
+return;
+As shown in Figure 5, ATCC adaptively performs optimistic or pes- 17 if 𝑅_𝑐𝑜𝑢𝑛𝑡 ≠ 0 then
+simistic operations based on the rules specified by the action. In 18 foreach 𝑅_𝑡𝑖𝑑 in 𝑟𝑒𝑎𝑑𝑒𝑟_𝑙𝑖𝑠𝑡 do
+general, transactions are executed optimistically (init action) and 19 𝑟𝑒𝑎𝑑𝑒𝑟 = ctx_arr[𝑅_𝑡𝑖𝑑.𝑤𝑖𝑑];
+periodically invoke the RL model. When a transaction’s action 20 if 𝑟𝑒𝑎𝑑𝑒𝑟 .𝑝𝑟𝑖𝑜𝑟𝑖𝑡𝑦 > 𝑐𝑡𝑥.𝑝𝑟𝑖𝑜𝑟𝑖𝑡𝑦 then
+Insert(𝑙𝑜𝑐𝑘_𝑞𝑢𝑒𝑢𝑒, 𝑐𝑡𝑥, Write) and Wait;
+changes, the worker validates the data items that need to be locked 21
+to detect existing conflicts, and then acquires the corresponding 22 foreach 𝑟𝑒𝑎𝑑𝑒𝑟 in 𝑟𝑒𝑎𝑑𝑒𝑟_𝑙𝑖𝑠𝑡 do
+Abort(𝑟𝑒𝑎𝑑𝑒𝑟);
+locks (Section 5.3). Upon committing, the worker validates the re- 23
+𝑅_𝑐𝑜𝑢𝑛𝑡 -= 1;
+maining portions of the data items (those that are unlocked) and 24
+completes the final commit process (Section 5.4). 25 if 𝑊 _𝑜𝑤𝑛𝑒𝑟 is INVALID then
+𝑊 _𝑜𝑤𝑛𝑒𝑟 = 𝑡𝑖𝑑;
+26
+Non-Blocking Optimistic Execution via Deferred Writes. In 27 else
+ATCC, optimistic reading and pessimistic locking coexist. For long-
+28
+𝑤𝑟𝑖𝑡𝑒𝑟 = ctx_arr[𝑊 _𝑜𝑤𝑛𝑒𝑟 .𝑤𝑖𝑑];
+running agentic transactions, traditional pessimistic locking can 29 if 𝑤𝑟𝑖𝑡𝑒𝑟 .𝑝𝑟𝑖𝑜𝑟𝑖𝑡𝑦 < 𝑐𝑡𝑥.𝑝𝑟𝑖𝑜𝑟𝑖𝑡𝑦 then
+easily lead to severe blocking. As shown in Figure 6a, transaction 30 Abort(𝑤𝑟𝑖𝑡𝑒𝑟);
+𝑇 1 and 𝑇 2 operate on the same data item 𝐴, where 𝑇 1 writes 𝐴 and 31 𝑊 _𝑜𝑤𝑛𝑒𝑟 = 𝑡𝑖𝑑;
+𝑇 2 reads 𝐴. Once 𝑇 1 acquires the write lock on 𝐴 and updates it, 32 else
+𝑇 2 must wait until 𝑇 1 releases the lock. For agentic transactions 33 Insert(𝑙𝑜𝑐𝑘_𝑞𝑢𝑒𝑢𝑒, 𝑐𝑡𝑥, Write) and Wait;
+with a prolonged lifetime, holding locks for an extended period 34 Insert(𝑟𝑜𝑤, 𝑐𝑡𝑥.𝑊 𝑆/𝐻𝑊 𝑆);
+leads to head-of-line blocking and poor responsiveness for other
+transactions.
+Early lock release [12, 15] (Figure 6b) aims to reduce blocking by
+partially updated versions. For optimistic writes, the transaction
+releasing locks before a transaction commits. After 𝑇 completes its
+1 directly inserts the row into the write set.
+updates, it releases the lock on 𝐴, allowing 𝑇 to read the new value
+2
+without waiting for 𝑇 1 to commit its changes. However, to maintain Priority-Based Preemptive Locking. In ATCC, the priority-based
+correctness,𝑇 is not permitted to commit before𝑇 does. Otherwise, locking is used to resolve conflicts among pessimistic operations.
+2 1
+if 𝑇 aborts, 𝑇 would encounter a dirty read, violating isolation For read operations, the delayed write-apply mechanism en-
+1 2
+guarantees. In agentic workloads, this design also introduces long ables short-lived transactions to read optimistically, facilitating
+blocking, as 𝑇 may finish its own logic early but still must wait for fast execution. However, agentic transactions still acquire explicit
+2
+the long-running transaction 𝑇 to commit. read locks on critical items to avoid aborts during their long ex-
+1
+To avoid long blocking, ATCC adopts a delayed write apply mecha- ecution, where other short or lower-priority transactions might
+nism (Figure 6c). Transactions acquire write locks to resolve concur- update these items before the agentic transactions commit. Thus,
+rent write-write conflicts, but buffer the new value in the local write the RLock() function (Alg. 1, lines 1-13) is provided for transactions
+set instead of immediately updating the database. Short-lived trans- to acquire read locks and resolve concurrent read-write conflicts.
+actions like 𝑇 2 can read the last committed value (𝐴 = 1) without First, it checks if the transaction already owns the lock as a writer
+being blocked, achieving faster commit. or is listed as a reader. If so, the lock is immediately granted. Other-
+To this end, optimistic reads are processed directly without check- wise, it checks if another writer exists and applies the Wound-Wait
+ing whether a transaction owns the write lock, but transactions protocol by comparing the priorities: waiting for a higher-priority
+still need to spin on the committing latch to check if a writer is transaction to commit and aborting the lower-priority transaction.
+currently applying an update, thereby avoiding reads of in-flight, After acquiring the lock, the transaction is added to the reader list,
+6
+
+
+===== PAGE 7 =====
+Lock Wait Lock Preempt
+T1 T2 T1 T2
+StartTS(5) StartTS(1) Priority(5) Priority(6)
+Lock(A) … Lock(A) …
+… Lock(B) Loc … k(B) Lock(B)
+Lock(B) … Priority: … Abort Lock(A) 57 … Lock(A)
+(a) Wound-Wait (b) ATCC
+emiT
+Algorithm 2: Functions of Validation
+Input: thread (transaction) context 𝑐𝑡𝑥
+Output: return true if success; false otherwise
+1 Function ActionChange(LockAction 𝑎𝑐):
+//Lock the HRS or RS, HWS or WS based on the lock action. 2
+3 foreach 𝑟𝑜𝑤, 𝑟𝑒𝑎𝑑_𝑣𝑒𝑟 in 𝑡𝑥𝑛.𝐻𝑅𝑆/𝑅𝑆 do 4 if 𝑟𝑒𝑎𝑑_𝑣𝑒𝑟 == 𝑟𝑜𝑤.𝑐𝑢𝑟𝑟_𝑣𝑒𝑟 then RLock(𝑟𝑜𝑤); //Lock the row or abort. 5
+6 else
+Abort(𝑐𝑡𝑥); The row is updated by other txn, abort.
+7
+Figure 7: Deadlock caused by transaction priority changes 8 foreach 𝑟𝑜𝑤 in 𝑡𝑥𝑛.𝐻𝑊 𝑆/𝑊 𝑆 do
+when using the Wound-Wait algorithm. WLock(𝑟𝑜𝑤); //Lock the row or abort.
+9
+10 Function Validation():
+the read lock counter is incremented, and the row is inserted into 11 foreach 𝑟𝑜𝑤 in 𝑡𝑥𝑛.𝑊 𝑆 do
+the transaction’s read set. WLock(𝑟𝑜𝑤); //Lock the row or abort.
+12
+For write operations, the WLock() function (lines 14-34) is used 13 foreach 𝑟𝑜𝑤, 𝑟𝑒𝑎𝑑_𝑣𝑒𝑟 in 𝑡𝑥𝑛.𝑅𝑆 do
+to resolve both write-read and write-write conflicts. Similarly to 14 if 𝑟𝑒𝑎𝑑𝑒𝑟_𝑙𝑖𝑠𝑡.Find(𝑐𝑡𝑥.tid) then
+handling read-write conflicts, the Wound-Wait protocol is applied 15 continue; The row is protected by the RLock.
+if conflicts occur. Once the lock is acquired, the row is added to the 16 while IsCommitting(𝑟𝑜𝑤) do
+Abort(𝑐𝑡𝑥); //The row is updating by other txn, abort.
+read and write sets, and the modification is deferred to the commit 17
+phase by using the delayed write apply mechanism. 18 if 𝑟𝑒𝑎𝑑_𝑣𝑒𝑟 ≠ 𝑟𝑜𝑤.𝑐𝑢𝑟𝑟_𝑣𝑒𝑟 then
+Abort(𝑐𝑡𝑥); The row is updated by other txn, abort.
+Note that the priority comparison between transactions in ATCC 19
+is determined based on the combination of ‘priority’ and ‘tid’ (‘startTS 20 foreach 𝑟𝑜𝑤 in 𝑡𝑥𝑛.𝑊 𝑆 do
+SetCommitting(𝑟𝑜𝑤);
++ wid’). Specifically, we define 𝑇 > 𝑇 if 𝑇 .priority > 𝑇 .priority or 21
+1 2 1 2
+(𝑇 1 .priority = 𝑇 2 .priority ∧𝑇 1 .tid < 𝑇 2 .tid). A smaller ‘tid’ indicates
+that the transaction was initiated earlier. It is important to note that
+the case where 𝑇 1 .tid = 𝑇 2 .tid cannot occur, as ‘tid’ incorporates Later, 𝑇 2 requests a lock on resource 𝐴, but is now blocked by
+the worker ID (‘wid‘) of the thread associated with the transaction, 𝑇 1 , whose priority has become higher. This results in a circular
+ensuring its uniqueness at the time of assignment. dependency, leading to a deadlock.
+To mitigate this, when a transaction’s priority increases, it re-
+5.3 Model Transition and Dynamic Adjustment evaluates its pending lock requests to determine whether it can now
+preempt the lock or not. This re-evaluation mechanism ensures
+In ATCC, transactions periodically adjust their priority and locking
+that dynamically adjusted priorities do not result in unresolved
+actions by invoking the RL Model to reduce abort rates.
+circular waits, thereby preventing the formation of deadlocks.
+Priority Change and Deadlock Prevention. The dynamic pri-
+ority adjustment mechanism reduces abort rates for high-cost or Retroactive Validation and Lock Escalation. When the locking
+action changes, the transaction validates the data items that were
+critical transactions, but it violates the assumption of static pri-
+previously accessed optimistically to detect existing conflicts by
+orities (e.g., ‘startTS’) underlying traditional deadlock avoidance
+invoking the ActionChange function (Alg. 2, lines 1-9), ensuring
+mechanisms, thereby reintroducing the potential for deadlocks. In
+isolation guarantee (e.g., serializability). The transaction first veri-
+Wound–Wait, for instance, each transaction is assigned a static
+fies whether the reading data has been modified and attempts to
+priority (based on ‘startTS’), and a partial order relation (‘< ’)
+acquire read locks on these data items to prevent further modifica-
+is used to break wait cycles. As depicted in Figure 7a, transac-
+tions by other transactions. Subsequently, the transaction proceeds
+tion 𝑇 has a higher priority than 𝑇 since it starts earlier (i.e.,
+2 1
+to resolve write-write conflicts and employ write locks on the data
+𝑇 2 .𝑠𝑡𝑎𝑟𝑡𝑇𝑆 = 1 < 𝑇 1 .𝑠𝑡𝑎𝑟𝑡𝑇𝑆 = 5). 𝑇 1 and 𝑇 2 first require the lock
+items in the targeted write set. If any read or write lock acquisition
+on items 𝐴 and 𝐵. When 𝑇 subsequently requests a lock on 𝐵, it
+1
+fails, this indicates that a conflict with a higher-priority transaction
+must wait because the higher-priority transaction 𝑇 already holds
+2
+exists. In such cases, the current transaction must abort to prioritize
+𝐵. When 𝑇 requests a lock on 𝐴, it finds that the lower-priority
+2
+the execution of the higher-priority transaction.
+transaction 𝑇 holds the lock and therefore ‘wounds’ 𝑇 by aborting
+1 1
+it and taking over the lock. Since priorities remain fixed through-
+out execution and Wound-Wait always aborts the lower-priority 5.4 Unified Commitment
+transaction in a conflict, wait edges are always directed from lower- Upon committing, ATCC employs a validation procedure (Alg. 2,
+priority to higher-priority transactions. This guarantees that the lines 10-21) similar to that of Silo [33] for all transactions, as some
+wait-for graph is acyclic and hence deadlock-free. operations are processed optimistically.
+In contrast, when priorities change at runtime, this invariant is The validation begins by attempting to lock all data items in the
+violated. As illustrated in Figure 7b, consider a scenario where 𝑇 write set. Unlike Silo, which relies on a single updating latch to lock
+1
+initially has a lower priority than 𝑇 2 . 𝑇 1 requests a lock on 𝐵 and is data items, ATCC leverages WLock to detect potential write-write or
+blocked by 𝑇 due to its lower priority. Over time, the priority of 𝑇 read-write conflicts between concurrent transactions with varying
+2 1
+is dynamically increased, for instance, due to prolonged execution. priorities. After successfully locking the write set, ATCC proceeds
+7
+
+
+===== PAGE 8 =====
+to validate the read set. For data items that the transaction has pre- 6 EVALUATION
+viously accessed under the RLock, validation can be skipped, as the In this section, we evaluate the performance of ATCC with several
+read_ver and the current row version (curr_ver) are guaranteed agentic workloads.
+to be consistent. For optimistically executed read operations, ATCC
+performs lightweight version validation instead of acquiring the Implementation. ATCC is implemented based on openGauss-MOT
+[2]. openGauss is an open-source industrial-grade database system,
+RLock (lines 16-19). This is because locking these items for valida-
+and openGauss-MOT is an in-memory transactional storage en-
+tion could introduce unnecessary blocking or premature aborts in
+gine designed for high-performance OLTP workloads. Unlike most
+the presence of transient read-write conflicts. Since ATCC adopts
+academic in-memory database prototypes [9, 34, 36, 39, 40], which
+a write-delay apply mechanism, where modifications are only ap-
+execute transactions in a stored-procedure mode with fixed access
+plied at the final commit stage, such read-write conflicts do not
+patterns, ATCC leverages the SQL interface provided by openGauss-
+compromise serializability as long as the data has not been updated
+MOT to support flexible query processing. This flexibility allows
+(e.g., as illustrated by 𝑇 in Figure 4c).
+2 ATCC to seamlessly integrate with agentic transaction scenarios,
+After acquiring the write locks and validating the read set, the
+which contain various query types, enabling adaptive concurrency
+transaction marks the write locks as committing, ensuring that
+control in real-world operational environments.
+optimistic reads cannot access inconsistent data and that higher-
+priority transactions cannot preempt the acquired locks. Separating Testbeds. Our experiments run on a server equipped with Intel®
+the WLock() operation from SetCommitting() is critical, as the Xeon® Platinum 8360H CPUs (each with 24 physical cores, 33
+transaction might be blocked during lock acquisition. Coupling MiB LLC, clocked at 3.0 GHz), 768 GiB DDR4 DRAM, and a 2TB
+these operations could result in some data items being prematurely NVMe-SSD. The operating system is CentOS 7.9 (Linux release
+marked as is_committing, but the transaction will not update those 7.9.2009, kernel 3.10). To ensure stable performance results, all
+data items immediately, introducing unnecessary blocking to other worker threads are pinned to a single NUMA node, thereby elimi-
+optimistic reads. nating cross-NUMA memory access overhead.
+After validation, the transaction obtains a commit sequence Competitors. In our experiments, we compare ATCC with several
+number (data version number), writes the updates to the Write- representative CC schemes to evaluate the performance:
+Ahead Log (WAL), and applies the modifications to the global rows.
+• Wound-Wait: A variant of 2PL where a transaction preempts the
+lock if it is older than the lock holder and waits if younger.
+5.5 Priority-Driven Lock Handover • Silo [33]: A representative implementation of OCC and serves
+as a baseline for high-performance in-memory OLTP systems.
+After a transaction commits or aborts, it enters a clean-up phase
+• MOCC [36]: A hybrid CC scheme that selectively acquires pes-
+to safely release locks and transfer access rights to waiting trans-
+simistic read locks on hot records during execution and enforces
+actions based on their priorities. For each data item in the write
+a canonical lock-ordering protocol that allows transactions to
+set, ATCC first verifies if the current transaction remains the lock
+acquire, release, and re-acquire locks without deadlocks.
+holder. If it does, ATCC clears the committing flag, releases the lock,
+• Plor [9]: A hybrid CC protocol that transactions acquire locks
+and scans the associated 𝑙𝑜𝑐𝑘_𝑞𝑢𝑒𝑢𝑒 to determine the next eligible
+before updating, but do not block on reads. Conflicting reads are
+transaction(s) to acquire the lock(s). If not (e.g., preempted by a
+performed optimistically and validated in the commit phase.
+higher-priority writer), the data item is skipped. For each row in
+• Polaris [39]: An OCC variant that supports transaction priorities
+the transaction’s read set, the system checks if the transaction iden-
+via reservations. Each record can be reserved by higher-priority
+tifier is still present in the row’s 𝑟𝑒𝑎𝑑𝑒𝑟_𝑙𝑖𝑠𝑡 and removes its entry
+transactions (e.g., repeatedly aborted ones), preventing lower-
+from the list, and decrements the read counter. This ensures that
+priority writers from overwriting hot data, reducing tail latency.
+shared read locks are fully released, allowing subsequent writers
+• Polyjuice [34]: A learning-based CC framework that models each
+to acquire exclusive access safely. When 𝑅_𝑐𝑜𝑢𝑛𝑡 reaches zero, the
+pre-known transaction operation and the potential conflicts as an
+system examines the 𝑙𝑜𝑐𝑘_𝑞𝑢𝑒𝑢𝑒 and assigns the lock to waiting
+execution state, learns a mapping from each execution state to a
+lower-priority transactions as appropriate.
+concurrency control decision table to guide runtime transaction
+execution with the most suitable concurrency control actions
+(e.g., whether to wait, which version to read).
+5.6 Discussion
+In ATCC, an action change never involves releasing locks. Only agen- Workloads. Experiments use three benchmarks, including YCSB
+tic transactions with a high abort risk and large retry cost choose [5], TPC-C [4] and a simulated ticket reservation workload. In
+to acquire locks. Even when conflicts become rare, releasing these YCSB, each query accesses a single record, and the contention level
+locks would expose the previously read data to modifications, and is controlled via a Zipfian distribution. To make it a transactional
+any resulting aborts would incur an unacceptable retry cost. More- benchmark, we wrap 10 operations within a transaction and use
+over, most transactions can rely on delay write apply to read data one table with 10 columns and 1,000,000 rows. TPC-C is an industry-
+optimistically without being blocked by locks. Only those agentic standard benchmark for evaluating online transaction processing
+transactions that actually encounter conflicts need to acquire locks (OLTP) databases. Only Payment and NewOrder are used in our eval-
+to ensure conflict-free execution. Therefore, ATCC does not adopt uation, since several baselines only support these types. Inspired
+the release lock action. Once a transaction has escalated to a locking by the characteristics of agentic workloads, we adapt YCSB and
+action, it retains that action until it is either committed or aborted. TPC-C to emulate agent-like interaction patterns, and refer to the
+8
+
+
+===== PAGE 9 =====
+resulting benchmarks as Agentic-like YCSB and Agentic-like TPC-C. Polyjuice Polaris MOCC Silo Plor Wound-wait ATCC
+Clients issue agentic transactions with random inter-operation de- sp )400 20
+lays (uniformly distributed in 1-20 ms) to model the agent’s extra (tu p t 300 )sp tK 16
+(
+p
+a 5 b
+r
+0
+o
+o T 0
+c
+r h
+e
+t m s
+s
+e ,
+s
+s s w
+i
+-
+n
+i 5 m e
+g
+m
+.
+d u
+T
+s e la )
+o
+la t t e
+m
+y o d
+o
+i r t e t
+d
+s i fl
+e
+c r e
+l
+k e c
+a
+e t t r
+b
+t y - p
+o
+b l
+r
+b o a
+t
+y n o
+h
+k a
+a
+r i n e
+n
+n c
+d
+g a o
+l
+d
+i
+n w
+n
+d s
+g
+i o i t d
+,
+r i e o
+w
+k r n l
+h
+a o a t
+e
+a l i
+n
+o d r n a
+a
+r n
+n
+e b d p e
+a
+o r f
+g
+e m o
+e
+s r
+n
+e e r n
+t
+e r
+i
+t a
+c
+e s s -
+t
+o e a
+r
+x n
+a
+n e
+n
+in c a
+s
+u g g
+a
+t
+c
+e t i
+t
+n i o
+i
+m
+o
+t n i
+n
+. e c
+h g
+t u n o e r g h T1 20 00 0 0
+(tu
+p h g u o rh T
+12
+0 4 8
+Flight-Booking scenario. In this workload, we implement an agent A 8 16 24 32 40 48 8 16 24 32 40 48
+using a lightweight proxy that communicates with the database # of Workers # of Workers
+through SQL interfaces and connects to ChatGPT-4.0 to acquire (a) Agent transaction throughput (b) Transaction throughput
+200 20
+reasoning and natural language understanding capabilities. The 27.2
+A
+ag
+i
+e
+r A
+n
+c n
+t
+ra
+o
+E f
+p
+x t
+e
+, a
+ra
+a m
+t
+n
+e
+p d
+s
+l S
+o
+e e
+n
+: a F
+a
+t o s
+r
+r
+e
+) a
+l
+v
+a
+i
+t
+t a
+i
+r
+o
+a a
+n
+v m
+a
+e
+l
+l u
+s
+r l
+c
+e t
+h
+i q -
+e
+u tu
+m
+e r s
+a
+n t
+(
+( R
+i
+e
+n
+e .g
+c
+A
+l
+.,
+u
+ct b
+d
+o w
+in
+o o
+g
+k r
+R
+k S
+o
+fl F
+u
+o O
+t
+w →
+e
+.
+s
+J
+,
+F
+P
+K
+ri
+n
+c
+e
+e
+x
+s
+t
+,
+)k
+(sn
+e k o T g v 1
+1
+0
+5
+50
+0
+0 27 24 32 40 48
+)s(y
+c n e ta L 1
+1
+0
+5
+5
+Monday, prefer Star Alliance, avoid redeyes, budget < $600), the A
+agent parses the request and generates an initial plan. Then, it 0 0
+queries the “Routes” table to retrieve flight segments and feasible 8 16 24 32 40 48
+# of Workers
+itineraries. Based on intermediate results, it synthesizes additional Tail percentage, 48 threads
+SQL queries dynamically to address user constraints, such as fil- (c) Average token per agent txn (d) Latency distribution in 48 threads
+tering by alliance, time windows, or budget by querying “Routes,”
+“Aircraft,” and “Prices” tables. The agent iteratively optimizes can- Figure 8: Results when varying the number of workers (YCSB
+didate routes, relaxing constraints or exploring alternative joins if Low-Contention).
+needed. Once feasible options are identified, it queries the “Seats”
+table to verify availability, selects a seat, and executes a write oper-
+ation to finalize the reservation. throughput comparable to Silo. By performing asynchronous model
+Specifically, in our testing, 80% of clients issue agentic trans- invocations outside the transaction’s critical path and utilizing
+actions, while the remaining 20% continuously execute stored- lightweight latch-free structures for statistics, ATCC minimizes the
+procedure transactions in the background to represent conven- runtime impact, showing only a margin(≈ 3%) compared to Silo’s
+tional workloads. To prevent frequent aborts due to accessing hot minimal validation logic. Polaris, Plor, and MOCC exhibit slightly
+records, stored-procedure transactions retry after a shorter backoff lower throughput. Polaris incurs fixed costs for priority reserva-
+(10-30 ms). Unless otherwise noted, we report end-to-end transac- tions and updates on every record access and offers little benefit in
+tion latency measured from the initial submission until the transac- conflict-free environments. Similarly, MOCC introduces approxi-
+tion eventually commits (including all retries and injected delays). mately 5% overhead due to its page-level temperature tracking and
+To quantify the overhead of LLM interactions, we estimate the selective locking mechanisms. Plor, despite its latch-free design,
+average token consumption per transaction, denoted as 𝑇 . Based the bookkeeping overhead of its hybrid pessimistic/optimistic read
+𝑎𝑣𝑔
+on profiling the Flight Booking Agent Workload, we set the average mode still slightly reduces efficiency in low-contention scenarios.
+tokens per SQL operation 𝜔 ≈ 2703. 𝑇 𝑎𝑣𝑔 is calculated as 𝑇 𝑎𝑣𝑔 = The learning-based Polyjuice performs the worst in this scenario, as
+(1 + 𝑅 𝑎𝑏𝑜𝑟𝑡 ) · 𝑁 𝑜𝑝𝑠 · 𝜔, where 𝑅 𝑎𝑏𝑜𝑟𝑡 is the abort rate and 𝑁 𝑜𝑝𝑠 is the its offline-trained policy, dependent on static transaction types, fails
+number of operations per transaction. to adapt to the stochastic operations and dynamic access patterns
+of Agentic-like YCSB, leading to suboptimal decisions and severe
+performance degradation.
+6.1 Agentic-like YCSB Results
+Figures 8(c) and (d) report average token costs and tail latencies,
+We first analyze the performance of all the concurrency control
+reflecting cost efficiency and service quality for agent-centric appli-
+algorithms on the YCSB workload with three different variations:
+cations. Most systems maintain low costs and stable latencies. ATCC
+• Low Contention: 95% reads - 5% writes with a uniform access maintains a flat token cost (≈ 27𝑘), indicating a near-zero abort
+distribution (𝜃 = 0.0). rate. While baselines like Silo and Polaris exhibit slight increases in
+• Medium Contention: 90% reads - 10% writes with a hotspot of both token usage and P99.99 latency due to occasional unnecessary
+10% tuples that are accessed by ∼ 50% of all queries (𝜃 = 0.7). retries.
+• High Contention: 50% reads - 50% writes with a hotspot of 10%
+Medium contention. When contention increases, however, the
+tuples that are accessed by ∼ 75% of all queries (𝜃 = 0.99).
+ways these algorithms handle conflicts begin to significantly affect
+Low contention. We first establish a performance baseline us- the performance of long-lived agentic transactions.
+ing the Agentic-like YCSB workload with low contention. In this As shown in Figure 9, all systems continue to scale with increas-
+workload, transaction conflicts are rare; thus, system throughput ing worker threads under medium contention, but the performance
+is primarily determined by the inherent implementation overhead of agentic transactions degrades to varying degrees depending on
+rather than conflict resolution efficiency. each CC scheme’s conflict handling and ability to prioritize agentic
+As shown in Figures 8(a) and (b), all concurrency control (CC) workloads. Silo and Polaris, relying on optimistic validation, suffer
+protocols scale almost linearly up to 48 threads. ATCC achieves from frequent aborts as agentic transactions repeatedly read stale
+9
+
+
+===== PAGE 10 =====
+Polyjuice Polaris MOCC Silo Plor Wound-wait ATCC Polyjuice Polaris MOCC Silo Plor Wound-wait ATCC
+(tu p h
+t
+g
+n
+u
+e
+o s
+g
+r p h T t ) 1 2 3 0 0 0 0 0 0
+0
+)sp tK (tu p h g u o rh
+T
+1 1 2 6
+0
+4 8 (tu p h g
+t
+u
+n
+o
+e
+r s
+g
+h p T t ) 1 2 3 4 0 0 0 0
+0
+)sp tK (tu p h g u o
+rh T
+0 1 . .
+0
+1 2 5 5
+A 8 16 24 32 40 48 8 16 24 32 40 48 A 8 16 24 32 40 48 8 16 24 32 40 48
+# of Workers # of Workers # of Workers # of Workers
+(a) Agent transaction throughput (b) Transaction throughput (a) Agent transaction throughput (b) Transaction throughput
+60 200 600 60
+)k (n e k o T g v A 2 4 0 0 2 4 0 0 )s(y c n e ta L 1 15 0 50 0 0
+)k
+( n e k o T g v A 2 40 00 0 3 5 0 0 32 40 48 )s(y c n e ta L2 4 0 0
+32 40 48
+0 0 0 0
+8 16 24 32 40 48 8 16 24 32 40 48
+# of Workers # of Workers
+(b) Transaction throughput
+Tail percentage, 48 threads Tail percentage, 48 threads
+(c) Average token per agent txn (d) Latency distribution in 48 threads (c) Average token per agent txn (d) Latency distribution in 48 threads
+Figure 9: Results when varying the number of workers (YCSB Figure 10: Results when varying the number of workers
+Medium-Contention). (YCSB High-Contention).
+Polyjuice Polaris MOCC Silo Plor Wound-wait ATCC
+s)200 6
+v
+s
+is
+t
+e
+o
+r
+a
+r
+s
+e
+m
+io
+d
+n
+is
+p
+s
+l
+r
+e
+o
+o
+a
+f
+c
+d
+e
+h
+i
+d
+n
+o
+u
+g
+t
+r
+k
+m
+e
+e
+s
+e
+.
+y
+t
+W
+s
+r
+,
+ic
+a
+h
+s
+i
+a
+l
+c
+e
+th
+h
+t
+e
+i
+h
+e
+y
+e
+v
+a
+e
+to
+r
+d
+e
+ta
+b
+r
+l
+y
+e
+t
+p
+h
+c
+e
+a
+r
+a
+o
+n
+t
+u
+n
+e
+g
+i
+d
+b
+h
+l
+a
+y
+p
+li
+u
+i
+z
+n
+t
+i
+v
+n
+r
+a
+e
+g
+l
+m
+i
+a
+d
+a
+g
+a
+i
+e
+t
+n
+e
+n
+s
+d
+ts
+h
+b
+,
+i
+y
+g
+le
+h
+a
+f
+,
+a
+d
+t
+s
+i
+h
+t
+n
+e
+i
+g
+s
+r (tu
+p h
+g
+p t
+150
+)sp
+tK (tu 4
+u100 p
+t u o re th 9 e a) r . e W tr o y u l n o d o - p W , a a n it d im ca p u r s o in v g es a a g g e e n n t t t t h h r r o o u u g g h h p p u u t t t v o ia co p l r la e p e s m e p ( t F i i v g e - tn o rh T 50 h g u o rh 2
+locking but degrades the overall system performance due to the e g 0 T 0
+A
+indiscriminate blocking of short background transactions. MOCC 8 16 24 32 40 48 8 16 24 32 40 48
+# of Workers # of Workers
+and Plor fall between these two extremes but fail to fully resolve the
+(a) Agent transaction throughput (b) Transaction throughput
+trade-off: MOCC releases locks prematurely, exposing previously
+read data to concurrent updates, leading to aborts. Plor avoids con-
+Figure 11: Results for the different CC algorithms (TPC-C
+current updates using write locks, but in read-intensive workloads,
+with 100 warehouse).
+many agentic transactions are still aborted by shorter transactions.
+Polyjuice, optimized for static stored procedures, struggles to adapt
+to the random access, further impacting performance. records. Although this protective mechanism reduces short trans-
+ATCC achieves high throughput by adaptively switching hot data action throughput compared with purely optimistic schemes, it
+access to pessimistic mode. Crucially, by leveraging deferred updates, ensures fairness and economic viability.
+agentic read locks do not block the validation of concurrent stored Crucially, ATCC keeps the abort rate below 30%, reducing token
+procedures. This strategy achieves a high agentic throughput at costs by over 15× compared to Silo/Polaris (≈ 35𝑘 vs. 500𝑘+). ATCC
+48 threads, higher than Polaris by 18.1× and Polyjuice by 76.9×, exhibits superior tail latency control with fewer retries. Competi-
+while reducing token costs by ∼ 16% compared to Plor. Additionally, tors suffer from unbounded latency growth due to uncontrolled
+ATCC remains stable with tail latency, lowering by 5× compared to retries, ATCC commits the vast majority of agentic transactions with
+Polaris. bounded delay, lowering the P99.99 latency by approximately 3×
+High contention. Figure 10 presents throughput over a spectrum compared to Wound-wait.
+of thread numbers in a high contention workload. When contention
+becomes high, hot data items are accessed by many transactions con- 6.2 Agentic-like TPC-C Results
+currently. Silo, Polaris, and Polyjuice maintain high total through- We now evaluate the concurrency control protocols using the
+put but suppress agentic transactions to near-zero levels. Figure Agentic-like TPC-C workload under two different contention lev-
+10(a) highlights ATCC as the only robust solution, outperforming els by using 1 and 100 warehouses. The number of warehouses in
+MOCC and Wound-wait by approximately 3.1× and 2.2× in agentic TPC-C determines both the size of the database and the amount of
+transaction throughput, respectively. While other baselines drop concurrency. The warehouse is the root entity for almost all of the
+to near-zero throughput due to the retry loops. This performance tables in the database. We first run TPC-C with 100/48 warehouses
+advantage stems from ATCC’s proactive locking strategy on hot to simulate a low-contention environment rich in parallelism and
+10
+
+
+===== PAGE 11 =====
+Polyjuice Polaris MOCC Silo Plor Wound-wait ATCC
+(tu
+p h g t u n o e r
+s
+g h
+p
+A T
+t ) 10
+0 2 4 6
+8
+8 16 24 32 40 48
+)s p tK
+(tu p h g u o rh T 0 0
+0 0
+. .
+. .
+0 4 2
+6 8
+8 16 24 32 40 48
+(tu
+p h g u o rh T tn e
+s
+g
+p
+A
+t )
+0 1 2
+3 Wound-wait )sp
+tK (tu p h g u o rh T
+S
+0 2 4
+6 ilo ATCC
+# of Workers # of Workers 8 16 24 32 40 48 8 16 24 32 40 48
+# of Workers # of Workers
+(a) Agent transaction throughput (b) Transaction throughput
+(a) Agent transaction throughput (b) Transaction throughput
+Figure 12: Results for the different CC algorithms (TPC-C 40 300
+with 1 warehouse). )k (n
+e k o T 2
+3
+0
+0 )s
+(y
+c n e
+200
+then with 1 warehouse to represent high contention where trans- g v A 10 ta L 100
+actions compete heavily for the same set of records.
+0 0
+Low Contention. Figure 11 shows the throughput results for 8 1 # 6 of 2 W 4 or 3 k 2 ers 40 48
+the 100-warehouse case. When contention is low, all protocols
+Tail percentage, 48 threads
+scale almost linearly with increasing worker threads, consistent
+(c) Average token per agent txn (d) Latency distribution in 48 threads
+with the YCSB-Low-Contention results. Unlike YCSB’s random
+accesses, each TPC-C transaction has a fixed sequence of operations Figure 13: Performance comparison on the Flight Booking
+and stable data dependencies. This determinism allows Polyjuice, agentic workload.
+which uses an offline pre-trained policy, to allocate nearly optimal
+concurrency-control strategies for each operation, thus exhibiting
+excellent scalability similar to Silo.
+high total throughput only by starving agentic transactions, ren-
+High Contention. Figure 12 presents the results for the 1-warehouse dering it practically unusable for agent-centric applications. Sim-
+configuration, where contention is high due to intense competition ilarly, Wound-Wait’s indiscriminate locking triggers severe con-
+for the same records. Silo and Polaris suffer sharp throughput degra- tention and preemptive aborts of agentic transactions, causing total
+dation of agentic transactions due to validated aborts. Plor exhibits throughput decreased by nearly 10× compared to ATCC.
+the lowest performance, bottlenecked by both write blocking and Figure 13(c) and (d) highlight the economic implications and tail
+read-conflict invalidations. MOCC and Polyjuice achieve relative latency. Silo incurs prohibitive costs (∼33k tokens) due to patho-
+stability using explicit hot-term locking and deterministic policy logical retry loops, in which agents repeatedly waste tokens on
+learning, respectively, but they lack specific mechanisms to prevent reasoning only to fail validation. ATCC eliminates this waste via
+long-running proxies from running out of resources. adaptive locking, reducing token costs by approximately 60% (∼13k).
+In contrast, ATCC ensures the viability of agentic transactions Regarding tail latency, ATCC maintains a bounded P99.99 latency
+by actively protecting their read and write sets. By enforcing pes- of ∼70s. This represents a 4× reduction compared to Wound-Wait
+simistic isolation on hot records, ATCC achieves an agentic through- (∼290s), which suffers from significant lock queuing delays and
+put 2.2× higher than Wound-Wait and over 10× higher than other aborts under high concurrency.
+baselines. This confirms that under pathological contention, tar-
+geted protection is the only viable strategy to preserve interactivity
+6.4 Variable Agentic Client Proportion
+stability.
+Real-world deployments exhibit dynamic shifts between interac-
+tive and background-heavy phases. A practical CC scheme must
+6.3 Agentic Workload Performance therefore remain robust as the mix of agentic and stored-procedure
+In this experiment, we evaluate how ATCC performs on an agentic clients shifts over time. To evaluate robustness under such fluctua-
+ticket-ordering workload. Since MOCC, Plor, Polaris, and Polyjuice tions, we vary the proportion of agentic workers from 0% to 100%
+do not support standard SQL interfaces, we just compare ATCC with (48 threads total) using the YCSB medium contention workload.
+Wound-Wait and Silo under the same code-base. Figure 13 presents As illustrated in Figure 14, while total throughput naturally
+the performance results under the Flight Booking workload (80% declines as long-running transactions replace short procedures,
+agentic mixed). ATCC demonstrates exceptional robustness. It achieves nearly linear
+As shown in Figure 13(a), ATCC achieves a peak agent through- growth in agentic throughput, maintaining a negligible abort rate
+put of ∼2.5 tps, outperforming Wound-Wait by 2× and Silo by 2.5×. (∼ 0.2%) across all mix ratios. By dynamically switching hot agentic
+Crucially, this gain does not compromise background tasks. In Fig- operations to lock-protected mode while keeping background tasks
+ure 13(b), ATCC maintains a total throughput (∼5k tps) comparable optimistic, ATCC maintains minimal token costs (∼27k) and prevents
+to Silo. Employing adaptive locking with priority-aware schedul- latency spikes.
+ing, ATCC effectively protects long-running agents from starvation In contrast, baselines employing uniform conflict resolution fail
+without inducing system-wide gridlock. Conversely, Silo achieves to protect agent transactions. When agentic clients are few (10%
+11
+
+
+===== PAGE 12 =====
+Polyjuice Polaris MOCC Silo Plor Wound-wait ATCC partition a fixed policy (OCC or PCC), dynamically adjusting bound-
+(tu
+p h
+g u
+sp
+t
+)
+2
+3
+40
+0
+0
+0
+0
+0
+)sp tK
+(tu
+p 2
+3
+4
+0
+0
+0
+w
+a
+o
+r
+r
+o
+i
+d
+e
+u
+e
+s
+n
+r
+t
+e
+d
+o
+d
+-w
+a
+lo
+d
+a
+c
+a
+it
+k
+p
+P
+i
+t
+n
+C
+t
+g
+o
+C
+i
+c
+n
+w
+o
+t
+n
+i
+o
+t
+t
+h
+e
+P
+n
+o
+C
+t
+p
+C
+i
+t
+o
+i
+n
+m
+to
+/
+i
+h
+s
+r
+o
+t
+e
+i
+t
+d
+c
+s
+u
+p
+r
+c
+e
+o
+e
+a
+t
+d
+d
+s
+s
+h
+e
+,
+a
+i
+r
+f
+d
+e
+ts
+l
+d
+o
+.
+u
+c
+M
+c
+k
+i
+O
+n
+s.
+g
+C
+P
+u
+C
+lo
+n
+[
+r
+n
+3
+e
+[
+6
+9
+c
+]
+]
+e
+i
+s
+e
+n
+s
+n
+t
+a
+e
+h
+r
+g
+y
+a
+r
+n
+l
+a
+o
+c
+t
+c
+e
+e
+k
+s
+s
+o h blocking.
+rh
+T
+tn
+100
+g
+u o
+rh
+10 However, all of them face challenges in agentic workloads. Dy-
+e g 0 T 0 namic OCC assumes deterministic re-execution, locking the observed
+A
+0 20 40 60 80 100 0 20 40 60 80 100 read/write set. This fails with non-deterministic LLM agents that
+Percentage of Agent Workers (%) Percentage of Agent Workers (%) may generate entirely different SQL statements upon retry, ren-
+(a) Agent transaction throughput (b) Transaction throughput
+dering captured locks useless. For CormCC, its coarse-grained,
+200 120
+)k
+(sn
+e k o
+T g v A
+1
+1
+0
+5
+50
+0
+0
+2
+6
+0
+0
+50 70 90
+)s(y
+c n e ta
+L p 9 4
+8
+0
+0
+1
+0
+0
+50 70 90
+p
+h g
+ex
+i
+a
+a e
+p
+r
+v s
+t
+e
+i .
+i
+o
+n
+t
+M
+i
+r
+s
+o
+s
+i
+O
+n
+v
+a
+-
+e
+C c
+le
+c
+a
+C
+v
+e
+g
+e
+s a
+e
+l
+s n
+n
+i
+a
+n d
+t
+d
+g
+t
+P
+a
+r
+p
+a
+t lo h
+n
+ta
+r e
+s
+t
+a
+l
+i
+s a
+o
+c
+a c
+t
+n
+m
+i
+k
+o
+i
+e
+n
+s
+g
+e
+n
+s
+d m
+o
+t
+a
+h
+r
+t a
+e
+a
+e
+n
+s
+, t
+s
+r i
+t
+a
+c e
+h
+m
+s
+e
+a u
+e
+w
+h
+lt
+a
+e
+a i
+s
+t
+n r
+e
+e g
+t
+r
+n
+r
+o
+a
+i e n
+g
+d
+s
+e
+i
+s m
+t
+n
+.
+i
+e
+o
+T is
+i
+n
+h
+t
+m
+y
+a
+e
+l
+a y
+i
+t
+n
+t
+r
+c t
+a
+r h
+a
+e
+n
+g
+e a
+s
+e
+d t
+a
+n
+c
+t s
+t
+o
+t
+t
+s
+i
+r k
+’
+o
+a e
+b
+n
+t n e
+e
+s
+- -
+-
+,
+9 9 often leading to the preemption of high-value tasks.
+0 0
+0 20 40 60 80 100 10 30 50 70 90 Priority-Based Concurrency Control. Priority-based concur-
+Percentage of Agent Workers (%) Percentage of Agent Workers (%) rency control is a suitable scheme to prioritize certain classes of
+(c) Average token per agent txn (d) 999p tail Latency
+transactions over others, ensuring low tail latency of critical trans-
+actions. It intuitively seems suitable for prioritizing interactive
+Figure 14: Performance with varying interactive client pro-
+transactions, aligning closely with our approach. Existing systems
+portions (YCSB Medium-Contention).
+such as Microsoft SQL Server [1], Oracle Berkeley DB [3], and
+CockroachDB [30] incorporate ad hoc prioritization mechanisms to
+- 50%), long-running agents are repeatedly invalidated by high- favor high-priority transactions in scheduling or validation. More
+frequency background updates. This inefficiency manifests as a structured academic approaches, such as Polaris [39] and Ding et
+rapid escalation in costs: Silo’s token consumption spikes to ∼100k - al. [11], refine this by integrating priority into optimistic validation.
+3.3× higher than ATCC, while Polaris suffers from tail latency spikes Polaris uses a lightweight reservation mechanism based on times-
+nearly 10× worse than ATCC. tamps and abort counts to guarantee progress for older, retry-heavy
+transactions, while Ding et al. defer conflict resolution to validate
+7 RELATED WORK prioritized batches sequentially.
+However, relying on static heuristics (e.g., timestamps or abort
+Learning-Based Transaction Management. Machine learning
+counts) proves insufficient for agentic workloads. In optimistic set-
+techniques have been applied to enhance the performance and
+tings, over-prioritizing conflicting high-priority transactions trig-
+adaptability of database transaction management. [28] analyzes po-
+gers aborts among agentic transactions, while in pessimistic modes,
+tential conflicts from SQL predicates and assigns high-conflict trans-
+aggressive lock preemption leads to starvation. Crucially, these
+actions to dedicated FIFO queues for serial execution. However, it
+requires the complete set of SQL statements to be known before ex- static schemes lack semantic awareness of transaction value. They
+fail to account for the unique runtime characteristics of interactive
+ecution, making it inapplicable to agentic workloads where queries
+agents, such as variable urgency, evolving access patterns, and to-
+are generated incrementally by LLMs. Polyjuice [34] treats CC as
+a fine-grained policy that maps per-operation execution states to ken consumption. ATCC overcomes this by defining priority not as
+a static label, but as a dynamic function of real-time contention and
+actions and trains offline to obtain an optimized state-action policy
+accumulated token investment, ensuring that high-value agents
+table. While effective for deterministic stored procedures, its static
+survive without crippling system-wide throughput.
+policies fail to adapt to the stochastic, non-deterministic access
+patterns of interactive agents, leading to policy misalignment and
+performance degradation. ATCC employs a reinforcement learning 8 CONCLUSION
+framework explicitly designed for agentic stochasticity. Rather than In this paper, we present ATCC, an adaptive concurrency control
+relying on static templates or pre-declared query sets, ATCC analyzes framework tailored for the emerging paradigm of agentic transac-
+real-time system contention and phase-level access characteristics tions. ATCC introduces a reinforcement learning-based policy to dy-
+to adjust locking scopes dynamically. This adaptive approach en- namically adapt execution strategies, switching between optimistic
+sures both economic efficiency and service quality, addressing the and pessimistic modes based on the runtime interpretation of agent
+unique availability constraints of agent-centric applications. behaviors. Transactions identified as high-risk or cost-sensitive are
+Hybrid Concurrency Control (Hybrid CC). Hybrid CC com- proactively protected via lock scheduling, while others proceed op-
+bines the strengths of OCC and PCC to handle diverse workloads. timistically to maximize concurrency. By effectively balancing the
+Composing CC [44] provides a framework for safely composing trade-off between immediate blocking overhead and future abort
+different CC protocols. Dynamic OCC [8] executes transactions costs, ATCC addresses the unique challenges of long-running, non-
+optimistically, then re-executes aborted ones using 2PL based on deterministic agentic workflows. It preserves the high throughput
+the collected read/write set during the previous run. CormCC [31] advantage of traditional schemes while providing the robustness
+partitions data based on historical access patterns and assigns each and low tail latency required for LLM-driven data agents.
+12
+
+
+===== PAGE 13 =====
+REFERENCES arXiv:2408.05109 (2024).
+[1] 2025. Microsoft SQL Server. https://www.microsoft.com/en-us/sql-server. [23] Yi Lu, Xiangyao Yu, and Samuel Madden. 2019. STAR: scaling transactions
+[2] 2025. openGauss-MOT. https://docs.opengauss.org/en/docs/latest/database_ through asymmetric replication. Proceedings of the VLDB Endowment 12, 11 (jul
+administration_guide/mot.html/. 2019), 1316–1329. https://doi.org/10.14778/3342263.3342270
+[3] 2025. Oracle Berkeley DB. https://www.oracle.com/database/technologies/ [24] Lin Ma, Dana Van Aken, Ahmed Hefny, Gustavo Mezerhane, Andrew Pavlo,
+related/berkeleydb.html. and Geoffrey J. Gordon. 2018. Query-based Workload Forecasting for Self-
+[4] 2025. TPC-C. https://www.tpc.org/tpc_documents_current_versions/pdf/tpc- Driving Database Management Systems. In Proceedings of the 2018 Interna-
+c_v5.11.0.pdf. tional Conference on Management of Data (Houston, TX, USA) (SIGMOD ’18).
+[5] 2025. YCSB. https://github.com/brianfrankcooper/YCSB/. Association for Computing Machinery, New York, NY, USA, 631–645. https:
+[6] Philip A Bernstein, Vassos Hadzilacos, Nathan Goodman, et al. 1987. Concurrency //doi.org/10.1145/3183713.3196908
+control and recovery in database systems. Vol. 370. Addison-wesley Reading. [25] Alec Radford, Jeffrey Wu, Rewon Child, David Luan, Dario Amodei, Ilya
+[7] Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan, Sutskever, et al. 2019. Language models are unsupervised multitask learners.
+Prafulla Dhariwal, Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda OpenAI blog 1, 8 (2019), 9.
+Askell, et al. 2020. Language models are few-shot learners. Advances in neural [26] Kun Ren, Alexander Thomson, and Daniel J Abadi. 2012. Lightweight locking
+information processing systems 33 (2020), 1877–1901. for main memory database systems. Proceedings of the VLDB Endowment 6, 2
+[8] Man Cao, Minjia Zhang, Aritra Sengupta, and Michael D. Bond. 2016. Drinking (2012), 145–156.
+from both glasses: combining pessimistic and optimistic tracking of cross-thread [27] Timo Schick, Jane Dwivedi-Yu, Roberto Dessì, Roberta Raileanu, Maria Lomeli,
+dependences. In Proceedings of the 21st ACM SIGPLAN Symposium on Principles Eric Hambro, Luke Zettlemoyer, Nicola Cancedda, and Thomas Scialom. 2023.
+and Practice of Parallel Programming (Barcelona, Spain) (PPoPP ’16). Association Toolformer: Language models can teach themselves to use tools. Advances in
+for Computing Machinery, New York, NY, USA, Article 20, 13 pages. https: Neural Information Processing Systems 36 (2023), 68539–68551.
+//doi.org/10.1145/2851141.2851143 [28] Yangjun Sheng, Anthony Tomasic, Tieying Zhang, and Andrew Pavlo. 2019.
+[9] Youmin Chen, Xiangyao Yu, Paraschos Koutris, Andrea C. Arpaci-Dusseau, Scheduling OLTP transactions via learned abort prediction. In Proceedings of
+Remzi H. Arpaci-Dusseau, and Jiwu Shu. 2022. Plor: General Transactions with the Second International Workshop on Exploiting Artificial Intelligence Techniques
+Predictable, Low Tail Latency. In Proceedings of the 2022 International Conference for Data Management (Amsterdam, Netherlands) (aiDM ’19). Association for
+on Management of Data (Philadelphia, PA, USA) (SIGMOD ’22). Association for Computing Machinery, New York, NY, USA, Article 1, 8 pages. https://doi.org/
+Computing Machinery, New York, NY, USA, 19–33. https://doi.org/10.1145/ 10.1145/3329859.3329871
+3514221.3517879 [29] Linzhuang Sun, Tianyu Guo, Hao Liang, Yuying Li, Qifeng Cai, Jingxuan
+[10] Cristian Diaconu, Craig Freedman, Erik Ismert, Per-Ake Larson, Pravin Mit- Wei, Bihui Yu, Wentao Zhang, and Bin Cui. 2025. Rethinking Text-to-SQL:
+tal, Ryan Stonecipher, Nitin Verma, and Mike Zwilling. 2013. Hekaton: SQL Dynamic Multi-turn SQL Interaction for Real-world Database Exploration.
+server’s memory-optimized OLTP engine. In Proceedings of the 2013 ACM SIG- arXiv:2510.26495 [cs.DB] https://arxiv.org/abs/2510.26495
+MOD International Conference on Management of Data (New York, New York, [30] Rebecca Taft, Irfan Sharif, Andrei Matei, Nathan VanBenschoten, Jordan Lewis,
+USA) (SIGMOD ’13). Association for Computing Machinery, New York, NY, USA, Tobias Grieger, Kai Niemi, Andy Woods, Anne Birzin, Raphael Poss, Paul Bardea,
+1243–1254. https://doi.org/10.1145/2463676.2463710 Amruta Ranade, Ben Darnell, Bram Gruneir, Justin Jaffray, Lucy Zhang, and Peter
+[11] Bailu Ding, Lucja Kot, and Johannes Gehrke. 2018. Improving optimistic concur- Mattis. 2020. CockroachDB: The Resilient Geo-Distributed SQL Database. In
+rency control through transaction batching and operation reordering. Proc. VLDB Proceedings of the 2020 ACM SIGMOD International Conference on Management of
+Endow. 12, 2 (Oct. 2018), 169–182. https://doi.org/10.14778/3282495.3282502 Data (Portland, OR, USA) (SIGMOD ’20). Association for Computing Machinery,
+[12] Jose M. Faleiro, Daniel J. Abadi, and Joseph M. Hellerstein. 2017. High perfor- New York, NY, USA, 1493–1509. https://doi.org/10.1145/3318464.3386134
+mance transactions via early write visibility. Proc. VLDB Endow. 10, 5 (Jan. 2017), [31] Dixin Tang and Aaron J. Elmore. 2018. Toward Coordination-free and Re-
+613–624. https://doi.org/10.14778/3055540.3055553 configurable Mixed Concurrency Control. In 2018 USENIX Annual Techni-
+[13] Dawei Gao, Haibin Wang, Yaliang Li, Xiuyu Sun, Yichen Qian, Bolin Ding, cal Conference (USENIX ATC 18). USENIX Association, Boston, MA, 809–822.
+and Jingren Zhou. 2023. Text-to-sql empowered by large language models: A https://www.usenix.org/conference/atc18/presentation/tang
+benchmark evaluation. arXiv preprint arXiv:2308.15363 (2023). [32] Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-Anne
+[14] Jiaqi Guo, Zecheng Zhan, Yan Gao, Yan Xiao, Jian-Guang Lou, Ting Liu, and Lachaux, Timothée Lacroix, Baptiste Rozière, Naman Goyal, Eric Hambro, Faisal
+Dongmei Zhang. 2019. Towards complex text-to-sql in cross-domain database Azhar, et al. 2023. Llama: Open and efficient foundation language models. arXiv
+with intermediate representation. arXiv preprint arXiv:1905.08205 (2019). preprint arXiv:2302.13971 (2023).
+[15] Zhihan Guo, Kan Wu, Cong Yan, and Xiangyao Yu. 2021. Releasing Locks As [33] Stephen Tu, Wenting Zheng, Eddie Kohler, Barbara Liskov, and Samuel Madden.
+Early As You Can: Reducing Contention of Hotspots by Violating Two-Phase 2013. Speedy transactions in multicore in-memory databases. In Proceedings of
+Locking. In Proceedings of the 2021 International Conference on Management of the Twenty-Fourth ACM Symposium on Operating Systems Principles (Farminton,
+Data (Virtual Event, China) (SIGMOD ’21). Association for Computing Machinery, Pennsylvania) (SOSP ’13). Association for Computing Machinery, New York, NY,
+New York, NY, USA, 658–670. https://doi.org/10.1145/3448016.3457294 USA, 18–32. https://doi.org/10.1145/2517349.2522713
+[16] Boyan Li, Yuyu Luo, Chengliang Chai, Guoliang Li, and Nan Tang. 2024. [34] Jiachen Wang, Ding Ding, Huan Wang, Conrad Christensen, Zhaoguo Wang,
+The dawn of natural language to sql: Are we fully ready? arXiv preprint Haibo Chen, and Jinyang Li. 2021. Polyjuice: High-Performance Transactions
+arXiv:2406.01265 (2024). via Learned Concurrency Control. In 15th USENIX Symposium on Operating
+[17] Guoliang Li, Xuanhe Zhou, and Lei Cao. 2021. AI Meets Database: AI4DB and Systems Design and Implementation (OSDI 21). USENIX Association, 198–216.
+DB4AI. In Proceedings of the 2021 International Conference on Management of Data https://www.usenix.org/conference/osdi21/presentation/wang-jiachen
+(Virtual Event, China) (SIGMOD ’21). Association for Computing Machinery, [35] Run-Ze Wang, Zhen-Hua Ling, Jingbo Zhou, and Yu Hu. 2021. Tracking inter-
+New York, NY, USA, 2859–2866. https://doi.org/10.1145/3448016.3457542 action states for multi-turn text-to-sql semantic parsing. In Proceedings of the
+[18] Hanchen Li, Qiuyang Mang, Runyuan He, Qizheng Zhang, Huanzhi Mao, Xi- AAAI Conference on Artificial Intelligence, Vol. 35. 13979–13987.
+aokun Chen, Alvin Cheung, Joseph Gonzalez, and Ion Stoica. 2025. Continuum: [36] Tianzheng Wang and Hideaki Kimura. 2016. Mostly-optimistic concurrency
+Efficient and Robust Multi-Turn LLM Agent Scheduling with KV Cache Time-to- control for highly contended dynamic workloads on a thousand cores. Proc.
+Live. arXiv:2511.02230 [cs.OS] https://arxiv.org/abs/2511.02230 VLDB Endow. 10, 2 (Oct. 2016), 49–60. https://doi.org/10.14778/3015274.3015276
+[19] Haoyang Li, Shang Wu, Xiaokang Zhang, Xinmei Huang, Jing Zhang, Fuxin [37] Shunyu Yao, Dian Yu, Jeffrey Zhao, Izhak Shafran, Tom Griffiths, Yuan Cao, and
+Jiang, Shuai Wang, Tieying Zhang, Jianjun Chen, Rui Shi, et al. 2025. Omnisql: Karthik Narasimhan. 2023. Tree of thoughts: Deliberate problem solving with
+Synthesizing high-quality text-to-sql data at scale. arXiv preprint arXiv:2503.02240 large language models. Advances in neural information processing systems 36
+(2025). (2023), 11809–11822.
+[20] Hyeontaek Lim, Michael Kaminsky, and David G. Andersen. 2017. Cicada: [38] Shunyu Yao, Jeffrey Zhao, Dian Yu, Nan Du, Izhak Shafran, Karthik R Narasimhan,
+Dependably Fast Multi-Core In-Memory Transactions. In Proceedings of the 2017 and Yuan Cao. 2023. ReAct: Synergizing Reasoning and Acting in Language
+ACM International Conference on Management of Data (Chicago, Illinois, USA) Models. In The Eleventh International Conference on Learning Representations.
+(SIGMOD ’17). Association for Computing Machinery, New York, NY, USA, 21–35. https://openreview.net/forum?id=WE_vluYUL-X
+https://doi.org/10.1145/3035918.3064015 [39] Chenhao Ye, Wuh-Chwen Hwang, Keren Chen, and Xiangyao Yu. 2023. Polaris:
+[21] Shu Liu, Alan Zhu, Sumanth Hegde, Shiyi Cao, Shuo Yuan, Samion Suwito, Tyler Enabling Transaction Priority in Optimistic Concurrency Control. Proc. ACM
+Griggs, Matei Zaharia, Joseph E. Gonzalez, and Ion Stoica. 2025. SkyRL-SQL: Manag. Data 1, 1, Article 44 (May 2023), 24 pages. https://doi.org/10.1145/3588724
+Multi-turn SQL Data Agents via RL. In First Workshop on Multi-Turn Interactions [40] Xiangyao Yu, Andrew Pavlo, Daniel Sanchez, and Srinivas Devadas. 2016. TicToc:
+in Large Language Models. https://openreview.net/forum?id=VNPGUGbC1p Time Traveling Optimistic Concurrency Control. In Proceedings of the 2016 Inter-
+[22] Xinyu Liu, Shuyu Shen, Boyan Li, Peixian Ma, Runzhi Jiang, Yuxin Zhang, Ju national Conference on Management of Data (San Francisco, California, USA) (SIG-
+Fan, Guoliang Li, Nan Tang, and Yuyu Luo. 2024. A Survey of NL2SQL with MOD ’16). Association for Computing Machinery, New York, NY, USA, 1629–1642.
+Large Language Models: Where are we, and where are we going? arXiv preprint https://doi.org/10.1145/2882903.2882935
+13
+
+
+===== PAGE 14 =====
+[41] Xiangyao Yu, Yu Xia, Andrew Pavlo, Daniel Sanchez, Larry Rudolph, and Srinivas [43] Victor Zhong, Caiming Xiong, and Richard Socher. 2017. Seq2sql: Generating
+Devadas. 2018. Sundial: harmonizing concurrency control and caching in a dis- structured queries from natural language using reinforcement learning. arXiv
+tributed oltp database management system. Proceedings of the VLDB Endowment preprint arXiv:1709.00103 (2017).
+11, 10 (2018), 1289–1302. [44] Ofri Ziv, Alex Aiken, Guy Golan-Gueta, G. Ramalingam, and Mooly Sagiv. 2015.
+[42] Wayne Xin Zhao, Kun Zhou, Junyi Li, Tianyi Tang, Xiaolei Wang, Yupeng Hou, Composing concurrency control. SIGPLAN Not. 50, 6 (June 2015), 240–249.
+Yingqian Min, Beichen Zhang, Junjie Zhang, Zican Dong, et al. 2023. A survey https://doi.org/10.1145/2813885.2737970
+of large language models. arXiv preprint arXiv:2303.18223 1, 2 (2023).
+14

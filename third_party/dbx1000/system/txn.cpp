@@ -223,11 +223,6 @@ RC txn_man::finish(RC rc) {
 #elif CC_ALG == HEKATON
 	rc = validate_hekaton(rc);
 	cleanup(rc);
-#elif CC_ALG == HYBRID
-	if (rc == RCOK)
-		rc = validate_hybrid();
-	else
-		cleanup(rc);
 #else 
 	cleanup(rc);
 #endif

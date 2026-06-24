@@ -8,6 +8,7 @@
 void table_t::init(Catalog * schema) {
 	this->table_name = schema->table_name;
 	this->schema = schema;
+	this->cur_tab_size = 0;
 }
 
 RC table_t::get_new_row(row_t *& row) {

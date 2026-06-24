@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "astra-core"
+version = "0.1.0"
+description = "Agent-side transaction runtime with pluggable concurrency control over a versioned KV backend"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "pybind11>=2.10",
+]
+authors = [
+  {name = "ASTRA contributors"},
+]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: C++",
+  "Topic :: Database",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.scripts]
+astra-cc-matrix = "agent.evaluation.cc_matrix_cli:main"
+astra-dbx1000-native = "agent.evaluation.dbx1000_native:main"
+astra-agent-paths = "agent.evaluation.agent_path_experiment:main"
+astra-atcc-retry = "agent.evaluation.atcc_retry_experiment:main"
+astra-atcc-train = "agent.evaluation.atcc_policy_training:main"
+astra-atcc-profiles = "agent.evaluation.atcc_profile_runner:main"
+astra-atcc-cost-search = "agent.evaluation.atcc_reward_cost_search:main"
+
+[tool.setuptools.packages.find]
+include = ["agent*"]
+
+[tool.setuptools]
+include-package-data = true

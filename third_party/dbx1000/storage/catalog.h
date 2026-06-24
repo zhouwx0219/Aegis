@@ -22,6 +22,7 @@ public:
 		strcpy(this->type, type);
 		strcpy(this->name, name);
 	};
+	~Column() { delete [] type; delete [] name; }
 
 	UInt64 id;
 	UInt32 size;
@@ -33,6 +34,8 @@ public:
 
 class Catalog {
 public:
+	Catalog() : field_cnt(0), table_name(NULL), _columns(NULL), tuple_size(0) {}
+	~Catalog() { delete [] _columns; }
 	// abandoned init function
 	// field_size is the size of each each field.
 	void init(const char * table_name, int field_cnt);

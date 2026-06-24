@@ -1,18 +1,31 @@
 #!/usr/bin/env bash
-# 编译 cast_core Python 扩展（C++ 事务内核 + pybind11 桥接）。
-# 用法: bash build.sh
-set -e
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$HERE"
+set -euo pipefail
 
-PYINC=$(python3 -m pybind11 --includes)
-EXT=$(python3-config --extension-suffix)
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
+
+CXX="${CXX:-g++}"
+PYINC="$(python3 -m pybind11 --includes)"
+EXT="$(python3-config --extension-suffix)"
 
 echo "compiling cast_core${EXT} ..."
-g++ -O3 -std=c++17 -shared -fPIC \
-  -I "$HERE" \
+# PYINC intentionally expands to multiple compiler arguments.
+# shellcheck disable=SC2086
+"$CXX" -O3 -std=c++17 -Wall -Wextra -shared -fPIC \
+  -DASTRA_DBX1000_EMBEDDED=1 -DNOGRAPHITE=1 \
+  -I "$ROOT" \
+  -I "$ROOT/third_party/dbx1000" \
+  -I "$ROOT/third_party/dbx1000/storage" \
+  -I "$ROOT/third_party/dbx1000/system" \
+  -I "$ROOT/third_party/dbx1000/concurrency_control" \
   ${PYINC} \
   core/bindings/cast_bindings.cpp \
+  core/storage/dbx1000_versioned_kv.cpp \
+  third_party/dbx1000/storage/catalog.cpp \
+  third_party/dbx1000/storage/table.cpp \
+  third_party/dbx1000/storage/row.cpp \
+  third_party/dbx1000/storage/index_hash.cpp \
+  -pthread \
   -o "cast_core${EXT}"
 
-echo "built: $HERE/cast_core${EXT}"
+echo "built: $ROOT/cast_core${EXT}"

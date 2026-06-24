@@ -10,17 +10,14 @@ CFLAGS += $(INCLUDE) -D NOGRAPHITE=1 -Werror -Wno-error=overloaded-virtual -O3
 LDFLAGS = -Wall -L. -L./libs -pthread -g -lrt -std=c++0x -O3 -no-pie -ljemalloc
 LDFLAGS += $(CFLAGS)
 
-CPPS = $(filter-out ./benchmarks/astra_vita.cpp,$(foreach dir, $(SRC_DIRS), $(wildcard $(dir)*.cpp)))
+CPPS = $(foreach dir, $(SRC_DIRS), $(wildcard $(dir)*.cpp))
 OBJS = $(CPPS:.cpp=.o)
 DEPS = $(CPPS:.cpp=.d)
 
-all:rundb astra_vita
+all:rundb
 
 rundb : $(OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
-
-astra_vita: benchmarks/astra_vita.cpp
-	$(CC) $(CFLAGS) -I../.. -std=c++17 -pthread -o $@ $<
 
 -include $(OBJS:%.o=%.d)
 
@@ -32,4 +29,4 @@ astra_vita: benchmarks/astra_vita.cpp
 
 .PHONY: clean
 clean:
-	rm -f rundb astra_vita $(OBJS) $(DEPS)
+	rm -f rundb $(OBJS) $(DEPS)

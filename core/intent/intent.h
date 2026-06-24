@@ -1,6 +1,5 @@
 #pragma once
-// 写意图：记录"这次写的语义是什么"，而不仅是"写成什么值"。
-// 沿用现有 Data-Agent-System 的五类意图。
+
 #include <cstdint>
 #include <string>
 
@@ -24,32 +23,34 @@ struct Condition {
   std::string expected_value;
 };
 
+// Carries the semantic meaning of a write in addition to its materialized value.
 struct WriteIntent {
   std::string object_id;
   IntentType intent_type = IntentType::kRead;
-  std::string payload;  // append 片段 / delta 增量 / 其他语义负载
-  Condition condition;  // 供 CAS 使用
+  std::string payload;
+  Condition condition;
 
-  // —— 约束可交换（escrow）扩展 ——
-  // 仅对 DELTA 有意义：constrained=true 表示该扣减带下界约束（如库存 stock>=lower_bound）。
-  // 默认 false ⟹ 行为与历史完全一致（既有 CostAsymmetricCommit 调用方不设置此字段）。
-  // 约束扣减的状态化预留由 cast::concurrency::EscrowAccount / HybridDispatcher 负责，
-  // 此处只承载"这是一笔带下界的可交换写"这一意图标注。
-  // Ordered APPEND is strict by default. Set true only for a commutative
-  // collection-style append whose operator satisfies associativity/commutativity.
+  // Ordered append is strict by default. Enable this only when the append
+  // operator is associative and commutative.
   bool commutative = false;
 
+  // A constrained delta must not move the resolved value below lower_bound.
   bool constrained = false;
   long long lower_bound = 0;
 };
 
-inline const char* IntentTypeName(IntentType t) {
-  switch (t) {
-    case IntentType::kRead: return "READ";
-    case IntentType::kOverwrite: return "OVERWRITE";
-    case IntentType::kAppend: return "APPEND";
-    case IntentType::kDelta: return "DELTA";
-    case IntentType::kCas: return "CAS";
+inline const char* IntentTypeName(IntentType type) {
+  switch (type) {
+    case IntentType::kRead:
+      return "READ";
+    case IntentType::kOverwrite:
+      return "OVERWRITE";
+    case IntentType::kAppend:
+      return "APPEND";
+    case IntentType::kDelta:
+      return "DELTA";
+    case IntentType::kCas:
+      return "CAS";
   }
   return "READ";
 }

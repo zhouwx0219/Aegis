@@ -1,5 +1,5 @@
 #pragma once
-// 成本标注的投机分支：一个候选解，携带读基线、缓冲写、写意图，以及生成成本与质量。
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -9,21 +9,29 @@
 
 namespace cast::branch {
 
-// 一个分支对某对象的写：记录读到的基线(用于版本校验与语义 rebase)与缓冲的新值。
+struct BranchRead {
+  std::string object_id;
+  std::uint64_t version = 0;
+};
+
+// Buffered write for one speculative branch. The base fields capture the
+// branch snapshot; branch_value is the materialized candidate value; intent
+// carries the semantic operation used by pluggable CC modules.
 struct BranchWrite {
   std::string object_id;
   cast::object::ObjectType kind = cast::object::ObjectType::kGeneric;
-  std::string base_value;            // 分支读到的基线值
-  std::uint64_t base_version = 0;    // 分支读到的版本（读集）
-  std::string branch_value;          // 分支缓冲的新值
-  cast::intent::WriteIntent intent;  // 写意图（决定并发类与 rebase 方式）
+  std::string base_value;
+  std::uint64_t base_version = 0;
+  std::string branch_value;
+  cast::intent::WriteIntent intent;
 };
 
 struct SpeculativeBranch {
   std::string branch_id;
+  std::vector<BranchRead> read_set;
   std::vector<BranchWrite> writes;
-  double gen_cost = 1.0;  // 该候选的生成成本（由算子注入）
-  double quality = 0.0;   // winner 选择打分
+  double gen_cost = 1.0;
+  double quality = 0.0;
 };
 
 }  // namespace cast::branch

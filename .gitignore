@@ -1,34 +1,23 @@
-# Python / local environments
 __pycache__/
 *.py[cod]
 .venv/
 .venv-*/
 venv/
 
-# Native build outputs
 *.so
 *.pyd
 *.dll
 *.dylib
 build/
 dist/
-third_party/dbx1000/rundb
-third_party/dbx1000/astra_vita
-third_party/dbx1000/**/*.o
-third_party/dbx1000/**/*.d
-third_party/dbx1000/core
-third_party/dbx1000/core.*
+docs/
+results/
 
-# Local runtime/cache artifacts
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-agent/experiments/results/llm_cache.json
-
-# OS/editor noise
 .DS_Store
 Thumbs.db
 *.swp
 *.swo
-
-docs/
+astra_core.egg-info/

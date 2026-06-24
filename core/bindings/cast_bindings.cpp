@@ -1,25 +1,26 @@
-// pybind11 桥接：把 C++ 事务内核暴露为 Python 扩展模块 cast_core。
-// Python 层（算子/调度/workload）通过它构造候选并调用成本不对称提交、escrow、混合分发器。
+// Python bindings for the ASTRA transaction kernel.
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
 #include <vector>
 
 #include "core/branch/speculative_branch.h"
+#include "core/concurrency/concurrency_control.h"
 #include "core/concurrency/escrow.h"
-#include "core/concurrency/hybrid_dispatcher.h"
+#include "core/concurrency/semantic_cc.h"
 #include "core/cost/cost_model.h"
 #include "core/intent/intent.h"
 #include "core/intent/policy_dispatcher.h"
 #include "core/object/unified_object.h"
 #include "core/storage/versioned_object_store.h"
+#include "core/txn/commit_protocol.h"
 #include "core/txn/cost_asymmetric_commit.h"
 
 namespace py = pybind11;
 using namespace cast;
 
 PYBIND11_MODULE(cast_core, m) {
-  m.doc() = "CAST/ASTRA: cost-asymmetric speculative transactions + hybrid CC core (C++ kernel)";
+  m.doc() = "ASTRA: intent-aware agent transaction kernel";
 
   py::enum_<object::ObjectType>(m, "ObjectType")
       .value("kGeneric", object::ObjectType::kGeneric)
@@ -59,12 +60,28 @@ PYBIND11_MODULE(cast_core, m) {
       .def_readwrite("constrained", &intent::WriteIntent::constrained)
       .def_readwrite("lower_bound", &intent::WriteIntent::lower_bound);
 
-  py::class_<storage::VersionedObjectStore>(m, "VersionedObjectStore")
+  py::class_<storage::VersionedKVStore>(m, "VersionedKVStore")
+      .def("get", &storage::VersionedKVStore::Get)
+      .def("get_version", &storage::VersionedKVStore::GetVersion)
+      .def("put", &storage::VersionedKVStore::Put)
+      .def("put_if_version", &storage::VersionedKVStore::PutIfVersion)
+      .def("delete_if_version", &storage::VersionedKVStore::DeleteIfVersion)
+      .def_property_readonly("backend_name", [](const storage::VersionedKVStore& store) {
+        return std::string(store.BackendName());
+      });
+
+  py::class_<storage::Dbx1000VersionedKVStore, storage::VersionedKVStore>(
+      m, "Dbx1000VersionedKVStore")
+      .def(py::init<std::size_t, std::size_t, std::size_t>(),
+           py::arg("max_key_bytes") = 512,
+           py::arg("max_value_bytes") = 8192,
+           py::arg("bucket_count") = 4096);
+  m.attr("VersionedObjectStore") = m.attr("Dbx1000VersionedKVStore");
+
+  py::class_<branch::BranchRead>(m, "BranchRead")
       .def(py::init<>())
-      .def("get", &storage::VersionedObjectStore::Get)
-      .def("get_version", &storage::VersionedObjectStore::GetVersion)
-      .def("put", &storage::VersionedObjectStore::Put, py::arg("key"), py::arg("value"))
-      .def("put_if_version", &storage::VersionedObjectStore::PutIfVersion);
+      .def_readwrite("object_id", &branch::BranchRead::object_id)
+      .def_readwrite("version", &branch::BranchRead::version);
 
   py::class_<branch::BranchWrite>(m, "BranchWrite")
       .def(py::init<>())
@@ -78,6 +95,7 @@ PYBIND11_MODULE(cast_core, m) {
   py::class_<branch::SpeculativeBranch>(m, "SpeculativeBranch")
       .def(py::init<>())
       .def_readwrite("branch_id", &branch::SpeculativeBranch::branch_id)
+      .def_readwrite("read_set", &branch::SpeculativeBranch::read_set)
       .def_readwrite("writes", &branch::SpeculativeBranch::writes)
       .def_readwrite("gen_cost", &branch::SpeculativeBranch::gen_cost)
       .def_readwrite("quality", &branch::SpeculativeBranch::quality);
@@ -104,29 +122,68 @@ PYBIND11_MODULE(cast_core, m) {
       .def("wasted_compute", &cost::CostStats::WastedCompute, py::arg("model"))
       .def("total_compute", &cost::CostStats::TotalCompute, py::arg("model"));
 
-  py::enum_<txn::CommitStrategy>(m, "CommitStrategy")
-      .value("kStrictOCC", txn::CommitStrategy::kStrictOCC)
-      .value("kCAST", txn::CommitStrategy::kCAST);
+  py::class_<concurrency::ConcurrencyControl>(m, "ConcurrencyControl")
+      .def_property_readonly("name", [](const concurrency::ConcurrencyControl& cc) {
+        return std::string(cc.Name());
+      })
+      .def_property_readonly("family", [](const concurrency::ConcurrencyControl& cc) {
+        return std::string(cc.Family());
+      })
+      .def_property_readonly("description", [](const concurrency::ConcurrencyControl& cc) {
+        return std::string(cc.Description());
+      })
+      .def_property_readonly("allows_semantic_rebase", [](const concurrency::ConcurrencyControl& cc) {
+        return cc.AllowsSemanticRebase();
+      })
+      .def_property_readonly("requires_object_locks", [](const concurrency::ConcurrencyControl& cc) {
+        return cc.RequiresObjectLocks();
+      });
+  py::class_<concurrency::SemanticConcurrencyControl,
+             concurrency::ConcurrencyControl>(m, "SemanticConcurrencyControl")
+      .def(py::init<>());
+  py::class_<concurrency::StrictOccConcurrencyControl,
+             concurrency::ConcurrencyControl>(m, "StrictOccConcurrencyControl")
+      .def(py::init<>());
+  py::class_<concurrency::StrictValidationConcurrencyControl,
+             concurrency::ConcurrencyControl>(m, "StrictValidationConcurrencyControl")
+      .def(py::init<std::string, std::string, bool, std::string>(),
+           py::arg("name") = "strict",
+           py::arg("family") = "strict_validation",
+           py::arg("requires_object_locks") = false,
+           py::arg("description") =
+               "Strict version validation over the agent read/write set");
+
+  py::class_<txn::CommitProtocol>(m, "CommitProtocol")
+      .def_property_readonly("name", [](const txn::CommitProtocol& protocol) {
+        return std::string(protocol.Name());
+      })
+      .def_property_readonly("family", [](const txn::CommitProtocol& protocol) {
+        return std::string(protocol.Family());
+      })
+      .def_property_readonly("description", [](const txn::CommitProtocol& protocol) {
+        return std::string(protocol.Description());
+      });
 
   py::class_<txn::CommitOutcome>(m, "CommitOutcome")
       .def_readonly("committed", &txn::CommitOutcome::committed)
       .def_readonly("rejected", &txn::CommitOutcome::rejected)
+      .def_readonly("needs_regeneration", &txn::CommitOutcome::needs_regeneration)
       .def_readonly("winner_branch_id", &txn::CommitOutcome::winner_branch_id)
       .def_readonly("action", &txn::CommitOutcome::action)
-      .def_readonly("reason", &txn::CommitOutcome::reason);
+      .def_readonly("reason", &txn::CommitOutcome::reason)
+      .def_readonly("conflict_object_ids", &txn::CommitOutcome::conflict_object_ids);
 
-  py::class_<txn::CostAsymmetricCommit>(m, "CostAsymmetricCommit")
-      .def(py::init<storage::VersionedObjectStore&, cost::CostModel>(), py::arg("store"),
+  py::class_<txn::CostAsymmetricCommit, txn::CommitProtocol>(m, "CostAsymmetricCommit")
+      .def(py::init<storage::VersionedKVStore&, cost::CostModel>(), py::arg("store"),
            py::arg("model"), py::keep_alive<1, 2>())
       .def(
           "commit_task",
           [](txn::CostAsymmetricCommit& self, std::vector<branch::SpeculativeBranch> candidates,
-             txn::CommitStrategy strategy, cost::CostStats& stats) {
-            return self.CommitTask(candidates, strategy, &stats);
+             const concurrency::ConcurrencyControl& cc, cost::CostStats& stats) {
+            return self.CommitTask(candidates, cc, &stats);
           },
-          py::arg("candidates"), py::arg("strategy"), py::arg("stats"));
+          py::arg("candidates"), py::arg("cc"), py::arg("stats"));
 
-  // ===== 下沉的约束可交换(escrow) + 混合并发分发器 =====
   py::class_<concurrency::EscrowAccount>(m, "EscrowAccount")
       .def(py::init<>())
       .def(py::init<long long, long long>(), py::arg("capacity"), py::arg("lower_bound") = 0)
@@ -137,50 +194,4 @@ PYBIND11_MODULE(cast_core, m) {
       .def("granted", &concurrency::EscrowAccount::granted)
       .def("rejected", &concurrency::EscrowAccount::rejected)
       .def("oversold", &concurrency::EscrowAccount::oversold);
-
-  py::enum_<concurrency::CCClass>(m, "CCClass")
-      .value("kRead", concurrency::CCClass::kRead)
-      .value("kCommFree", concurrency::CCClass::kCommFree)
-      .value("kCommConstr", concurrency::CCClass::kCommConstr)
-      .value("kStrict", concurrency::CCClass::kStrict);
-
-  py::enum_<concurrency::HybridPolicy>(m, "HybridPolicy")
-      .value("kOCC", concurrency::HybridPolicy::kOCC)
-      .value("kMVCC", concurrency::HybridPolicy::kMVCC)
-      .value("k2PL", concurrency::HybridPolicy::k2PL)
-      .value("kMergeAll", concurrency::HybridPolicy::kMergeAll)
-      .value("kHybrid", concurrency::HybridPolicy::kHybrid);
-
-  py::enum_<concurrency::TaskOutcome>(m, "TaskOutcome")
-      .value("kDirect", concurrency::TaskOutcome::kDirect)
-      .value("kReselect", concurrency::TaskOutcome::kReselect)
-      .value("kAllAborted", concurrency::TaskOutcome::kAllAborted);
-
-  py::class_<concurrency::AdaptiveCandidate>(m, "AdaptiveCandidate")
-      .def(py::init<>())
-      .def_readwrite("reads", &concurrency::AdaptiveCandidate::reads)
-      .def_readwrite("writes", &concurrency::AdaptiveCandidate::writes)
-      .def_readwrite("base", &concurrency::AdaptiveCandidate::base);
-
-  py::class_<concurrency::DispatchStats>(m, "DispatchStats")
-      .def_readonly("committed", &concurrency::DispatchStats::committed)
-      .def_readonly("reselect", &concurrency::DispatchStats::reselect)
-      .def_readonly("regen", &concurrency::DispatchStats::regen)
-      .def_readonly("merge", &concurrency::DispatchStats::merge)
-      .def_readonly("escrow_grant", &concurrency::DispatchStats::escrow_grant)
-      .def_readonly("escrow_reject", &concurrency::DispatchStats::escrow_reject)
-      .def_readonly("oversell", &concurrency::DispatchStats::oversell);
-
-  py::class_<concurrency::HybridDispatcher>(m, "HybridDispatcher")
-      .def(py::init<concurrency::HybridPolicy>(), py::arg("policy"))
-      .def("init_strict", &concurrency::HybridDispatcher::init_strict, py::arg("o"))
-      .def("init_counter", &concurrency::HybridDispatcher::init_counter, py::arg("o"))
-      .def("init_stock", &concurrency::HybridDispatcher::init_stock, py::arg("o"), py::arg("s0"))
-      .def("init_read", &concurrency::HybridDispatcher::init_read, py::arg("o"))
-      .def("snapshot", &concurrency::HybridDispatcher::snapshot, py::arg("objs"))
-      .def("commit_task", &concurrency::HybridDispatcher::commit_task, py::arg("cands"))
-      .def("commit_regen", &concurrency::HybridDispatcher::commit_regen, py::arg("c"))
-      .def("commit_2pl", &concurrency::HybridDispatcher::commit_2pl, py::arg("c"))
-      .def("stats", &concurrency::HybridDispatcher::stats)
-      .def("value_of", &concurrency::HybridDispatcher::value_of, py::arg("o"));
 }

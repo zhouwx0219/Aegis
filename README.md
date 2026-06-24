@@ -1,209 +1,287 @@
-# ASTRA: Agent-Side Transactions
+# ASTRA Core
 
-ASTRA is a research prototype for **agent-side transaction execution and semantic-aware concurrency control** in data agent systems.
+ASTRA is a compact agent-side transaction runtime. A task may generate multiple
+candidate plans, operate on heterogeneous versioned objects, and commit through
+a selectable concurrency-control module.
 
-The project targets the AI-OLTP gap: recent data-agent systems such as Palimpzest focus on read-heavy AI-OLAP workloads, while many agent tasks also write shared state such as seats, inventory, counters, order status, and text. ASTRA moves the transaction boundary to the agent side, where object semantics and generated candidates are still visible.
-
-## Naming
-
-| Name | Meaning in the paper | Code / artifact |
-|---|---|---|
-| **ASTRA** | The full system: Agent-Side Transactions | This repository and paper narrative |
-| **CAST** | ASTRA's cost-asymmetric commit protocol | `core/txn/cost_asymmetric_commit.h` |
-| **HYBRID** | The experimental label for ASTRA's semantic-aware CC strategy | Figures and CSV results |
-| **CSI-SS** | The mixed correctness boundary | `docs/ISOLATION_LEVELS.md`, `docs/PROOFS.md` |
-
-We no longer use CAST as the whole-system name. CAST is the commit protocol inside ASTRA: `direct -> merge -> reselect -> regenerate`.
-
-## What Is Implemented
+## Architecture
 
 ```text
-Python agent/runtime layer
-  - AgentTransactionManager: begin -> snapshot/read -> model/tool calls
-    -> candidate branches -> commit/reject trace
-  - Mock and DeepSeek OTA candidate generators
-  - Synthetic, true-concurrency, VitaBench-style, and LLM-in-the-loop experiments
-
-pybind11
-  - In-process bridge to the C++ kernel (`cast_core`)
-
-C++ kernel
-  - VersionedObjectStore: minimal versioned KV reference store
-  - WriteIntent + PolicyDispatcher: typed intents and semantic rebase
-  - CostAsymmetricCommit: CAST direct/merge/reselect/regenerate
-  - HybridDispatcher: per-object/intent HYBRID CC policy
-  - EscrowAccount: constrained commutative reservation, no oversell
+Agent task -> K candidates -> ASTRA transaction runtime
+           -> pluggable CC validation -> atomic version checks and writes
+           -> DBx1000 Catalog + table_t + row_t + IndexHash
 ```
 
-Important scope decision for the CCFA paper: **real persistent DB backend**, **crash recovery**, and an **adaptive optimizer for choosing `k` or policy** are future work. They are not required for the current transaction/CC contribution.
+- `core/storage` exposes a narrow `VersionedKVStore` contract. The default
+  `Dbx1000VersionedKVStore` stores key, value, existence, and a monotonic version
+  in DBx1000 rows and uses DBx1000's hash index for lookup.
+- `core/concurrency` defines the `ConcurrencyControl` plugin interface. The
+  included `SemanticConcurrencyControl` understands overwrite, ordered or
+  commutative append, delta, constrained delta, and CAS. Strict validation
+  modules provide OCC and DBx1000-style traditional comparison points.
+- `core/txn` defines a `CommitProtocol` interface. The default
+  `CostAsymmetricCommit` validates candidates in quality order and performs
+  direct commit, semantic resolution, candidate reselection, or an explicit
+  regeneration request. Multi-object writes use one atomic version-check batch.
+- `agent/runtime` owns snapshots, model/tool traces, candidate construction,
+  CC registration, and real regeneration callbacks. Its modules map directly to
+  the four pluggable design points:
+  `branching.py` for multi-branch transaction semantics, `cc_registry.py` plus
+  `core/concurrency` for semantic-aware CC modules, `commit_protocol.py` plus
+  `core/txn` for cost-aware commit protocols, and `adaptive.py` for ATCC policy
+  tables.
+- `agent/workloads` contains provider-neutral Agent-YCSB and Agent-TPCC
+  workloads derived from DBx1000's benchmark families, split into faithful and
+  semantic agent layers.
+- `agent/evaluation/dbx1000_native.py` runs DBx1000's own executable as an
+  external native baseline, so native OCC/MVCC/TicToc/Silo/2PL results are not
+  confused with ASTRA's agent-side adapters.
 
-## Repository Layout
+DBx1000 is an in-memory OLTP research engine. In ASTRA it is deliberately used
+as a process-local, non-durable, versioned KV substrate; agent/runtime owns the
+transaction semantics, CC policy selection, read-set validation, regeneration
+boundary, and trace. The vendored upstream revision and local embedding changes
+are recorded in `third_party/dbx1000/UPSTREAM.md`.
 
-```text
-cast-das/
-├── core/                         # C++ transaction / concurrency kernel
-│   ├── storage/                  # versioned KV reference boundary
-│   ├── intent/                   # write-intent classification and rebase
-│   ├── txn/                      # CAST commit protocol
-│   ├── concurrency/              # HYBRID dispatcher and escrow
-│   └── bindings/                 # pybind11 module
-├── agent/
-│   ├── runtime/                  # upper transaction lifecycle
-│   ├── llm/                      # DeepSeek OTA agent operator
-│   ├── workloads/                # synthetic / VitaBench-style workloads
-│   ├── experiments/              # experiments and paper figure generator
-│   └── integrations/             # VitaBench OTA integration
-├── docs/                         # paper skeleton, proofs, artifact guide
-├── scripts/                      # smoke and reproduction entrypoints
-├── figures/                      # schematic figures
-└── build.sh                      # build `cast_core`
-```
+## Build And Test
 
-## Quick Start
-
-On WSL/Linux:
+On Linux or WSL:
 
 ```bash
-python3 -m pip install -r requirements.txt   # needed for legacy PNG scripts
+python3 -m pip install -e .
 bash build.sh
-bash scripts/smoke.sh
+python3 -m unittest discover -s tests -v
 ```
 
-`bash scripts/smoke.sh` builds the C++ extension, imports `cast_core`, runs the transaction lifecycle checks, runs the end-to-end CAST demo, verifies the correctness boundary, and regenerates the paper-facing SVG figures.
+`pyproject.toml` declares the Python package metadata, the `pybind11`
+dependency, and the `astra-cc-matrix` and `astra-dbx1000-native` console
+scripts. The native `cast_core` extension is still built explicitly by
+`build.sh`, because the DBx1000 embedding is intentionally kept as a narrow
+local adapter.
+If importing `agent.runtime` or running the CLI reports that `cast_core` is not
+available, rebuild with `bash build.sh` using the same Linux/WSL Python runtime.
 
-If `matplotlib` is unavailable, the smoke path still works because `agent/experiments/paper_figures.py` uses only the Python standard library.
+## Versioned KV
 
-## Core Paper Figures
+```python
+import cast_core as cc
 
-The CCFA-facing figure set is generated into:
-
-```text
-agent/experiments/results/paper_figures/
+store = cc.Dbx1000VersionedKVStore(
+    max_key_bytes=512,
+    max_value_bytes=8192,
+    bucket_count=4096,
+)
+store.put("inventory:42", "10")
+snapshot = store.get("inventory:42")
+updated = store.put_if_version("inventory:42", snapshot.version, "9")
 ```
 
-Regenerate from existing CSV/JSON results:
+Deletes leave a versioned tombstone, so deleting and recreating a key cannot
+reintroduce an old version. The transaction kernel uses `BatchPutIfVersion` for
+all-or-nothing validation and writes across multiple keys.
+
+## CC Plugins
+
+The runtime includes `semantic` (also available as the compatibility aliases
+`cast` and `semantic-v2`), `occ`, DBx1000-style strict validation adapters
+(`mvcc`, `silo`, `tictoc`, and `2pl`), plus an ATCC-shaped `adaptive` policy
+table. The default table chooses `semantic` for rebaseable intents, may choose
+`2pl` for wide strict read/write footprints, and falls back to `occ`:
+
+```python
+import cast_core as cc
+from agent.runtime import AgentTransactionManager
+
+manager = AgentTransactionManager()
+manager.register_cc("semantic-v2", cc.SemanticConcurrencyControl())
+print(manager.cc_strategy("adaptive"))
+print(manager.module_catalog()["commit_protocol"]["name"])
+
+manager.register_object("counter", 0, kind="counter")
+txn = manager.begin("task-1")
+txn.add_candidate("candidate-1", quality=1, gen_cost=0).delta("counter", 1)
+result = txn.commit(strategy="adaptive")
+```
+
+To add another agent-side CC module, implement `ConcurrencyControl::Name`,
+`Family`, optional metadata such as `RequiresObjectLocks`, and `Resolve`, expose
+the class in `cast_bindings.cpp`, and register an instance under a runtime name.
+`StrictValidationConcurrencyControl` can also be used to register a named
+traditional baseline over the same agent read/write-set validation contract.
+Storage and commit orchestration do not need to change.
+
+The DBx1000-style names are comparison adapters at the ASTRA layer. They do not
+delegate transaction execution to DBx1000's original benchmark threads or lock
+managers; DBx1000 remains the versioned KV backend.
+
+For authoritative DBx1000 native CC baselines, use `astra-dbx1000-native`. It
+copies the vendored DBx1000 tree into a temporary directory, patches `CC_ALG`,
+builds `rundb`, runs the original benchmark path, and parses DBx1000's
+`[summary]` output:
 
 ```bash
-python3 agent/experiments/paper_figures.py
+python3 -m agent.evaluation.dbx1000_native \
+  --workload ycsb \
+  --strategies occ,mvcc,tictoc,silo,no_wait \
+  --threads 8 \
+  --output dbx1000-ycsb-native.json
 ```
 
-Current core figures:
+The adaptive table is explicit and replaceable from Python:
 
-1. `fig1_cost_asymmetry.svg`: cost asymmetry, mergeability, and boundary cases.
-2. `fig2_true_concurrency.svg`: measured throughput/latency under true concurrency.
-3. `fig3_semantic_reselect.svg`: semantic validation and multi-candidate reselect.
-4. `fig4_escrow_correctness.svg`: constrained commutative writes and no oversell.
-5. `fig5_llm_in_loop.svg`: real DeepSeek trace evidence and replay comparison.
-6. `fig6_baseline_family.svg`: OCC/Silo/TicToc/MVCC/2PL/HYBRID baseline family.
-7. `fig7_scale_out.svg`: larger task counts and thread scale-out.
-8. `fig8_agent_aware_baselines.svg`: OCC+K, HYBRID-K1, merge-all, and safety-aware baselines.
-9. `fig9_hotspot_mixed.svg`: hotspot mixed-object workload with throughput and generation-call efficiency.
-10. `fig10_vitabench_authoritative.svg`: VitaBench environment-derived OTA write workload over real shared resources.
-11. `fig11_rigorous_vitabench.svg`: large-scale benchmark reporting throughput, P95 latency, and SLA success rate.
+```python
+from agent.runtime import AdaptivePolicyRule, AdaptivePolicyTable
 
-See `docs/CCFA_ARTIFACT_GUIDE.md` for the claim-to-figure mapping.
+manager.set_adaptive_policy(
+    AdaptivePolicyTable(
+        rules=(
+            AdaptivePolicyRule(
+                name="strict-wide-to-2pl",
+                target_strategy="2pl",
+                min_reads=2,
+                min_writes=4,
+                overwrite_only=True,
+            ),
+        ),
+        fallback_strategy="occ",
+    )
+)
+```
 
-## Reproduction
+Operation-level ATCC has two execution variants. `adaptive-op` keeps semantic
+optimistic resolution and adds commit-phase locks for pessimistic targets.
+`adaptive-op-strict` is the pure traditional switch: optimistic targets use
+strict OCC, while pessimistic targets are locked before the snapshot and held
+through commit. `2pl-pre` is the full pre-snapshot 2PL baseline. Pre-snapshot
+strategies must be evaluated with
+`agent_path_experiment --execution-mode concurrent`.
 
-Curated CCFA reproduction flow:
+See `docs/pre_snapshot_atcc_tpcc_report.md` for training, reproduction, and
+large TPC-C NewOrder results.
+
+The online ATCC policy table can be selected with
+`agent_path_experiment --operation-policy atcc`. It combines object-role priors
+with runtime conflict and lock-wait feedback while staying on the strict
+OCC/2PL path. See `docs/online_atcc_experiment_zh.md` for the focused ATCC
+TPC-C/YCSB experiments and reproduction commands.
+
+The migrated phase-aware ATCC workflow can be reproduced as a fixed profile
+suite. It trains the tabular ATCC policy artifact, evaluates OCC, full
+pre-snapshot 2PL, and loaded ATCC on Agent-YCSB/Agent-TPCC low/medium/high
+profiles, and writes both JSON artifacts and a Markdown summary table:
 
 ```bash
-bash scripts/reproduce_ccfa.sh
+python3 -m agent.evaluation.atcc_profile_runner \
+  --profiles all \
+  --output-dir results/phase_atcc_profiles
 ```
 
-From Windows PowerShell:
+For a quick smoke run, lower `--train-task-count`, `--eval-task-count`,
+`--eval-repeats`, and `--workers`. The installed console script is
+`astra-atcc-profiles`. Phase-aware ATCC policy artifacts are versioned; current
+artifacts use schema version 2 and include `class=<object_class>` in Q-table
+state keys, so formal profile runs should retrain artifacts after changing the
+state dimensions. Retry-evaluation reports include `policy_artifact_schema`
+when `--policy-artifact` is used, making legacy or incompatible artifacts visible
+in the result JSON. See `docs/phase_atcc_v2_profile_experiment_zh.md` for the
+current v2 profile experiment and `docs/phase_atcc_v2_smoke_report_zh.md` for a
+small smoke run. The current ATCC module design is summarized in
+`docs/atcc_design_zh.md`, and the latest local pressure-scale profile analysis is
+in `docs/phase_atcc_v2_scale_experiment_zh.md`. For a workload closer to the
+original ATCC paper's agent-starvation setting, see
+`docs/atcc_paperlike_starvation_experiment_zh.md`.
 
-```powershell
-.\scripts\reproduce_ccfa.ps1
+## Agent Workloads
+
+Both workloads emit immutable, JSON-serializable `AgentTask` values containing
+a natural-language request, task context, K ranked candidates, and typed
+operations. They can be generated without an LLM and executed by any adapter
+that understands the common operation model.
+
+```python
+from agent.runtime import AgentTransactionManager
+from agent.workloads import (
+    TPCCAgentWorkload,
+    YCSBAgentWorkload,
+    execute_task,
+    register_workload,
+)
+
+manager = AgentTransactionManager()
+workload = YCSBAgentWorkload()
+register_workload(manager, workload)
+
+for task in workload.generate_tasks(10, seed=7):
+    result = execute_task(manager, task, cc="semantic")
 ```
 
-The script always rebuilds the kernel, runs dependency-light checks, reruns the cost-asymmetry sweep, runs the CCFA baseline/scale/agent-aware/hotspot extension experiments, and regenerates the SVG figure set. If `matplotlib` is installed, it also reruns the legacy PNG experiments.
+`YCSBAgentWorkload` and `TPCCAgentWorkload` are the semantic agent layers
+(`agent-ycsb-semantic` and `agent-tpcc-semantic`): they support K candidates and
+semantic intents. `YCSBFaithfulAgentWorkload` and `TPCCFaithfulAgentWorkload`
+are the faithful agent layers (`agent-ycsb-faithful` and
+`agent-tpcc-faithful`): they use one candidate per task and keep closer
+DBx1000-derived request surfaces. TPC-C faithful/native comparability is limited
+to DBx1000's Payment/NewOrder surface; order-status, delivery, and stock-level
+belong to the semantic agent extension.
+Each workload exposes a JSON-serializable manifest describing the DBx1000
+source files, preserved benchmark semantics, and ASTRA agent adaptations.
 
-The default quick profile covers the expanded baseline family, up to 32 worker threads, up to 10k synthetic tasks, and 5k booking tasks. Use `bash scripts/reproduce_ccfa.sh large` for the larger stress profile with up to 64 worker threads, 50k synthetic tasks, and 10k booking tasks.
+Use `agent.evaluation.run_strategy_matrix` to compare CC strategies on the
+same generated tasks. `contention_window > 1` begins multiple transactions
+from the same snapshot before committing them, which makes strict OCC-style
+and semantic-rebase behavior comparable without changing the workload model.
 
-Real DeepSeek calls are intentionally not run by default:
+```python
+from agent.evaluation import run_strategy_matrix
+from agent.workloads import TPCCAgentWorkload, TPCCConfig
+
+workload = TPCCAgentWorkload(
+    TPCCConfig(transaction_mix=(("new_order", 1.0),))
+)
+summaries = run_strategy_matrix(
+    workload,
+    ("semantic", "adaptive", "occ", "2pl"),
+    task_count=100,
+    seed=7,
+    contention_window=8,
+)
+for summary in summaries:
+    print(summary.to_dict())
+```
+
+The same matrix runner is available as a CLI. After `pip install -e .`, the
+equivalent console script is `astra-cc-matrix`.
 
 ```bash
-DEEPSEEK_API_KEY=... python3 agent/experiments/llm_in_the_loop.py all --tasks 60 --k 3 --conc 8
+python3 -m agent.evaluation.cc_matrix_cli \
+  --workload tpcc \
+  --workload-layer semantic \
+  --transaction-mix new_order:1.0 \
+  --strategies semantic,adaptive,occ,2pl \
+  --adaptive-policy new-order \
+  --task-count 100 \
+  --seed 7 \
+  --repeats 5 \
+  --contention-window 8 \
+  --format json
+
+python3 -m agent.evaluation.cc_matrix_cli \
+  --workload ycsb \
+  --workload-layer faithful \
+  --strategies semantic,occ \
+  --task-count 100 \
+  --repeats 5 \
+  --format csv \
+  --csv-section aggregates \
+  --output ycsb_cc_matrix.csv
 ```
 
-The current real run uses DeepSeek `deepseek-chat` with 60 OTA tasks, `K=3`, API
-concurrency 8, replay threads 8, 3 replay seeds, and `speed=20`. It produced 0
-API errors, mean real generation latency 1.32s, 100% tasks with at least two
-alternatives, live HYBRID `oversell=0`, and same-trace replay HYBRID throughput
-8.2% above OCC+K and 3.05x 2PL. See
-`agent/experiments/results/llm_analysis.md`.
+See `docs/experiments.md` for the full reproduction and analysis guide,
+including the NewOrder ATCC-style policy-table sweep.
 
-For a no-key dry run:
+## Regeneration Boundary
 
-```bash
-bash scripts/reproduce_ccfa.sh llm-mock
-```
-
-VitaBench-derived authoritative write workload:
-
-```bash
-bash scripts/reproduce_vitabench.sh
-```
-
-This command installs the external VitaBench package into `/tmp/vb`, verifies that an official OTA order tool decrements shared `quantity`, runs the CC benchmark on real VitaBench OTA resources, and regenerates `fig10_vitabench_authoritative.svg`.
-
-DBx1000-backed in-memory Vita workload:
-
-```bash
-bash scripts/reproduce_dbx1000_vita.sh
-```
-
-This builds the vendored DBx1000 ASTRA/Vita runner and compares DBx-style OCC/MVCC/TicToc/Silo/2PL baselines with ASTRA-HYBRID on the same VitaBench-derived shared-resource workload. The vendored DBx1000 tree also registers `CC_ALG=HYBRID` as a native compile-time CC option. See `docs/DBX1000_INTEGRATION.md` for scope, parameters, and caveats.
-
-Additional DBx1000-backed sensitivity sweeps:
-
-```bash
-bash scripts/reproduce_dbx1000_vita_sensitivity.sh
-```
-
-This varies candidate count and worker threads under high contention and writes `agent/experiments/results/dbx1000_vita_sensitivity_summary.csv`.
-
-DBx1000-backed hot-resource stress:
-
-```bash
-bash scripts/reproduce_dbx1000_vita_stress.sh
-```
-
-This reports speedup against the best safe DBx1000 baseline, not only OCC+K. The current stress result is the only DBx1000/Vita setting in this artifact with a 50%+ throughput improvement; see `docs/DBX1000_RESEARCH_STORY.md` for the exact scope and caveats.
-
-Full DBx1000-backed `K x contention` matrix:
-
-```bash
-bash scripts/reproduce_dbx1000_vita_matrix.sh
-```
-
-This runs `K=1/4/8` across low, medium, and high contention and writes `agent/experiments/results/dbx1000_vita_matrix_summary.csv`. See `docs/DBX1000_MATRIX_EXPERIMENTS.md` for parameters, CC policy definitions, and the current results.
-
-Real DeepSeek `K x contention` matrix:
-
-```bash
-DEEPSEEK_API_KEY=... bash scripts/reproduce_llm_matrix.sh
-```
-
-This runs real DeepSeek calls for `K=1/4/8` across low, medium, and high contention. It distinguishes the traditional branch-per-transaction baseline from the stronger agent-aware OCC ablation. See `docs/REAL_LLM_MATRIX_AND_BASELINES.md`.
-
-Large-scale rigorous benchmark:
-
-```bash
-bash scripts/reproduce_rigorous.sh large
-```
-
-This runs 30k tasks per seed, 5 seeds, up to 64 worker threads, and regenerates `fig11_rigorous_vitabench.svg`.
-
-## Main Evidence
-
-- CAST replaces expensive regeneration with semantic merge or candidate reuse.
-- HYBRID reduces false conflicts compared with syntactic OCC/MVCC-style checks.
-- Escrow preserves lower-bound constraints while keeping commutative concurrency.
-- The expanded CCFA experiments add OCC/Silo/TicToc/MVCC/2PL baselines, agent-aware OCC+K/HYBRID-K1 controls, larger workload sweeps, and a hotspot mixed-object workload where HYBRID reduces generation calls per task close to 1.0.
-- The VitaBench-derived benchmark collects real OTA shared resources and confirms official order-tool quantity decrements; HYBRID improves throughput while keeping zero oversell.
-- The rigorous benchmark reports throughput, P95/P99 latency, commit rate, and SLA success rate; at 64 threads HYBRID improves throughput by 54.7% over OCC+K and raises SLA success from 25.5% to 83.4%.
-- In real DeepSeek OTA traces, calls are seconds-scale and every task produced multiple alternatives in the recorded run, validating the reselect premise; the current 60-task run has mean c_gen 1.32s and HYBRID replay throughput 8.2% above OCC+K with zero oversell.
-
-The current artifact is close to a CCFA paper prototype: the remaining work is mostly paper writing, final claim selection, and presentation polish rather than missing core mechanisms.
+A conflict never relabels an old plan as newly generated. When all candidates
+conflict, the C++ kernel returns `regenerate_required`. If the caller supplies a
+regenerator, the Python runtime refreshes the snapshot and invokes it; otherwise
+the transaction aborts without overwriting concurrent data.

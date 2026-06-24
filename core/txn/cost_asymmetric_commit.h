@@ -1,117 +1,92 @@
 #pragma once
-// Cost-asymmetric commit protocol.
-// Resolution order: direct -> semantic rebase -> reselect -> regenerate.
-// Semantic rejection (for example exhausted escrow or failed CAS) is not a
-// version conflict and therefore must not trigger an expensive regeneration.
+
 #include <algorithm>
+#include <numeric>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "core/branch/speculative_branch.h"
 #include "core/cost/cost_model.h"
-#include "core/intent/policy_dispatcher.h"
-#include "core/storage/versioned_object_store.h"
+#include "core/storage/versioned_kv.h"
+#include "core/txn/commit_protocol.h"
 
 namespace cast::txn {
 
-enum class CommitStrategy {
-  kStrictOCC,
-  kCAST,
-};
-
-struct CommitOutcome {
-  bool committed = false;
-  bool rejected = false;
-  std::string winner_branch_id;
-  std::string action;  // direct | merge | reselect | regenerate | reject | abort
-  std::string reason;
-};
-
-class CostAsymmetricCommit {
+class CostAsymmetricCommit final : public CommitProtocol {
  public:
-  CostAsymmetricCommit(storage::VersionedObjectStore& store, cost::CostModel model)
-      : store_(store), model_(model) {}
+  CostAsymmetricCommit(storage::VersionedKVStore& store, cost::CostModel model)
+      : store_(store) {
+    (void)model;
+  }
 
-  CommitOutcome CommitTask(std::vector<branch::SpeculativeBranch>& candidates,
-                           CommitStrategy strategy, cost::CostStats* stats) {
-    CommitOutcome out;
+  const char* Name() const override { return "cost-asymmetric"; }
+  const char* Family() const override { return "commit_protocol"; }
+  const char* Description() const override {
+    return "Cost-aware multi-branch commit with semantic merge, reselect, and regeneration";
+  }
+
+  CommitOutcome CommitTask(
+      std::vector<branch::SpeculativeBranch>& candidates,
+      const concurrency::ConcurrencyControl& cc,
+      cost::CostStats* stats) override {
+    cost::CostStats local_stats;
+    if (stats == nullptr) stats = &local_stats;
+    CommitOutcome outcome;
     if (candidates.empty()) {
-      out.action = "abort";
-      out.reason = "no candidates";
-      return out;
+      outcome.action = "abort";
+      outcome.reason = "no candidates";
+      return outcome;
     }
     stats->candidates_generated += candidates.size();
     stats->n_tasks += 1;
 
-    std::size_t winner_idx = 0;
-    for (std::size_t i = 1; i < candidates.size(); ++i) {
-      if (candidates[i].quality > candidates[winner_idx].quality) winner_idx = i;
-    }
+    std::vector<std::size_t> order(candidates.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::stable_sort(order.begin(), order.end(), [&](std::size_t left,
+                                                     std::size_t right) {
+      return candidates[left].quality > candidates[right].quality;
+    });
 
-    TryResult first = TryCommit(candidates[winner_idx], strategy);
-    if (first.committed) {
-      stats->n_merge += first.merges;
-      out.committed = true;
-      out.winner_branch_id = candidates[winner_idx].branch_id;
-      out.action = first.action;
-      return out;
-    }
-
-    bool has_conflict = first.failure == FailureKind::kConflict;
-    std::size_t retry_idx = winner_idx;
-    std::string reject_reason =
-        first.failure == FailureKind::kSemanticReject ? first.reason : "";
-
-    if (strategy == CommitStrategy::kCAST) {
-      for (std::size_t i = 0; i < candidates.size(); ++i) {
-        if (i == winner_idx) continue;
-        TryResult tr = TryCommit(candidates[i], strategy);
-        if (tr.committed) {
-          stats->n_merge += tr.merges;
-          stats->n_reselect += 1;
-          out.committed = true;
-          out.winner_branch_id = candidates[i].branch_id;
-          out.action = "reselect";
-          return out;
-        }
-        if (!has_conflict && tr.failure == FailureKind::kConflict) {
-          has_conflict = true;
-          retry_idx = i;
-        }
-        if (tr.failure == FailureKind::kSemanticReject && reject_reason.empty()) {
-          reject_reason = tr.reason;
-        }
+    bool has_conflict = false;
+    std::size_t conflict_index = order.front();
+    std::string rejection_reason;
+    for (std::size_t position = 0; position < order.size(); ++position) {
+      const std::size_t index = order[position];
+      TryResult result = TryCommit(candidates[index], cc);
+      if (result.committed) {
+        stats->n_merge += result.merges;
+        if (position > 0) ++stats->n_reselect;
+        outcome.committed = true;
+        outcome.winner_branch_id = candidates[index].branch_id;
+        outcome.action = position > 0 ? "reselect" : result.action;
+        return outcome;
+      }
+      if (result.failure == FailureKind::kConflict && !has_conflict) {
+        has_conflict = true;
+        conflict_index = index;
+        outcome.conflict_object_ids = result.conflict_object_ids;
+      }
+      if (result.failure == FailureKind::kSemanticReject &&
+          rejection_reason.empty()) {
+        rejection_reason = result.reason;
       }
     }
 
-    // All alternatives failed a business condition. Regeneration cannot create
-    // inventory or make a false CAS condition true, so reject without paying c_gen.
     if (!has_conflict) {
-      out.rejected = true;
-      out.action = "reject";
-      out.reason = reject_reason.empty() ? "semantic condition rejected" : reject_reason;
-      return out;
+      outcome.rejected = true;
+      outcome.action = "reject";
+      outcome.reason = rejection_reason.empty() ? "semantic condition rejected"
+                                                 : rejection_reason;
+      return outcome;
     }
 
-    stats->n_regen += 1;
-    std::string refresh_reason;
-    if (!RefreshBaseline(candidates[retry_idx], &refresh_reason)) {
-      out.rejected = true;
-      out.action = "reject";
-      out.reason = refresh_reason;
-      return out;
-    }
-
-    TryResult retried = TryCommit(candidates[retry_idx], strategy);
-    stats->n_merge += retried.merges;
-    out.committed = retried.committed;
-    out.rejected = retried.failure == FailureKind::kSemanticReject;
-    out.winner_branch_id = candidates[retry_idx].branch_id;
-    out.action = out.rejected ? "reject" : "regenerate";
-    if (!retried.committed) {
-      out.reason = retried.reason.empty() ? "regenerate still failed" : retried.reason;
-    }
-    return out;
+    outcome.needs_regeneration = true;
+    outcome.winner_branch_id = candidates[conflict_index].branch_id;
+    outcome.action = "regenerate_required";
+    outcome.reason = std::string(cc.Name()) +
+                     ": conflict requires a newly generated candidate";
+    return outcome;
   }
 
  private:
@@ -123,103 +98,73 @@ class CostAsymmetricCommit {
     std::string action;
     FailureKind failure = FailureKind::kNone;
     std::string reason;
+    std::vector<std::string> conflict_object_ids;
   };
 
-  TryResult TryCommit(const branch::SpeculativeBranch& b, CommitStrategy strategy) {
+  TryResult TryCommit(const branch::SpeculativeBranch& candidate,
+                      const concurrency::ConcurrencyControl& cc) {
     std::vector<storage::VersionCheck> checks;
     std::vector<storage::WriteOp> writes;
+    std::unordered_set<std::string> read_targets;
+    std::unordered_set<std::string> write_targets;
     std::size_t merges = 0;
-    bool used_rebase = false;
+    bool rebased = false;
 
-    for (const auto& w : b.writes) {
-      const auto cur = store_.Get(w.object_id);
-      const auto cls = intent::PolicyDispatcher::Classify(w.intent);
-
-      if (cls == intent::PolicyDispatcher::ConcurrencyClass::kReadOnly) continue;
-
-      if (cur.version == w.base_version) {
-        // CAS and constrained DELTA are business predicates, not merely version
-        // checks. Re-evaluate them even on the fast/direct path.
-        if (cls == intent::PolicyDispatcher::ConcurrencyClass::kConditionalRebase ||
-            cls == intent::PolicyDispatcher::ConcurrencyClass::kConstrainedCommutative) {
-          const auto rr = intent::PolicyDispatcher::ResolveWrite(
-              w.base_value, w.branch_value, w.intent, cur.value);
-          if (!rr.success) {
-            return TryResult{false, 0, "", FailureKind::kSemanticReject, rr.reason};
-          }
-          if (rr.should_write) {
-            checks.push_back({w.object_id, cur.version});
-            writes.push_back({w.object_id, rr.value});
-          }
-        } else {
-          checks.push_back({w.object_id, w.base_version});
-          writes.push_back({w.object_id, w.branch_value});
-        }
-        continue;
+    for (const auto& read : candidate.read_set) {
+      if (read.object_id.empty()) {
+        return {false, 0, "", FailureKind::kSemanticReject,
+                "candidate contains empty read target", {}};
       }
+      if (!read_targets.insert(read.object_id).second) continue;
+      checks.push_back({read.object_id, read.version});
+    }
 
-      const bool rebindable =
-          strategy == CommitStrategy::kCAST &&
-          (cls == intent::PolicyDispatcher::ConcurrencyClass::kCommutativeRebase ||
-           cls == intent::PolicyDispatcher::ConcurrencyClass::kConstrainedCommutative ||
-           cls == intent::PolicyDispatcher::ConcurrencyClass::kConditionalRebase);
-      if (!rebindable) {
-        return TryResult{false, 0, "", FailureKind::kConflict, "version conflict"};
+    for (const auto& write : candidate.writes) {
+      if (!write_targets.insert(write.object_id).second) {
+        return {false, 0, "", FailureKind::kSemanticReject,
+                "candidate contains duplicate write target: " + write.object_id,
+                {}};
       }
-
-      const auto rr = intent::PolicyDispatcher::ResolveWrite(
-          w.base_value, w.branch_value, w.intent, cur.value);
-      if (!rr.success) {
-        return TryResult{false, 0, "", FailureKind::kSemanticReject, rr.reason};
-      }
-      if (rr.should_write) {
-        checks.push_back({w.object_id, cur.version});
-        writes.push_back({w.object_id, rr.value});
-      }
-      used_rebase = true;
-      if (cls == intent::PolicyDispatcher::ConcurrencyClass::kCommutativeRebase ||
-          cls == intent::PolicyDispatcher::ConcurrencyClass::kConstrainedCommutative) {
-        ++merges;
+      const auto current = store_.Get(write.object_id);
+      const auto resolved = cc.Resolve(write, current);
+      switch (resolved.decision) {
+        case concurrency::CCDecision::kSkip:
+          continue;
+        case concurrency::CCDecision::kConflict:
+          return {false, 0, "", FailureKind::kConflict, resolved.reason,
+                  {write.object_id}};
+        case concurrency::CCDecision::kReject:
+          return {false, 0, "", FailureKind::kSemanticReject, resolved.reason,
+                  {}};
+        case concurrency::CCDecision::kApply:
+          checks.push_back({write.object_id, current.version});
+          writes.push_back({write.object_id, resolved.value});
+          rebased = rebased || resolved.rebased;
+          if (resolved.merged) ++merges;
+          break;
       }
     }
 
     if (store_.BatchPutIfVersion(checks, writes)) {
-      return TryResult{true, merges, used_rebase ? "merge" : "direct",
-                       FailureKind::kNone, ""};
+      return {true, merges, rebased ? "merge" : "direct", FailureKind::kNone,
+              "", {}};
     }
-    return TryResult{false, 0, "", FailureKind::kConflict,
-                     "atomic version check failed"};
+    return {false, 0, "", FailureKind::kConflict,
+            "atomic version check failed", ConflictTargets(checks)};
   }
 
-  bool RefreshBaseline(branch::SpeculativeBranch& b, std::string* reason) {
-    for (auto& w : b.writes) {
-      const auto cur = store_.Get(w.object_id);
-      const auto cls = intent::PolicyDispatcher::Classify(w.intent);
-
-      // Regenerating an ordered APPEND means replaying its declared payload on
-      // the newest value. OVERWRITE keeps its generated target value.
-      const bool recompute =
-          w.intent.intent_type == intent::IntentType::kAppend ||
-          cls == intent::PolicyDispatcher::ConcurrencyClass::kCommutativeRebase ||
-          cls == intent::PolicyDispatcher::ConcurrencyClass::kConstrainedCommutative ||
-          cls == intent::PolicyDispatcher::ConcurrencyClass::kConditionalRebase;
-      if (recompute) {
-        const auto rr = intent::PolicyDispatcher::ResolveWrite(
-            w.base_value, w.branch_value, w.intent, cur.value);
-        if (!rr.success) {
-          if (reason) *reason = rr.reason;
-          return false;
-        }
-        if (rr.should_write) w.branch_value = rr.value;
-      }
-      w.base_value = cur.value;
-      w.base_version = cur.version;
+  std::vector<std::string> ConflictTargets(
+      const std::vector<storage::VersionCheck>& checks) const {
+    std::vector<std::string> targets;
+    std::unordered_set<std::string> seen;
+    for (const auto& check : checks) {
+      if (store_.GetVersion(check.key) == check.expected_version) continue;
+      if (seen.insert(check.key).second) targets.push_back(check.key);
     }
-    return true;
+    return targets;
   }
 
-  storage::VersionedObjectStore& store_;
-  cost::CostModel model_;
+  storage::VersionedKVStore& store_;
 };
 
 }  // namespace cast::txn

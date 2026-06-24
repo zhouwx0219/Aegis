@@ -115,7 +115,5 @@ private:
 	RC				validate_silo();
 #elif CC_ALG == HEKATON
 	RC 				validate_hekaton(RC rc);
-#elif CC_ALG == HYBRID
-	RC				validate_hybrid();
 #endif
 };

@@ -8,6 +8,14 @@
 #include "catalog.h"
 #include "mem_alloc.h"
 
+namespace {
+
+void StripCarriageReturn(std::string& line) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+}
+
+}  // namespace
+
 RC workload::init() {
 	sim_done = false;
 	return RCOK;
@@ -19,18 +27,21 @@ RC workload::init_schema(string schema_file) {
 	string line;
 	ifstream fin(schema_file);
     Catalog * schema;
-    while (getline(fin, line)) {
+	while (getline(fin, line)) {
+		StripCarriageReturn(line);
 		if (line.compare(0, 6, "TABLE=") == 0) {
 			string tname;
 			tname = &line[6];
 			schema = (Catalog *) _mm_malloc(sizeof(Catalog), CL_SIZE);
 			getline(fin, line);
+			StripCarriageReturn(line);
 			int col_count = 0;
 			// Read all fields for this table.
 			vector<string> lines;
 			while (line.length() > 1) {
 				lines.push_back(line);
 				getline(fin, line);
+				StripCarriageReturn(line);
 			}
 			schema->init( tname.c_str(), lines.size() );
 			for (UInt32 i = 0; i < lines.size(); i++) {
@@ -66,6 +77,7 @@ RC workload::init_schema(string schema_file) {
 			string iname;
 			iname = &line[6];
 			getline(fin, line);
+			StripCarriageReturn(line);
 
 			vector<string> items;
 			string token;

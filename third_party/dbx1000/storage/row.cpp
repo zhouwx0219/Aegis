@@ -3,6 +3,7 @@
 #include "table.h"
 #include "catalog.h"
 #include "row.h"
+#ifndef ASTRA_DBX1000_EMBEDDED
 #include "txn.h"
 #include "row_lock.h"
 #include "row_ts.h"
@@ -12,9 +13,9 @@
 #include "row_tictoc.h"
 #include "row_silo.h"
 #include "row_vll.h"
-#include "row_hybrid.h"
 #include "mem_alloc.h"
 #include "manager.h"
+#endif
 
 RC 
 row_t::init(table_t * host_table, uint64_t part_id, uint64_t row_id) {
@@ -39,6 +40,9 @@ row_t::switch_schema(table_t * host_table) {
 }
 
 void row_t::init_manager(row_t * row) {
+#ifdef ASTRA_DBX1000_EMBEDDED
+	(void)row;
+#else
 #if CC_ALG == DL_DETECT || CC_ALG == NO_WAIT || CC_ALG == WAIT_DIE
     manager = (Row_lock *) mem_allocator.alloc(sizeof(Row_lock), _part_id);
 #elif CC_ALG == TIMESTAMP
@@ -55,12 +59,11 @@ void row_t::init_manager(row_t * row) {
 	manager = (Row_silo *) _mm_malloc(sizeof(Row_silo), 64);
 #elif CC_ALG == VLL
     manager = (Row_vll *) mem_allocator.alloc(sizeof(Row_vll), _part_id);
-#elif CC_ALG == HYBRID
-    manager = (Row_hybrid *) mem_allocator.alloc(sizeof(Row_hybrid), _part_id);
 #endif
 
 #if CC_ALG != HSTORE
 	manager->init(this);
+#endif
 #endif
 }
 
@@ -132,11 +135,17 @@ void row_t::copy(row_t * src) {
 }
 
 void row_t::free_row() {
-	free(data);
+	_mm_free(data);
 }
 
 RC row_t::get_row(access_t type, txn_man * txn, row_t *& row) {
 	RC rc = RCOK;
+#ifdef ASTRA_DBX1000_EMBEDDED
+	(void)type;
+	(void)txn;
+	row = this;
+	return rc;
+#else
 #if CC_ALG == WAIT_DIE || CC_ALG == NO_WAIT || CC_ALG == DL_DETECT
 	uint64_t thd_id = txn->get_thd_id();
 	lock_t lt = (type == RD || type == SCAN)? LOCK_SH : LOCK_EX;
@@ -242,7 +251,7 @@ RC row_t::get_row(access_t type, txn_man * txn, row_t *& row) {
 		assert(row->get_schema() == this->get_schema());
 	}
 	return rc;
-#elif CC_ALG == OCC || CC_ALG == HYBRID
+#elif CC_ALG == OCC
 	// OCC always make a local copy regardless of read or write
 	txn->cur_row = (row_t *) mem_allocator.alloc(sizeof(row_t), get_part_id());
 	txn->cur_row->init(get_table(), get_part_id());
@@ -261,6 +270,7 @@ RC row_t::get_row(access_t type, txn_man * txn, row_t *& row) {
 #else
 	assert(false);
 #endif
+#endif
 }
 
 // the "row" is the row read out in get_row(). 
@@ -271,6 +281,11 @@ RC row_t::get_row(access_t type, txn_man * txn, row_t *& row) {
 // For TIMESTAMP, the row will be explicity deleted at the end of access().
 // (cf. row_ts.cpp)
 void row_t::return_row(access_t type, txn_man * txn, row_t * row) {	
+#ifdef ASTRA_DBX1000_EMBEDDED
+	(void)type;
+	(void)txn;
+	(void)row;
+#else
 #if CC_ALG == WAIT_DIE || CC_ALG == NO_WAIT || CC_ALG == DL_DETECT
 	assert (row == NULL || row == this || type == XP);
 	if (ROLL_BACK && type == XP) {// recover from previous writes.
@@ -295,7 +310,7 @@ void row_t::return_row(access_t type, txn_man * txn, row_t * row) {
 		RC rc = this->manager->access(txn, W_REQ, row);
 		assert(rc == RCOK);
 	}
-#elif CC_ALG == OCC || CC_ALG == HYBRID
+#elif CC_ALG == OCC
 	assert (row != NULL);
 	if (type == WR)
 		manager->write( row, txn->end_ts );
@@ -309,6 +324,7 @@ void row_t::return_row(access_t type, txn_man * txn, row_t * row) {
 	return;
 #else 
 	assert(false);
+#endif
 #endif
 }
 

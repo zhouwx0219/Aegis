@@ -121,7 +121,7 @@ RC thread_t::run() {
 		vll_man.vllMainLoop(m_txn, m_query);
 #elif CC_ALG == MVCC || CC_ALG == HEKATON
 		glob_manager->add_ts(get_thd_id(), m_txn->get_ts());
-#elif CC_ALG == OCC || CC_ALG == HYBRID
+#elif CC_ALG == OCC
 		// In the original OCC paper, start_ts only reads the current ts without advancing it.
 		// But we advance the global ts here to simplify the implementation. However, the final
 		// results should be the same.
@@ -223,7 +223,7 @@ RC thread_t::runTest(txn_man * txn)
 	RC rc = RCOK;
 	if (g_test_case == READ_WRITE) {
 		rc = ((TestTxnMan *)txn)->run_txn(g_test_case, 0);
-#if CC_ALG == OCC || CC_ALG == HYBRID
+#if CC_ALG == OCC
 		txn->start_ts = get_next_ts(); 
 #endif
 		rc = ((TestTxnMan *)txn)->run_txn(g_test_case, 1);

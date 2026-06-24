@@ -41,9 +41,11 @@ def chat(messages, model=DEFAULT_MODEL, temperature=0.7, max_tokens=1024,
     if response_json:
         payload["response_format"] = {"type": "json_object"}
     body = json.dumps(payload).encode("utf-8")
+    if retries < 1:
+        raise ValueError("retries must be at least 1")
     last = None
+    started_at = time.perf_counter()
     for attempt in range(retries):
-        t0 = time.perf_counter()
         try:
             req = urllib.request.Request(
                 API_URL, data=body, method="POST",
@@ -51,7 +53,7 @@ def chat(messages, model=DEFAULT_MODEL, temperature=0.7, max_tokens=1024,
                          "Content-Type": "application/json"})
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 raw = json.loads(resp.read().decode("utf-8"))
-            dt = time.perf_counter() - t0
+            dt = time.perf_counter() - started_at
             text = raw["choices"][0]["message"]["content"]
             return {"text": text, "latency_s": dt,
                     "usage": raw.get("usage", {}), "raw": raw}

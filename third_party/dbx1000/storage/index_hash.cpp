@@ -1,133 +1,156 @@
-#include "global.h"	
+#include "global.h"
 #include "index_hash.h"
+#ifndef ASTRA_DBX1000_EMBEDDED
 #include "mem_alloc.h"
+#endif
 #include "table.h"
 
 RC IndexHash::init(uint64_t bucket_cnt, int part_cnt) {
-	_bucket_cnt = bucket_cnt;
-	_bucket_cnt_per_part = bucket_cnt / part_cnt;
-	_buckets = new BucketHeader * [part_cnt];
-	for (int i = 0; i < part_cnt; i++) {
-		_buckets[i] = (BucketHeader *) _mm_malloc(sizeof(BucketHeader) * _bucket_cnt_per_part, 64);
-		for (uint32_t n = 0; n < _bucket_cnt_per_part; n ++)
-			_buckets[i][n].init();
-	}
-	return RCOK;
+  assert(part_cnt > 0);
+  assert(bucket_cnt >= static_cast<uint64_t>(part_cnt));
+  _bucket_cnt = bucket_cnt;
+  _bucket_cnt_per_part = bucket_cnt / part_cnt;
+  _part_cnt = part_cnt;
+  _buckets = new BucketHeader*[part_cnt];
+  for (int part = 0; part < part_cnt; ++part) {
+    _buckets[part] = static_cast<BucketHeader*>(
+        _mm_malloc(sizeof(BucketHeader) * _bucket_cnt_per_part, 64));
+    for (uint64_t bucket = 0; bucket < _bucket_cnt_per_part; ++bucket) {
+      _buckets[part][bucket].init();
+    }
+  }
+  return RCOK;
 }
 
-RC 
-IndexHash::init(int part_cnt, table_t * table, uint64_t bucket_cnt) {
-	init(bucket_cnt, part_cnt);
-	this->table = table;
-	return RCOK;
+RC IndexHash::init(int part_cnt, table_t* value_table, uint64_t bucket_cnt) {
+  init(bucket_cnt, part_cnt);
+  table = value_table;
+  return RCOK;
 }
+
+#ifdef ASTRA_DBX1000_EMBEDDED
+IndexHash::~IndexHash() {
+  if (_buckets == NULL) return;
+  for (uint64_t part = 0; part < _part_cnt; ++part) {
+    for (uint64_t bucket = 0; bucket < _bucket_cnt_per_part; ++bucket) {
+      _buckets[part][bucket].clear();
+    }
+    _mm_free(_buckets[part]);
+  }
+  delete[] _buckets;
+}
+#endif
 
 bool IndexHash::index_exist(idx_key_t key) {
-	assert(false);
+  itemid_t* item = NULL;
+  return index_try_read(key, item, 0) == RCOK;
 }
 
-void 
-IndexHash::get_latch(BucketHeader * bucket) {
-	while (!ATOM_CAS(bucket->locked, false, true)) {}
+void IndexHash::get_latch(BucketHeader* bucket) {
+  while (!ATOM_CAS(bucket->locked, false, true)) {
+  }
 }
 
-void 
-IndexHash::release_latch(BucketHeader * bucket) {
-	bool ok = ATOM_CAS(bucket->locked, true, false);
-	assert(ok);
+void IndexHash::release_latch(BucketHeader* bucket) {
+  bool ok = ATOM_CAS(bucket->locked, true, false);
+  assert(ok);
 }
 
-	
-RC IndexHash::index_insert(idx_key_t key, itemid_t * item, int part_id) {
-	RC rc = RCOK;
-	uint64_t bkt_idx = hash(key);
-	assert(bkt_idx < _bucket_cnt_per_part);
-	BucketHeader * cur_bkt = &_buckets[part_id][bkt_idx];
-	// 1. get the ex latch
-	get_latch(cur_bkt);
-	
-	// 2. update the latch list
-	cur_bkt->insert_item(key, item, part_id);
-	
-	// 3. release the latch
-	release_latch(cur_bkt);
-	return rc;
+RC IndexHash::index_insert(idx_key_t key, itemid_t* item, int part_id) {
+  if (part_id < 0 || static_cast<uint64_t>(part_id) >= _part_cnt) return ERROR;
+  uint64_t bucket_index = hash(key);
+  if (bucket_index >= _bucket_cnt_per_part) return ERROR;
+  BucketHeader* bucket = &_buckets[part_id][bucket_index];
+  get_latch(bucket);
+  bucket->insert_item(key, item, part_id);
+  release_latch(bucket);
+  return RCOK;
 }
 
-RC IndexHash::index_read(idx_key_t key, itemid_t * &item, int part_id) {
-	uint64_t bkt_idx = hash(key);
-	assert(bkt_idx < _bucket_cnt_per_part);
-	BucketHeader * cur_bkt = &_buckets[part_id][bkt_idx];
-	RC rc = RCOK;
-	// 1. get the sh latch
-//	get_latch(cur_bkt);
-	cur_bkt->read_item(key, item, table->get_table_name());
-	// 3. release the latch
-//	release_latch(cur_bkt);
-	return rc;
-
+RC IndexHash::index_read(idx_key_t key, itemid_t*& item, int part_id) {
+  if (index_try_read(key, item, part_id) != RCOK) {
+    M_ASSERT(false, "Key does not exist!");
+  }
+  return RCOK;
 }
 
-RC IndexHash::index_read(idx_key_t key, itemid_t * &item, 
-						int part_id, int thd_id) {
-	uint64_t bkt_idx = hash(key);
-	assert(bkt_idx < _bucket_cnt_per_part);
-	BucketHeader * cur_bkt = &_buckets[part_id][bkt_idx];
-	RC rc = RCOK;
-	// 1. get the sh latch
-//	get_latch(cur_bkt);
-	cur_bkt->read_item(key, item, table->get_table_name());
-	// 3. release the latch
-//	release_latch(cur_bkt);
-	return rc;
+RC IndexHash::index_read(idx_key_t key, itemid_t*& item, int part_id,
+                         int thd_id) {
+  (void)thd_id;
+  return index_read(key, item, part_id);
 }
 
-/************** BucketHeader Operations ******************/
+RC IndexHash::index_try_read(idx_key_t key, itemid_t*& item, int part_id) {
+  if (part_id < 0 || static_cast<uint64_t>(part_id) >= _part_cnt) return ERROR;
+  uint64_t bucket_index = hash(key);
+  if (bucket_index >= _bucket_cnt_per_part) return ERROR;
+  BucketHeader* bucket = &_buckets[part_id][bucket_index];
+  return bucket->try_read_item(key, item) ? RCOK : ERROR;
+}
 
 void BucketHeader::init() {
-	node_cnt = 0;
-	first_node = NULL;
-	locked = false;
+  node_cnt = 0;
+  first_node = NULL;
+  locked = false;
 }
 
-void BucketHeader::insert_item(idx_key_t key, 
-		itemid_t * item, 
-		int part_id) 
-{
-	BucketNode * cur_node = first_node;
-	BucketNode * prev_node = NULL;
-	while (cur_node != NULL) {
-		if (cur_node->key == key)
-			break;
-		prev_node = cur_node;
-		cur_node = cur_node->next;
-	}
-	if (cur_node == NULL) {		
-		BucketNode * new_node = (BucketNode *) 
-			mem_allocator.alloc(sizeof(BucketNode), part_id );
-		new_node->init(key);
-		new_node->items = item;
-		if (prev_node != NULL) {
-			new_node->next = prev_node->next;
-			prev_node->next = new_node;
-		} else {
-			new_node->next = first_node;
-			first_node = new_node;
-		}
-	} else {
-		item->next = cur_node->items;
-		cur_node->items = item;
-	}
+void BucketHeader::insert_item(idx_key_t key, itemid_t* item, int part_id) {
+  BucketNode* node = first_node;
+  BucketNode* previous = NULL;
+  while (node != NULL && node->key != key) {
+    previous = node;
+    node = node->next;
+  }
+  if (node == NULL) {
+#ifdef ASTRA_DBX1000_EMBEDDED
+    BucketNode* new_node = new BucketNode(key);
+#else
+    BucketNode* new_node = static_cast<BucketNode*>(
+        mem_allocator.alloc(sizeof(BucketNode), part_id));
+    new_node->init(key);
+#endif
+    new_node->items = item;
+    if (previous == NULL) {
+      new_node->next = first_node;
+      first_node = new_node;
+    } else {
+      new_node->next = previous->next;
+      previous->next = new_node;
+    }
+    ++node_cnt;
+  } else {
+    item->next = node->items;
+    node->items = item;
+  }
 }
 
-void BucketHeader::read_item(idx_key_t key, itemid_t * &item, const char * tname) 
-{
-	BucketNode * cur_node = first_node;
-	while (cur_node != NULL) {
-		if (cur_node->key == key)
-			break;
-		cur_node = cur_node->next;
-	}
-	M_ASSERT(cur_node->key == key, "Key does not exist!");
-	item = cur_node->items;
+bool BucketHeader::try_read_item(idx_key_t key, itemid_t*& item) {
+  BucketNode* node = first_node;
+  while (node != NULL && node->key != key) node = node->next;
+  if (node == NULL) {
+    item = NULL;
+    return false;
+  }
+  item = node->items;
+  return true;
 }
+
+void BucketHeader::read_item(idx_key_t key, itemid_t*& item,
+                             const char* table_name) {
+  (void)table_name;
+  bool found = try_read_item(key, item);
+  M_ASSERT(found, "Key does not exist!");
+}
+
+#ifdef ASTRA_DBX1000_EMBEDDED
+void BucketHeader::clear() {
+  BucketNode* node = first_node;
+  while (node != NULL) {
+    BucketNode* next = node->next;
+    delete node;
+    node = next;
+  }
+  first_node = NULL;
+  node_cnt = 0;
+}
+#endif
