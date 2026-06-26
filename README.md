@@ -103,7 +103,7 @@ python3 -m unittest \
 
 ## 5. 简化实验命令
 
-为了交接方便，新增了 PowerShell 包装脚本。
+新增了 PowerShell 包装脚本。
 
 ### 5.1 跑 YCSB
 
@@ -196,30 +196,7 @@ python .\scripts\summarize_retry_results.py --input-dir .\results\ycsb_strict_tu
 results/archive/exploratory_20260624/
 ```
 
-## 8. 当前推荐阅读文档
-
-交接同事建议按这个顺序读：
-
-1. `README.md`
-2. `docs/DataAgentSystem组会汇报-2026.06.25.md`
-3. `docs/atcc_design_zh.md`
-4. `docs/YCSB_ATCC提升项目-2026.06.25.14/YCSB_ATCC提升项目-2026.06.25.14-讲解.md`
-5. `docs/YCSB传统CC对比实验项目-2026.06.25.14/YCSB传统CC对比实验项目-2026.06.25.14-讲解.md`
-6. `docs/ATCC文献YCSB对比分析项目-2026.06.25.14/ATCC文献YCSB对比分析项目-2026.06.25.14-讲解.md`
-
-历史工作日志已归档到：
-
-```text
-docs/archive/worklogs/
-```
-
-归档说明见：
-
-```text
-docs/archive/ARCHIVE_MANIFEST.md
-```
-
-## 9. ATCC policy variant
+## 8. ATCC policy variant
 
 当前最值得关注的 ATCC variant 是：
 
@@ -236,11 +213,4 @@ ycsb-strict-tuned
 - 更高 retry 才扩大锁范围；
 - 避免 medium 下过早进入 full read-write locking；
 - 在 high 下减少 retry 和 token waste。
-
-## 10. 交接注意事项
-
-1. 当前 worktree 中存在不少历史改动，交接前如需提交，建议只 stage 本次明确相关文件。
-2. Windows Python 不能导入 Linux `.so`，实验和测试尽量走 WSL。
-3. `defer-until-after-planning` 指标可能更好，但它改变了长事务窗口，只能作为 deferred-snapshot 补充变体，不能混入严格 long-transaction ATCC 主结论。
-4. 当前实验规模是小规模研究原型。正式论文级结论还需要多 seed、多 repeat、更大规模矩阵。
 
