@@ -43,12 +43,21 @@ def train_phase_atcc_policy(
     latency_cv: float,
     latency_max_s: float,
     max_attempts: int,
+    agent_admission_mode: str = "planning-only",
     tokens_per_operation: float = 2703.0,
     background_workers: int = 0,
     background_interval_s: float = 0.0,
     background_strategy: str = "occ",
     atcc_lock_wait_cost_per_s: Optional[float] = None,
     atcc_lock_action_cost: Optional[float] = None,
+    atcc_lock_queue_depth_cost: Optional[float] = None,
+    atcc_lock_handoff_cost: Optional[float] = None,
+    atcc_committing_count_cost: Optional[float] = None,
+    object_lock_scheduler: str = "race",
+    object_lock_priority_burst: int = 2,
+    prelock_wait_budget_s: float = 0.0,
+    prelock_wait_budget_mode: str = "transaction",
+    prelock_lease_mode: str = "hold",
 ) -> Dict[str, Any]:
     if episodes <= 0:
         raise ValueError("episodes must be positive")
@@ -62,6 +71,12 @@ def train_phase_atcc_policy(
         policy.atcc_module.lock_wait_cost_per_s = float(atcc_lock_wait_cost_per_s)
     if atcc_lock_action_cost is not None:
         policy.atcc_module.lock_action_cost = float(atcc_lock_action_cost)
+    if atcc_lock_queue_depth_cost is not None:
+        policy.atcc_module.lock_queue_depth_cost = float(atcc_lock_queue_depth_cost)
+    if atcc_lock_handoff_cost is not None:
+        policy.atcc_module.lock_handoff_cost = float(atcc_lock_handoff_cost)
+    if atcc_committing_count_cost is not None:
+        policy.atcc_module.committing_count_cost = float(atcc_committing_count_cost)
 
     runs: list[RetryRunSummary] = []
     started_at = time.perf_counter()
@@ -78,6 +93,7 @@ def train_phase_atcc_policy(
                 seed=run_seed,
                 workers=workers,
                 agent_slots=agent_slots,
+                agent_admission_mode=agent_admission_mode,
                 planning_delay_s=planning_delay_s,
                 latency_distribution=latency_distribution,
                 latency_cv=latency_cv,
@@ -88,6 +104,11 @@ def train_phase_atcc_policy(
                 background_workers=background_workers,
                 background_interval_s=background_interval_s,
                 background_strategy=background_strategy,
+                object_lock_scheduler=object_lock_scheduler,
+                object_lock_priority_burst=object_lock_priority_burst,
+                prelock_wait_budget_s=prelock_wait_budget_s,
+                prelock_wait_budget_mode=prelock_wait_budget_mode,
+                prelock_lease_mode=prelock_lease_mode,
             )
         )
 
@@ -101,6 +122,7 @@ def train_phase_atcc_policy(
         "seed": int(seed),
         "workers": int(workers),
         "agent_slots": int(agent_slots),
+        "agent_admission_mode": str(agent_admission_mode),
         "planning_delay_s": float(planning_delay_s),
         "latency_distribution": str(latency_distribution),
         "latency_cv": float(latency_cv),
@@ -110,6 +132,11 @@ def train_phase_atcc_policy(
         "background_workers": int(background_workers),
         "background_interval_s": float(background_interval_s),
         "background_strategy": str(background_strategy),
+        "object_lock_scheduler": str(object_lock_scheduler),
+        "object_lock_priority_burst": int(object_lock_priority_burst),
+        "prelock_wait_budget_s": float(prelock_wait_budget_s),
+        "prelock_wait_budget_mode": str(prelock_wait_budget_mode),
+        "prelock_lease_mode": str(prelock_lease_mode),
         "atcc_lock_wait_cost_per_s": (
             None
             if atcc_lock_wait_cost_per_s is None
@@ -117,6 +144,21 @@ def train_phase_atcc_policy(
         ),
         "atcc_lock_action_cost": (
             None if atcc_lock_action_cost is None else float(atcc_lock_action_cost)
+        ),
+        "atcc_lock_queue_depth_cost": (
+            None
+            if atcc_lock_queue_depth_cost is None
+            else float(atcc_lock_queue_depth_cost)
+        ),
+        "atcc_lock_handoff_cost": (
+            None
+            if atcc_lock_handoff_cost is None
+            else float(atcc_lock_handoff_cost)
+        ),
+        "atcc_committing_count_cost": (
+            None
+            if atcc_committing_count_cost is None
+            else float(atcc_committing_count_cost)
         ),
     }
     return {
@@ -171,6 +213,15 @@ def _artifact_stats(table: Dict[str, Any]) -> Dict[str, Any]:
         "atcc_runtime_latency_s": float(
             runtime_stats.get("ewma_latency_s", 0.0)
         ),
+        "atcc_runtime_lock_queue_depth": float(
+            runtime_stats.get("ewma_lock_queue_depth", 0.0)
+        ),
+        "atcc_runtime_lock_handoff_count": float(
+            runtime_stats.get("ewma_lock_handoff_count", 0.0)
+        ),
+        "atcc_runtime_committing_count": float(
+            runtime_stats.get("ewma_committing_count", 0.0)
+        ),
         "telemetry_key_count": len(telemetry),
         "telemetry_observation_count": sum(
             int(value.get("observations", 0))
@@ -187,6 +238,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--workers", type=int, default=32)
     parser.add_argument("--agent-slots", type=int, default=0)
+    parser.add_argument(
+        "--agent-admission-mode",
+        choices=("planning-only", "before-begin"),
+        default="planning-only",
+    )
     parser.add_argument("--planning-delay-ms", type=float, default=2.0)
     parser.add_argument(
         "--latency-distribution",
@@ -201,6 +257,28 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--background-interval-ms", type=float, default=0.0)
     parser.add_argument("--background-strategy", default="occ")
     parser.add_argument(
+        "--object-lock-scheduler",
+        choices=("race", "priority", "bounded-priority"),
+        default="race",
+    )
+    parser.add_argument("--object-lock-priority-burst", type=int, default=2)
+    parser.add_argument("--prelock-wait-budget-ms", type=float, default=0.0)
+    parser.add_argument(
+        "--prelock-wait-budget-mode",
+        choices=("transaction", "object"),
+        default="transaction",
+    )
+    parser.add_argument(
+        "--prelock-lease-mode",
+        choices=(
+            "hold",
+            "yield-during-planning",
+            "yield-refresh-regenerate",
+            "defer-until-after-planning",
+        ),
+        default="hold",
+    )
+    parser.add_argument(
         "--atcc-lock-wait-cost-per-s",
         type=float,
         help="Override the phase-aware ATCC reward penalty for one second of lock wait.",
@@ -209,6 +287,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--atcc-lock-action-cost",
         type=float,
         help="Override the fixed phase-aware ATCC reward penalty for taking a lock action.",
+    )
+    parser.add_argument(
+        "--atcc-lock-queue-depth-cost",
+        type=float,
+        help="Override the phase-aware ATCC reward penalty for each queued lock waiter.",
+    )
+    parser.add_argument(
+        "--atcc-lock-handoff-cost",
+        type=float,
+        help="Override the phase-aware ATCC reward penalty for each lock handoff signal.",
+    )
+    parser.add_argument(
+        "--atcc-committing-count-cost",
+        type=float,
+        help="Override the phase-aware ATCC reward penalty for each committing-pressure signal.",
     )
     parser.add_argument("--output", type=Path)
 
@@ -244,6 +337,7 @@ def main(argv: Optional[Sequence[str]] = None, *, stdout: Optional[TextIO] = Non
         seed=args.seed,
         workers=args.workers,
         agent_slots=args.agent_slots,
+        agent_admission_mode=args.agent_admission_mode,
         planning_delay_s=args.planning_delay_ms / 1000.0,
         latency_distribution=args.latency_distribution,
         latency_cv=args.latency_cv,
@@ -253,8 +347,16 @@ def main(argv: Optional[Sequence[str]] = None, *, stdout: Optional[TextIO] = Non
         background_workers=args.background_workers,
         background_interval_s=args.background_interval_ms / 1000.0,
         background_strategy=args.background_strategy,
+        object_lock_scheduler=args.object_lock_scheduler,
+        object_lock_priority_burst=args.object_lock_priority_burst,
+        prelock_wait_budget_s=args.prelock_wait_budget_ms / 1000.0,
+        prelock_wait_budget_mode=args.prelock_wait_budget_mode,
+        prelock_lease_mode=args.prelock_lease_mode,
         atcc_lock_wait_cost_per_s=args.atcc_lock_wait_cost_per_s,
         atcc_lock_action_cost=args.atcc_lock_action_cost,
+        atcc_lock_queue_depth_cost=args.atcc_lock_queue_depth_cost,
+        atcc_lock_handoff_cost=args.atcc_lock_handoff_cost,
+        atcc_committing_count_cost=args.atcc_committing_count_cost,
     )
     text = json.dumps(artifact, indent=2, sort_keys=True)
     if args.output is None:

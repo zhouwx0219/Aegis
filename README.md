@@ -1,51 +1,75 @@
-# ASTRA Core
+# Data Agent System / CAST-DAS
 
-ASTRA is a compact agent-side transaction runtime. A task may generate multiple
-candidate plans, operate on heterogeneous versioned objects, and commit through
-a selectable concurrency-control module.
+这是一个面向 **Data Agent 事务处理** 的研究原型。项目的核心思想是：
 
-## Architecture
+- 底层只负责 **版本化 KV 存储**；
+- Agent runtime 负责 **事务语义、候选分支、并发控制选择、提交协议和重试/再生成边界**；
+- ATCC、传统 CC、语义 CC 都作为可插拔模块接入，而不是写死进底层存储。
+
+当前项目重点支持在类 Agent 的 YCSB / TPC-C 改造负载上，对比：
+
+- OCC
+- 2PL No-wait / Wait-die
+- MVCC
+- SILO
+- TicToc
+- ATCC / `adaptive-op-strict`
+
+## 1. 项目结构
 
 ```text
-Agent task -> K candidates -> ASTRA transaction runtime
-           -> pluggable CC validation -> atomic version checks and writes
-           -> DBx1000 Catalog + table_t + row_t + IndexHash
+cast-das/
+├── agent/
+│   ├── runtime/        # Agent 事务运行时、CC registry、ATCC、提交协议
+│   ├── workloads/      # Agent-YCSB / Agent-TPCC 改造负载
+│   └── evaluation/     # 实验 runner、profile 训练、DBx1000 native runner
+├── core/               # C++ 核心接口：版本化 KV、并发控制、事务提交内核
+├── tests/              # 单元测试
+├── third_party/dbx1000 # DBx1000 源码，用作参考和 native baseline
+├── scripts/            # 交接用简化运行脚本
+├── docs/               # 精简后的说明文档；历史过程已归档到 docs/archive/
+├── results/            # 精简后的关键结果；历史结果已归档到 results/archive/
+├── build.sh            # 构建 Linux/WSL Python 扩展
+├── pyproject.toml
+└── README.md
 ```
 
-- `core/storage` exposes a narrow `VersionedKVStore` contract. The default
-  `Dbx1000VersionedKVStore` stores key, value, existence, and a monotonic version
-  in DBx1000 rows and uses DBx1000's hash index for lookup.
-- `core/concurrency` defines the `ConcurrencyControl` plugin interface. The
-  included `SemanticConcurrencyControl` understands overwrite, ordered or
-  commutative append, delta, constrained delta, and CAS. Strict validation
-  modules provide OCC and DBx1000-style traditional comparison points.
-- `core/txn` defines a `CommitProtocol` interface. The default
-  `CostAsymmetricCommit` validates candidates in quality order and performs
-  direct commit, semantic resolution, candidate reselection, or an explicit
-  regeneration request. Multi-object writes use one atomic version-check batch.
-- `agent/runtime` owns snapshots, model/tool traces, candidate construction,
-  CC registration, and real regeneration callbacks. Its modules map directly to
-  the four pluggable design points:
-  `branching.py` for multi-branch transaction semantics, `cc_registry.py` plus
-  `core/concurrency` for semantic-aware CC modules, `commit_protocol.py` plus
-  `core/txn` for cost-aware commit protocols, and `adaptive.py` for ATCC policy
-  tables.
-- `agent/workloads` contains provider-neutral Agent-YCSB and Agent-TPCC
-  workloads derived from DBx1000's benchmark families, split into faithful and
-  semantic agent layers.
-- `agent/evaluation/dbx1000_native.py` runs DBx1000's own executable as an
-  external native baseline, so native OCC/MVCC/TicToc/Silo/2PL results are not
-  confused with ASTRA's agent-side adapters.
+## 2. 系统架构
 
-DBx1000 is an in-memory OLTP research engine. In ASTRA it is deliberately used
-as a process-local, non-durable, versioned KV substrate; agent/runtime owns the
-transaction semantics, CC policy selection, read-set validation, regeneration
-boundary, and trace. The vendored upstream revision and local embedding changes
-are recorded in `third_party/dbx1000/UPSTREAM.md`.
+系统边界可以理解为：
 
-## Build And Test
+```text
+Agent Task
+  -> K 个候选计划
+  -> AgentTransactionManager
+  -> Branch Semantics / CC Registry / Commit Protocol
+  -> VersionedKVStore
+```
 
-On Linux or WSL:
+关键模块：
+
+- `agent/runtime/transaction.py`
+  - 管理事务生命周期、snapshot、prelock lease、提交/abort 结果。
+- `agent/runtime/cc_registry.py`
+  - 注册和选择并发控制策略。
+- `agent/runtime/adaptive.py`
+  - Operation-level ATCC 策略表。
+- `agent/runtime/atcc.py`
+  - Phase-aware ATCC 模块、Q 表、reward 和 priority。
+- `agent/runtime/traditional_cc.py`
+  - Agent runtime 层的传统 CC baseline：2PL、MVCC、SILO、TicToc。
+- `agent/workloads/ycsb.py`
+  - 类 Agent 的 YCSB 改造负载。
+- `agent/workloads/tpcc.py`
+  - 类 Agent 的 TPC-C 改造负载。
+- `agent/evaluation/atcc_retry_experiment.py`
+  - 当前主要实验入口。
+
+底层 DBx1000 在这个项目里主要作为 **进程内、非持久化、版本化 KV substrate**。Agent 事务语义不依赖 DBx1000 原生事务线程模型。
+
+## 3. 环境与构建
+
+推荐使用 WSL/Linux 运行，因为 `cast_core.cpython-312-x86_64-linux-gnu.so` 是 Linux Python 扩展。
 
 ```bash
 python3 -m pip install -e .
@@ -53,235 +77,170 @@ bash build.sh
 python3 -m unittest discover -s tests -v
 ```
 
-`pyproject.toml` declares the Python package metadata, the `pybind11`
-dependency, and the `astra-cc-matrix` and `astra-dbx1000-native` console
-scripts. The native `cast_core` extension is still built explicitly by
-`build.sh`, because the DBx1000 embedding is intentionally kept as a narrow
-local adapter.
-If importing `agent.runtime` or running the CLI reports that `cast_core` is not
-available, rebuild with `bash build.sh` using the same Linux/WSL Python runtime.
+如果在 Windows PowerShell 中操作，涉及运行实验时请通过 WSL：
 
-## Versioned KV
-
-```python
-import cast_core as cc
-
-store = cc.Dbx1000VersionedKVStore(
-    max_key_bytes=512,
-    max_value_bytes=8192,
-    bucket_count=4096,
-)
-store.put("inventory:42", "10")
-snapshot = store.get("inventory:42")
-updated = store.put_if_version("inventory:42", snapshot.version, "9")
+```powershell
+wsl -e bash -lc "cd /mnt/z/Data-Agent-System-master/cast-das && python3 -m unittest discover -s tests -v"
 ```
 
-Deletes leave a versioned tombstone, so deleting and recreating a key cannot
-reintroduce an old version. The transaction kernel uses `BatchPutIfVersion` for
-all-or-nothing validation and writes across multiple keys.
+## 4. 快速验证
 
-## CC Plugins
-
-The runtime includes `semantic` (also available as the compatibility aliases
-`cast` and `semantic-v2`), `occ`, DBx1000-style strict validation adapters
-(`mvcc`, `silo`, `tictoc`, and `2pl`), plus an ATCC-shaped `adaptive` policy
-table. The default table chooses `semantic` for rebaseable intents, may choose
-`2pl` for wide strict read/write footprints, and falls back to `occ`:
-
-```python
-import cast_core as cc
-from agent.runtime import AgentTransactionManager
-
-manager = AgentTransactionManager()
-manager.register_cc("semantic-v2", cc.SemanticConcurrencyControl())
-print(manager.cc_strategy("adaptive"))
-print(manager.module_catalog()["commit_protocol"]["name"])
-
-manager.register_object("counter", 0, kind="counter")
-txn = manager.begin("task-1")
-txn.add_candidate("candidate-1", quality=1, gen_cost=0).delta("counter", 1)
-result = txn.commit(strategy="adaptive")
-```
-
-To add another agent-side CC module, implement `ConcurrencyControl::Name`,
-`Family`, optional metadata such as `RequiresObjectLocks`, and `Resolve`, expose
-the class in `cast_bindings.cpp`, and register an instance under a runtime name.
-`StrictValidationConcurrencyControl` can also be used to register a named
-traditional baseline over the same agent read/write-set validation contract.
-Storage and commit orchestration do not need to change.
-
-The DBx1000-style names are comparison adapters at the ASTRA layer. They do not
-delegate transaction execution to DBx1000's original benchmark threads or lock
-managers; DBx1000 remains the versioned KV backend.
-
-For authoritative DBx1000 native CC baselines, use `astra-dbx1000-native`. It
-copies the vendored DBx1000 tree into a temporary directory, patches `CC_ALG`,
-builds `rundb`, runs the original benchmark path, and parses DBx1000's
-`[summary]` output:
+交接时建议先跑一组轻量测试：
 
 ```bash
-python3 -m agent.evaluation.dbx1000_native \
-  --workload ycsb \
-  --strategies occ,mvcc,tictoc,silo,no_wait \
-  --threads 8 \
-  --output dbx1000-ycsb-native.json
+python3 -m unittest \
+  tests.test_atcc_ycsb_strict_tuned \
+  tests.test_traditional_cc_full \
+  tests.test_atcc_retry_experiment \
+  -v
 ```
 
-The adaptive table is explicit and replaceable from Python:
+这能覆盖：
 
-```python
-from agent.runtime import AdaptivePolicyRule, AdaptivePolicyTable
+- 新的 YCSB tuned ATCC variant；
+- 传统 CC baseline；
+- retry experiment 的核心指标汇总。
 
-manager.set_adaptive_policy(
-    AdaptivePolicyTable(
-        rules=(
-            AdaptivePolicyRule(
-                name="strict-wide-to-2pl",
-                target_strategy="2pl",
-                min_reads=2,
-                min_writes=4,
-                overwrite_only=True,
-            ),
-        ),
-        fallback_strategy="occ",
-    )
-)
+## 5. 简化实验命令
+
+为了交接方便，新增了 PowerShell 包装脚本。
+
+### 5.1 跑 YCSB
+
+```powershell
+.\scripts\run_ycsb_compare.ps1 -Profile high -StrategySet atcc -PolicyVariant ycsb-strict-tuned
 ```
 
-Operation-level ATCC has two execution variants. `adaptive-op` keeps semantic
-optimistic resolution and adds commit-phase locks for pessimistic targets.
-`adaptive-op-strict` is the pure traditional switch: optimistic targets use
-strict OCC, while pessimistic targets are locked before the snapshot and held
-through commit. `2pl-pre` is the full pre-snapshot 2PL baseline. Pre-snapshot
-strategies must be evaluated with
-`agent_path_experiment --execution-mode concurrent`.
+常用参数：
 
-See `docs/pre_snapshot_atcc_tpcc_report.md` for training, reproduction, and
-large TPC-C NewOrder results.
+- `-Profile low|medium|high|all`
+- `-StrategySet atcc|full`
+  - `atcc`：`occ,tictoc-full,adaptive-op-strict`
+  - `full`：`occ,2pl-nowait,2pl-wait-die,mvcc-full,silo-full,tictoc-full,adaptive-op-strict`
+- `-PolicyVariant ycsb-strict-tuned|default`
+- `-TaskCount 60`
+- `-OutputDir results/handoff_ycsb_compare`
 
-The online ATCC policy table can be selected with
-`agent_path_experiment --operation-policy atcc`. It combines object-role priors
-with runtime conflict and lock-wait feedback while staying on the strict
-OCC/2PL path. See `docs/online_atcc_experiment_zh.md` for the focused ATCC
-TPC-C/YCSB experiments and reproduction commands.
+输出：
 
-The migrated phase-aware ATCC workflow can be reproduced as a fixed profile
-suite. It trains the tabular ATCC policy artifact, evaluates OCC, full
-pre-snapshot 2PL, and loaded ATCC on Agent-YCSB/Agent-TPCC low/medium/high
-profiles, and writes both JSON artifacts and a Markdown summary table:
-
-```bash
-python3 -m agent.evaluation.atcc_profile_runner \
-  --profiles all \
-  --output-dir results/phase_atcc_profiles
+```text
+results/handoff_ycsb_compare/
+├── ycsb-low.json
+├── ycsb-medium.json
+├── ycsb-high.json
+└── summary.csv
 ```
 
-For a quick smoke run, lower `--train-task-count`, `--eval-task-count`,
-`--eval-repeats`, and `--workers`. The installed console script is
-`astra-atcc-profiles`. Phase-aware ATCC policy artifacts are versioned; current
-artifacts use schema version 2 and include `class=<object_class>` in Q-table
-state keys, so formal profile runs should retrain artifacts after changing the
-state dimensions. Retry-evaluation reports include `policy_artifact_schema`
-when `--policy-artifact` is used, making legacy or incompatible artifacts visible
-in the result JSON. See `docs/phase_atcc_v2_profile_experiment_zh.md` for the
-current v2 profile experiment and `docs/phase_atcc_v2_smoke_report_zh.md` for a
-small smoke run. The current ATCC module design is summarized in
-`docs/atcc_design_zh.md`, and the latest local pressure-scale profile analysis is
-in `docs/phase_atcc_v2_scale_experiment_zh.md`. For a workload closer to the
-original ATCC paper's agent-starvation setting, see
-`docs/atcc_paperlike_starvation_experiment_zh.md`.
+### 5.2 跑 TPC-C
 
-## Agent Workloads
-
-Both workloads emit immutable, JSON-serializable `AgentTask` values containing
-a natural-language request, task context, K ranked candidates, and typed
-operations. They can be generated without an LLM and executed by any adapter
-that understands the common operation model.
-
-```python
-from agent.runtime import AgentTransactionManager
-from agent.workloads import (
-    TPCCAgentWorkload,
-    YCSBAgentWorkload,
-    execute_task,
-    register_workload,
-)
-
-manager = AgentTransactionManager()
-workload = YCSBAgentWorkload()
-register_workload(manager, workload)
-
-for task in workload.generate_tasks(10, seed=7):
-    result = execute_task(manager, task, cc="semantic")
+```powershell
+.\scripts\run_tpcc_compare.ps1 -Profile high -StrategySet full
 ```
 
-`YCSBAgentWorkload` and `TPCCAgentWorkload` are the semantic agent layers
-(`agent-ycsb-semantic` and `agent-tpcc-semantic`): they support K candidates and
-semantic intents. `YCSBFaithfulAgentWorkload` and `TPCCFaithfulAgentWorkload`
-are the faithful agent layers (`agent-ycsb-faithful` and
-`agent-tpcc-faithful`): they use one candidate per task and keep closer
-DBx1000-derived request surfaces. TPC-C faithful/native comparability is limited
-to DBx1000's Payment/NewOrder surface; order-status, delivery, and stock-level
-belong to the semantic agent extension.
-Each workload exposes a JSON-serializable manifest describing the DBx1000
-source files, preserved benchmark semantics, and ASTRA agent adaptations.
+输出：
 
-Use `agent.evaluation.run_strategy_matrix` to compare CC strategies on the
-same generated tasks. `contention_window > 1` begins multiple transactions
-from the same snapshot before committing them, which makes strict OCC-style
-and semantic-rebase behavior comparable without changing the workload model.
-
-```python
-from agent.evaluation import run_strategy_matrix
-from agent.workloads import TPCCAgentWorkload, TPCCConfig
-
-workload = TPCCAgentWorkload(
-    TPCCConfig(transaction_mix=(("new_order", 1.0),))
-)
-summaries = run_strategy_matrix(
-    workload,
-    ("semantic", "adaptive", "occ", "2pl"),
-    task_count=100,
-    seed=7,
-    contention_window=8,
-)
-for summary in summaries:
-    print(summary.to_dict())
+```text
+results/handoff_tpcc_compare/
+├── tpcc-low.json
+├── tpcc-medium.json
+├── tpcc-high.json
+└── summary.csv
 ```
 
-The same matrix runner is available as a CLI. After `pip install -e .`, the
-equivalent console script is `astra-cc-matrix`.
+### 5.3 手动汇总已有 JSON
 
-```bash
-python3 -m agent.evaluation.cc_matrix_cli \
-  --workload tpcc \
-  --workload-layer semantic \
-  --transaction-mix new_order:1.0 \
-  --strategies semantic,adaptive,occ,2pl \
-  --adaptive-policy new-order \
-  --task-count 100 \
-  --seed 7 \
-  --repeats 5 \
-  --contention-window 8 \
-  --format json
-
-python3 -m agent.evaluation.cc_matrix_cli \
-  --workload ycsb \
-  --workload-layer faithful \
-  --strategies semantic,occ \
-  --task-count 100 \
-  --repeats 5 \
-  --format csv \
-  --csv-section aggregates \
-  --output ycsb_cc_matrix.csv
+```powershell
+python .\scripts\summarize_retry_results.py --input-dir .\results\ycsb_strict_tuned_atcc_20260625
 ```
 
-See `docs/experiments.md` for the full reproduction and analysis guide,
-including the NewOrder ATCC-style policy-table sweep.
+## 6. 当前推荐实验入口
 
-## Regeneration Boundary
+如果只想复现当前最重要的 YCSB 结果：
 
-A conflict never relabels an old plan as newly generated. When all candidates
-conflict, the C++ kernel returns `regenerate_required`. If the caller supplies a
-regenerator, the Python runtime refreshes the snapshot and invokes it; otherwise
-the transaction aborts without overwriting concurrent data.
+```powershell
+.\scripts\run_ycsb_compare.ps1 `
+  -Profile all `
+  -StrategySet atcc `
+  -PolicyVariant ycsb-strict-tuned `
+  -OutputDir results/handoff_ycsb_tuned
+```
+
+如果要覆盖所有传统 CC：
+
+```powershell
+.\scripts\run_ycsb_compare.ps1 `
+  -Profile all `
+  -StrategySet full `
+  -PolicyVariant ycsb-strict-tuned `
+  -OutputDir results/handoff_ycsb_tuned_full
+```
+
+## 7. 当前关键结果
+
+保留在 results 顶层的关键实验：
+
+- `results/ycsb_strict_tuned_atcc_20260625/`
+  - YCSB default ATCC vs tuned ATCC A/B。
+- `results/ycsb_strict_tuned_full_cc_20260625/`
+  - tuned ATCC 与完整传统 CC 矩阵。
+- `results/full_traditional_cc_ycsb_20260625/`
+  - 调优前 YCSB 完整传统 CC 对比。
+- `results/full_traditional_cc_tpcc_20260625/`
+  - TPCC 完整传统 CC 对比。
+- `results/atcc_pressure_reactive_guard_obs4_profiles_20260624_23_confirm/`
+  - 当前保留的 ATCC policy artifact。
+
+历史 smoke、probe、cost sweep 和旧 profile 已归档到：
+
+```text
+results/archive/exploratory_20260624/
+```
+
+## 8. 当前推荐阅读文档
+
+交接同事建议按这个顺序读：
+
+1. `README.md`
+2. `docs/DataAgentSystem组会汇报-2026.06.25.md`
+3. `docs/atcc_design_zh.md`
+4. `docs/YCSB_ATCC提升项目-2026.06.25.14/YCSB_ATCC提升项目-2026.06.25.14-讲解.md`
+5. `docs/YCSB传统CC对比实验项目-2026.06.25.14/YCSB传统CC对比实验项目-2026.06.25.14-讲解.md`
+6. `docs/ATCC文献YCSB对比分析项目-2026.06.25.14/ATCC文献YCSB对比分析项目-2026.06.25.14-讲解.md`
+
+历史工作日志已归档到：
+
+```text
+docs/archive/worklogs/
+```
+
+归档说明见：
+
+```text
+docs/archive/ARCHIVE_MANIFEST.md
+```
+
+## 9. ATCC policy variant
+
+当前最值得关注的 ATCC variant 是：
+
+```text
+ycsb-strict-tuned
+```
+
+它通过 `--policy-variant ycsb-strict-tuned` 启用，只影响 YCSB policy table，不改变默认 ATCC、底层 KV、事务边界或传统 CC。
+
+设计意图：
+
+- 低风险首轮保持 OCC；
+- retry 后优先保护 hot writes；
+- 更高 retry 才扩大锁范围；
+- 避免 medium 下过早进入 full read-write locking；
+- 在 high 下减少 retry 和 token waste。
+
+## 10. 交接注意事项
+
+1. 当前 worktree 中存在不少历史改动，交接前如需提交，建议只 stage 本次明确相关文件。
+2. Windows Python 不能导入 Linux `.so`，实验和测试尽量走 WSL。
+3. `defer-until-after-planning` 指标可能更好，但它改变了长事务窗口，只能作为 deferred-snapshot 补充变体，不能混入严格 long-transaction ATCC 主结论。
+4. 当前实验规模是小规模研究原型。正式论文级结论还需要多 seed、多 repeat、更大规模矩阵。
+

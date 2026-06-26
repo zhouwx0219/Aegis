@@ -41,6 +41,9 @@ class PhaseAwareATCCDecision:
     global_abort_rate: float = 0.0
     global_lock_wait_s: float = 0.0
     global_latency_s: float = 0.0
+    global_lock_queue_depth: float = 0.0
+    global_lock_handoff_count: float = 0.0
+    global_committing_count: float = 0.0
 
 
 @dataclasses.dataclass
@@ -55,6 +58,9 @@ class ATCCRuntimeStats:
     ewma_abort_rate: float = 0.0
     ewma_lock_wait_s: float = 0.0
     ewma_latency_s: float = 0.0
+    ewma_lock_queue_depth: float = 0.0
+    ewma_lock_handoff_count: float = 0.0
+    ewma_committing_count: float = 0.0
 
     def observe(
         self,
@@ -64,6 +70,9 @@ class ATCCRuntimeStats:
         conflict_abort: bool,
         lock_wait_s: float,
         latency_s: float,
+        lock_queue_depth: float = 0.0,
+        lock_handoff_count: float = 0.0,
+        committing_count: float = 0.0,
     ) -> None:
         self.observations += 1
         if committed:
@@ -90,13 +99,34 @@ class ATCCRuntimeStats:
             self.alpha,
             self.observations,
         )
+        self.ewma_lock_queue_depth = _ewma(
+            self.ewma_lock_queue_depth,
+            max(0.0, float(lock_queue_depth)),
+            self.alpha,
+            self.observations,
+        )
+        self.ewma_lock_handoff_count = _ewma(
+            self.ewma_lock_handoff_count,
+            max(0.0, float(lock_handoff_count)),
+            self.alpha,
+            self.observations,
+        )
+        self.ewma_committing_count = _ewma(
+            self.ewma_committing_count,
+            max(0.0, float(committing_count)),
+            self.alpha,
+            self.observations,
+        )
 
-    def state_buckets(self) -> Tuple[str, str, str, str]:
+    def state_buckets(self) -> Tuple[str, str, str, str, str, str, str]:
         return (
             _bucket_count(self.observations),
             _bucket_rate(self.ewma_abort_rate),
             _bucket_latency_s(self.ewma_lock_wait_s),
             _bucket_latency_s(self.ewma_latency_s),
+            _bucket_count(int(round(self.ewma_lock_queue_depth))),
+            _bucket_count(int(round(self.ewma_lock_handoff_count))),
+            _bucket_count(int(round(self.ewma_committing_count))),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -113,6 +143,11 @@ class ATCCRuntimeStats:
             ewma_abort_rate=float(data.get("ewma_abort_rate", 0.0)),
             ewma_lock_wait_s=float(data.get("ewma_lock_wait_s", 0.0)),
             ewma_latency_s=float(data.get("ewma_latency_s", 0.0)),
+            ewma_lock_queue_depth=float(data.get("ewma_lock_queue_depth", 0.0)),
+            ewma_lock_handoff_count=float(
+                data.get("ewma_lock_handoff_count", 0.0)
+            ),
+            ewma_committing_count=float(data.get("ewma_committing_count", 0.0)),
         )
 
 
@@ -311,8 +346,12 @@ class PhaseAwareATCCModule:
         abort_penalty: float = 2.0,
         reject_penalty: float = 0.5,
         lock_wait_cost_per_s: float = 80.0,
+        lock_queue_depth_cost: float = 0.05,
+        lock_handoff_cost: float = 0.03,
+        committing_count_cost: float = 0.005,
         lock_action_cost: float = 0.02,
         interval_cost_per_s: float = 1.0,
+        ycsb_tuned_prior: bool = False,
     ):
         self.name = str(name)
         self.action_specs = {spec.name: spec for spec in self.ACTIONS}
@@ -331,8 +370,12 @@ class PhaseAwareATCCModule:
         self.abort_penalty = float(abort_penalty)
         self.reject_penalty = float(reject_penalty)
         self.lock_wait_cost_per_s = float(lock_wait_cost_per_s)
+        self.lock_queue_depth_cost = float(lock_queue_depth_cost)
+        self.lock_handoff_cost = float(lock_handoff_cost)
+        self.committing_count_cost = float(committing_count_cost)
         self.lock_action_cost = float(lock_action_cost)
         self.interval_cost_per_s = float(interval_cost_per_s)
+        self.ycsb_tuned_prior = bool(ycsb_tuned_prior)
 
     @classmethod
     def tpcc(cls) -> "PhaseAwareATCCModule":
@@ -373,6 +416,31 @@ class PhaseAwareATCCModule:
             lock_wait_cost_per_s=180.0,
             lock_action_cost=0.05,
             interval_cost_per_s=1.0,
+        )
+
+    @classmethod
+    def ycsb_strict_tuned(cls) -> "PhaseAwareATCCModule":
+        return cls(
+            name="ycsb-strict-tuned-phase-aware-atcc",
+            learner=ATCCPolicyQLearner(
+                tuple(spec.name for spec in cls.ACTIONS),
+                learning_rate=0.30,
+                epsilon=0.0,
+                min_epsilon=0.0,
+                epsilon_decay=1.0,
+                seed=13907,
+            ),
+            hot_conflict_threshold=0.12,
+            hot_lock_wait_threshold_s=0.020,
+            min_hot_observations=1,
+            abort_penalty=2.2,
+            lock_wait_cost_per_s=220.0,
+            lock_queue_depth_cost=0.08,
+            lock_handoff_cost=0.04,
+            committing_count_cost=0.008,
+            lock_action_cost=0.08,
+            interval_cost_per_s=1.4,
+            ycsb_tuned_prior=True,
         )
 
     def select(
@@ -477,8 +545,30 @@ class PhaseAwareATCCModule:
                     if runtime_stats is not None
                     else 0.0
                 ),
+                global_lock_queue_depth=(
+                    float(runtime_stats.ewma_lock_queue_depth)
+                    if runtime_stats is not None
+                    else 0.0
+                ),
+                global_lock_handoff_count=(
+                    float(runtime_stats.ewma_lock_handoff_count)
+                    if runtime_stats is not None
+                    else 0.0
+                ),
+                global_committing_count=(
+                    float(runtime_stats.ewma_committing_count)
+                    if runtime_stats is not None
+                    else 0.0
+                ),
             )
         action, explore, q_values = self.learner.select(state_key, prior_action=prior)
+        if action != "occ" and self._should_override_lock_for_low_abort_pressure(
+            phase=phase,
+            retry_count=retry_count,
+            runtime_stats=runtime_stats,
+        ):
+            action = "occ"
+            explore = False
         return PhaseAwareATCCDecision(
             state_key=state_key,
             action=action,
@@ -502,6 +592,21 @@ class PhaseAwareATCCModule:
             ),
             global_latency_s=(
                 float(runtime_stats.ewma_latency_s)
+                if runtime_stats is not None
+                else 0.0
+            ),
+            global_lock_queue_depth=(
+                float(runtime_stats.ewma_lock_queue_depth)
+                if runtime_stats is not None
+                else 0.0
+            ),
+            global_lock_handoff_count=(
+                float(runtime_stats.ewma_lock_handoff_count)
+                if runtime_stats is not None
+                else 0.0
+            ),
+            global_committing_count=(
+                float(runtime_stats.ewma_committing_count)
                 if runtime_stats is not None
                 else 0.0
             ),
@@ -542,6 +647,9 @@ class PhaseAwareATCCModule:
         conflict_abort: bool,
         lock_wait_s: float,
         operation_count: int,
+        lock_queue_depth: float = 0.0,
+        lock_handoff_count: float = 0.0,
+        committing_count: float = 0.0,
     ) -> float:
         reward = self.reward(
             decision.action,
@@ -549,6 +657,9 @@ class PhaseAwareATCCModule:
             rejected=rejected,
             conflict_abort=conflict_abort,
             lock_wait_s=lock_wait_s,
+            lock_queue_depth=lock_queue_depth,
+            lock_handoff_count=lock_handoff_count,
+            committing_count=committing_count,
             retry_count=decision.retry_count,
             agent_interval_s=decision.agent_interval_s,
             operation_count=operation_count,
@@ -567,6 +678,9 @@ class PhaseAwareATCCModule:
         retry_count: int,
         agent_interval_s: float,
         operation_count: int,
+        lock_queue_depth: float = 0.0,
+        lock_handoff_count: float = 0.0,
+        committing_count: float = 0.0,
     ) -> float:
         value = self.commit_reward if committed else 0.0
         if rejected:
@@ -577,6 +691,9 @@ class PhaseAwareATCCModule:
         if action != "occ":
             value -= self.lock_action_cost
             value -= max(0.0, float(lock_wait_s)) * self.lock_wait_cost_per_s
+            value -= max(0.0, float(lock_queue_depth)) * self.lock_queue_depth_cost
+            value -= max(0.0, float(lock_handoff_count)) * self.lock_handoff_cost
+            value -= max(0.0, float(committing_count)) * self.committing_count_cost
             value -= 0.001 * max(0, int(operation_count))
         return value
 
@@ -610,6 +727,16 @@ class PhaseAwareATCCModule:
         hot_write_ratio: float,
         global_abort_rate: float = 0.0,
     ) -> str:
+        if self.ycsb_tuned_prior:
+            return self._ycsb_strict_tuned_prior_action(
+                profiles=profiles,
+                phase=phase,
+                retry_count=retry_count,
+                agent_interval_s=agent_interval_s,
+                hot_read_ratio=hot_read_ratio,
+                hot_write_ratio=hot_write_ratio,
+                global_abort_rate=global_abort_rate,
+            )
         writes = sum(1 for profile in profiles if getattr(profile, "access_kind", "") == "write")
         if phase == "explore":
             return "occ"
@@ -624,6 +751,41 @@ class PhaseAwareATCCModule:
         if agent_interval_s >= 0.10 and hot_write_ratio > 0.0:
             return "lock-hot-writes"
         if writes >= 8 and phase == "commit" and global_abort_rate >= 0.10:
+            return "lock-hot-writes"
+        return "occ"
+
+    def _ycsb_strict_tuned_prior_action(
+        self,
+        *,
+        profiles: Sequence[Any],
+        phase: str,
+        retry_count: int,
+        agent_interval_s: float,
+        hot_read_ratio: float,
+        hot_write_ratio: float,
+        global_abort_rate: float = 0.0,
+    ) -> str:
+        writes = sum(1 for profile in profiles if getattr(profile, "access_kind", "") == "write")
+        reads = sum(1 for profile in profiles if getattr(profile, "access_kind", "") == "read")
+        if phase == "explore":
+            return "occ"
+        if int(retry_count) <= 0:
+            if hot_write_ratio >= 0.75 and max(0.0, float(global_abort_rate)) >= 0.25:
+                return "lock-hot-writes"
+            return "occ"
+        if int(retry_count) >= 3 and (hot_read_ratio > 0.0 or hot_write_ratio > 0.0):
+            return "lock-read-write-set"
+        if int(retry_count) >= 2 and hot_write_ratio >= 0.50:
+            return "lock-write-set"
+        if hot_write_ratio > 0.0:
+            return "lock-hot-writes"
+        if (
+            int(retry_count) >= 2
+            and hot_read_ratio >= 0.50
+            and (reads >= writes or max(0.0, float(agent_interval_s)) >= 0.10)
+        ):
+            return "lock-hot-read-write"
+        if writes >= 8 and max(0.0, float(global_abort_rate)) >= 0.20:
             return "lock-hot-writes"
         return "occ"
 
@@ -690,6 +852,28 @@ class PhaseAwareATCCModule:
             return True
         return writes == 0 and reads > 0
 
+    def _should_override_lock_for_low_abort_pressure(
+        self,
+        *,
+        phase: str,
+        retry_count: int,
+        runtime_stats: Optional[ATCCRuntimeStats],
+    ) -> bool:
+        if phase not in {"explore", "refine"}:
+            return False
+        if int(retry_count) > 0:
+            return False
+        if runtime_stats is None or int(runtime_stats.observations) < 4:
+            return False
+        if float(runtime_stats.ewma_abort_rate) >= 0.05:
+            return False
+        return (
+            float(runtime_stats.ewma_lock_wait_s) >= 0.010
+            or float(runtime_stats.ewma_lock_queue_depth) >= 1.0
+            or float(runtime_stats.ewma_lock_handoff_count) >= 1.0
+            or float(runtime_stats.ewma_committing_count) >= 1.0
+        )
+
     def state_key(
         self,
         *,
@@ -709,31 +893,56 @@ class PhaseAwareATCCModule:
         reads = sum(1 for profile in profiles if getattr(profile, "access_kind", "") == "read")
         writes = sum(1 for profile in profiles if getattr(profile, "access_kind", "") == "write")
         intents = Counter(str(getattr(profile, "intent_name", "")) for profile in profiles)
-        global_obs, global_abort, global_lock_wait, global_latency = (
+        (
+            global_obs,
+            global_abort,
+            global_lock_wait,
+            global_latency,
+            global_queue_depth,
+            global_handoff,
+            global_committing,
+        ) = (
             runtime_stats.state_buckets()
             if runtime_stats is not None
-            else ("0", "0", "0ms", "0ms")
+            else ("0", "0", "0ms", "0ms", "0", "0", "0")
         )
-        return "|".join(
-            (
-                "workload=" + ",".join(workloads),
-                "task=" + ",".join(task_types),
-                "class=" + ",".join(classes),
-                "phase=" + str(phase),
-                "reads=" + _bucket_count(reads),
-                "writes=" + _bucket_count(writes),
-                "hotR=" + _bucket_rate(hot_read_ratio),
-                "hotW=" + _bucket_rate(hot_write_ratio),
-                "retry=" + _bucket_count(retry_count),
-                "interval=" + _bucket_latency_s(agent_interval_s),
-                "priority=" + _bucket_count(priority),
-                "globalObs=" + global_obs,
-                "globalAbort=" + global_abort,
-                "globalLockWait=" + global_lock_wait,
-                "globalLatency=" + global_latency,
-                "intent=" + ",".join(f"{name}:{_bucket_count(count)}" for name, count in sorted(intents.items())),
+        parts = [
+            "workload=" + ",".join(workloads),
+            "task=" + ",".join(task_types),
+            "class=" + ",".join(classes),
+            "phase=" + str(phase),
+            "reads=" + _bucket_count(reads),
+            "writes=" + _bucket_count(writes),
+            "hotR=" + _bucket_rate(hot_read_ratio),
+            "hotW=" + _bucket_rate(hot_write_ratio),
+            "retry=" + _bucket_count(retry_count),
+            "interval=" + _bucket_latency_s(agent_interval_s),
+            "priority=" + _bucket_count(priority),
+            "globalObs=" + global_obs,
+            "globalAbort=" + global_abort,
+            "globalLockWait=" + global_lock_wait,
+            "globalLatency=" + global_latency,
+        ]
+        if (
+            global_queue_depth != "0"
+            or global_handoff != "0"
+            or global_committing != "0"
+        ):
+            parts.extend(
+                (
+                    "globalQueueDepth=" + global_queue_depth,
+                    "globalHandoff=" + global_handoff,
+                    "globalCommitting=" + global_committing,
+                )
+            )
+        parts.append(
+            "intent="
+            + ",".join(
+                f"{name}:{_bucket_count(count)}"
+                for name, count in sorted(intents.items())
             )
         )
+        return "|".join(parts)
 
     def is_hot_profile(
         self,
@@ -812,8 +1021,12 @@ class PhaseAwareATCCModule:
             "abort_penalty": self.abort_penalty,
             "reject_penalty": self.reject_penalty,
             "lock_wait_cost_per_s": self.lock_wait_cost_per_s,
+            "lock_queue_depth_cost": self.lock_queue_depth_cost,
+            "lock_handoff_cost": self.lock_handoff_cost,
+            "committing_count_cost": self.committing_count_cost,
             "lock_action_cost": self.lock_action_cost,
             "interval_cost_per_s": self.interval_cost_per_s,
+            "ycsb_tuned_prior": self.ycsb_tuned_prior,
             "learner": self.learner.to_dict(),
         }
 
@@ -837,8 +1050,12 @@ class PhaseAwareATCCModule:
             abort_penalty=float(data.get("abort_penalty", 2.0)),
             reject_penalty=float(data.get("reject_penalty", 0.5)),
             lock_wait_cost_per_s=float(data.get("lock_wait_cost_per_s", 80.0)),
+            lock_queue_depth_cost=float(data.get("lock_queue_depth_cost", 0.05)),
+            lock_handoff_cost=float(data.get("lock_handoff_cost", 0.03)),
+            committing_count_cost=float(data.get("committing_count_cost", 0.005)),
             lock_action_cost=float(data.get("lock_action_cost", 0.02)),
             interval_cost_per_s=float(data.get("interval_cost_per_s", 1.0)),
+            ycsb_tuned_prior=bool(data.get("ycsb_tuned_prior", False)),
         )
 
 

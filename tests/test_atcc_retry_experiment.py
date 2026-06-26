@@ -142,6 +142,51 @@ class RetryExperimentMetricTests(unittest.TestCase):
         self.assertEqual(aggregate["prelock_committing_enters"], 3)
         self.assertEqual(aggregate["prelock_committing_exits"], 3)
 
+    def test_retry_aggregate_charges_tokens_for_lease_refresh_regeneration(self):
+        runs = (
+            RetryRunSummary(
+                workload="agent-ycsb-semantic",
+                strategy="adaptive-op-strict",
+                policy_variant="phase-rl",
+                seed=1,
+                task_count=2,
+                workers=1,
+                agent_slots=1,
+                agent_admission_mode="before-begin",
+                max_attempts=2,
+                planning_delay_s=0.0,
+                latency_distribution="fixed",
+                committed_tasks=2,
+                final_failed_tasks=0,
+                rejected_tasks=0,
+                total_attempts=2,
+                conflict_aborts=0,
+                conflict_object_counts={},
+                conflict_object_class_counts={},
+                operation_policy_counts={"pessimistic": 2},
+                operation_rule_counts={"phase-atcc-commit-lock-hot-writes": 2},
+                action_counts={"direct": 2},
+                prelock_wait_s=0.0,
+                elapsed_s=1.0,
+                task_operation_counts=(4, 4),
+                tokens_per_operation=10.0,
+                estimated_tokens=80.0,
+                estimated_wasted_tokens=0.0,
+                lease_refresh_regenerations=1,
+            ),
+        )
+
+        aggregate = aggregate_retry_runs(runs)[0]
+
+        self.assertEqual(aggregate["lease_refresh_regenerations"], 1)
+        self.assertEqual(aggregate["lease_refresh_regenerations_per_task"], 0.5)
+        self.assertEqual(aggregate["estimated_refresh_tokens"], 40.0)
+        self.assertEqual(aggregate["estimated_refresh_tokens_per_task"], 20.0)
+        self.assertEqual(aggregate["estimated_tokens"], 120.0)
+        self.assertEqual(aggregate["estimated_tokens_per_task"], 60.0)
+        self.assertEqual(aggregate["estimated_wasted_tokens"], 40.0)
+        self.assertEqual(aggregate["estimated_wasted_tokens_per_task"], 20.0)
+
     def test_agent_phase_sequence_advances_by_retry_attempt(self):
         workload = build_agent_workload(
             "tpcc",
@@ -306,6 +351,11 @@ class RetryExperimentMetricTests(unittest.TestCase):
             aggregate["lease_refresh_regenerations"],
             row["lease_refresh_regenerations"],
         )
+        self.assertGreater(aggregate["estimated_refresh_tokens"], 0.0)
+        self.assertGreater(
+            aggregate["estimated_wasted_tokens_per_task"],
+            row["estimated_wasted_tokens_per_task"],
+        )
 
     def test_agent_admission_mode_is_reported(self):
         workload = build_agent_workload(
@@ -345,6 +395,57 @@ class RetryExperimentMetricTests(unittest.TestCase):
             aggregate_retry_runs(runs)[0]["agent_admission_mode"],
             "before-begin",
         )
+
+    def test_lock_scheduler_and_prelock_budget_are_reported(self):
+        workload = build_agent_workload(
+            "ycsb",
+            "semantic",
+            ycsb_config=YCSBConfig(
+                record_count=4,
+                field_count=1,
+                requests_per_task=1,
+                candidates_per_task=1,
+                read_weight=0.0,
+                update_weight=1.0,
+                zipf_theta=0.0,
+            ),
+        )
+        runs = run_retry_matrix(
+            workload,
+            ("adaptive-op-strict",),
+            workload_kind="ycsb",
+            policy_variant="phase-rl",
+            task_count=2,
+            seed=13,
+            repeats=1,
+            workers=1,
+            agent_slots=1,
+            agent_admission_mode="before-begin",
+            planning_delay_s=0.0,
+            latency_distribution="fixed",
+            latency_cv=0.8,
+            latency_max_s=0.0,
+            max_attempts=2,
+            tokens_per_operation=10.0,
+            object_lock_scheduler="bounded-priority",
+            object_lock_priority_burst=3,
+            prelock_wait_budget_s=0.007,
+            prelock_wait_budget_mode="object",
+            prelock_lease_mode="defer-until-after-planning",
+        )
+
+        row = runs[0].to_dict()
+        aggregate = aggregate_retry_runs(runs)[0]
+        self.assertEqual(row["object_lock_scheduler"], "bounded-priority")
+        self.assertEqual(row["object_lock_priority_burst"], 3)
+        self.assertEqual(row["prelock_wait_budget_s"], 0.007)
+        self.assertEqual(row["prelock_wait_budget_mode"], "object")
+        self.assertEqual(row["prelock_lease_mode"], "defer-until-after-planning")
+        self.assertEqual(aggregate["object_lock_scheduler"], "bounded-priority")
+        self.assertEqual(aggregate["object_lock_priority_burst"], 3)
+        self.assertEqual(aggregate["prelock_wait_budget_s"], 0.007)
+        self.assertEqual(aggregate["prelock_wait_budget_mode"], "object")
+        self.assertEqual(aggregate["prelock_lease_mode"], "defer-until-after-planning")
 
 
 if __name__ == "__main__":

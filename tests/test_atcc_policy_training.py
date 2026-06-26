@@ -30,14 +30,23 @@ class ATCCPolicyTrainingTests(unittest.TestCase):
             seed=11,
             workers=1,
             agent_slots=0,
+            agent_admission_mode="before-begin",
             planning_delay_s=0.0,
             latency_distribution="fixed",
             latency_cv=0.8,
             latency_max_s=0.0,
             max_attempts=2,
             tokens_per_operation=10.0,
+            object_lock_scheduler="bounded-priority",
+            object_lock_priority_burst=3,
+            prelock_wait_budget_s=0.007,
+            prelock_wait_budget_mode="object",
+            prelock_lease_mode="defer-until-after-planning",
             atcc_lock_wait_cost_per_s=123.0,
             atcc_lock_action_cost=0.07,
+            atcc_lock_queue_depth_cost=0.11,
+            atcc_lock_handoff_cost=0.13,
+            atcc_committing_count_cost=0.17,
         )
 
         table = artifact["operation_policy_table"]
@@ -60,10 +69,25 @@ class ATCCPolicyTrainingTests(unittest.TestCase):
         self.assertIn("atcc_runtime_stats", table)
         self.assertGreater(table["atcc_runtime_stats"]["observations"], 0)
         self.assertGreater(stats["atcc_runtime_observation_count"], 0)
+        self.assertEqual(artifact["training_config"]["agent_admission_mode"], "before-begin")
+        self.assertEqual(artifact["training_config"]["object_lock_scheduler"], "bounded-priority")
+        self.assertEqual(artifact["training_config"]["object_lock_priority_burst"], 3)
+        self.assertEqual(artifact["training_config"]["prelock_wait_budget_s"], 0.007)
+        self.assertEqual(artifact["training_config"]["prelock_wait_budget_mode"], "object")
+        self.assertEqual(artifact["training_config"]["prelock_lease_mode"], "defer-until-after-planning")
+        self.assertEqual(artifact["runs"][0]["agent_admission_mode"], "before-begin")
+        self.assertEqual(artifact["runs"][0]["object_lock_scheduler"], "bounded-priority")
+        self.assertEqual(artifact["runs"][0]["prelock_wait_budget_mode"], "object")
         self.assertEqual(artifact["training_config"]["atcc_lock_wait_cost_per_s"], 123.0)
         self.assertEqual(artifact["training_config"]["atcc_lock_action_cost"], 0.07)
+        self.assertEqual(artifact["training_config"]["atcc_lock_queue_depth_cost"], 0.11)
+        self.assertEqual(artifact["training_config"]["atcc_lock_handoff_cost"], 0.13)
+        self.assertEqual(artifact["training_config"]["atcc_committing_count_cost"], 0.17)
         self.assertEqual(table["atcc_module"]["lock_wait_cost_per_s"], 123.0)
         self.assertEqual(table["atcc_module"]["lock_action_cost"], 0.07)
+        self.assertEqual(table["atcc_module"]["lock_queue_depth_cost"], 0.11)
+        self.assertEqual(table["atcc_module"]["lock_handoff_cost"], 0.13)
+        self.assertEqual(table["atcc_module"]["committing_count_cost"], 0.17)
 
         loaded = OperationPolicyTable.ycsb_phase_rl_atcc().with_learned_state(
             artifact,
@@ -89,6 +113,9 @@ class ATCCPolicyTrainingTests(unittest.TestCase):
         )
         self.assertEqual(loaded_table["atcc_module"]["lock_wait_cost_per_s"], 123.0)
         self.assertEqual(loaded_table["atcc_module"]["lock_action_cost"], 0.07)
+        self.assertEqual(loaded_table["atcc_module"]["lock_queue_depth_cost"], 0.11)
+        self.assertEqual(loaded_table["atcc_module"]["lock_handoff_cost"], 0.13)
+        self.assertEqual(loaded_table["atcc_module"]["committing_count_cost"], 0.17)
 
 
 if __name__ == "__main__":

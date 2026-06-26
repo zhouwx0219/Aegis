@@ -86,6 +86,11 @@ class RetryRunSummary:
     prelock_handoff_count: int = 0
     prelock_committing_enters: int = 0
     prelock_committing_exits: int = 0
+    object_lock_scheduler: str = "race"
+    object_lock_priority_burst: int = 2
+    prelock_wait_budget_s: float = 0.0
+    prelock_wait_budget_mode: str = "transaction"
+    prelock_lease_mode: str = "hold"
 
     @property
     def commit_rate(self) -> float:
@@ -379,8 +384,17 @@ def aggregate_retry_runs(runs: Sequence[RetryRunSummary]) -> List[Dict[str, Any]
             for count in run.task_operation_counts
         )
         wasted_attempts = sum(run.wasted_attempts for run in group)
-        estimated_tokens = sum(run.estimated_tokens for run in group)
-        estimated_wasted_tokens = sum(run.estimated_wasted_tokens for run in group)
+        estimated_base_tokens = sum(run.estimated_tokens for run in group)
+        estimated_base_wasted_tokens = sum(
+            run.estimated_wasted_tokens for run in group
+        )
+        refresh_tokens = _estimated_refresh_tokens(
+            lease_refresh_regenerations,
+            task_operation_counts,
+            group[0].tokens_per_operation,
+        )
+        estimated_tokens = estimated_base_tokens + refresh_tokens
+        estimated_wasted_tokens = estimated_base_wasted_tokens + refresh_tokens
         rows.append(
             {
                 "strategy": strategy,
@@ -411,9 +425,17 @@ def aggregate_retry_runs(runs: Sequence[RetryRunSummary]) -> List[Dict[str, Any]
                     sorted(conflict_object_class_counts.items())
                 ),
                 "background_workers": group[0].background_workers,
+                "object_lock_scheduler": group[0].object_lock_scheduler,
+                "object_lock_priority_burst": group[0].object_lock_priority_burst,
+                "prelock_wait_budget_s": group[0].prelock_wait_budget_s,
+                "prelock_wait_budget_mode": group[0].prelock_wait_budget_mode,
+                "prelock_lease_mode": group[0].prelock_lease_mode,
                 "background_commits": background_commits,
                 "background_aborts": background_aborts,
                 "lease_refresh_regenerations": lease_refresh_regenerations,
+                "lease_refresh_regenerations_per_task": (
+                    lease_refresh_regenerations / task_count if task_count else 0.0
+                ),
                 "background_throughput": background_commits / elapsed
                 if elapsed > 0
                 else 0.0,
@@ -445,6 +467,12 @@ def aggregate_retry_runs(runs: Sequence[RetryRunSummary]) -> List[Dict[str, Any]
                 else 0.0,
                 "task_operation_counts": list(task_operation_counts),
                 "tokens_per_operation": group[0].tokens_per_operation,
+                "estimated_base_tokens": estimated_base_tokens,
+                "estimated_base_wasted_tokens": estimated_base_wasted_tokens,
+                "estimated_refresh_tokens": refresh_tokens,
+                "estimated_refresh_tokens_per_task": refresh_tokens / task_count
+                if task_count
+                else 0.0,
                 "estimated_tokens": estimated_tokens,
                 "estimated_tokens_per_task": estimated_tokens / task_count
                 if task_count
@@ -461,6 +489,21 @@ def aggregate_retry_runs(runs: Sequence[RetryRunSummary]) -> List[Dict[str, Any]
             }
         )
     return rows
+
+
+def _estimated_refresh_tokens(
+    refresh_count: int,
+    task_operation_counts: Sequence[int],
+    tokens_per_operation: float,
+) -> float:
+    if refresh_count <= 0 or not task_operation_counts:
+        return 0.0
+    operation_count = _mean(task_operation_counts)
+    return (
+        int(refresh_count)
+        * max(0.0, float(operation_count))
+        * max(0.0, float(tokens_per_operation))
+    )
 
 
 def _run_one_retry(
@@ -756,6 +799,11 @@ def _run_one_retry(
         prelock_handoff_count=prelock_handoff_count,
         prelock_committing_enters=prelock_committing_enters,
         prelock_committing_exits=prelock_committing_exits,
+        object_lock_scheduler=str(object_lock_scheduler),
+        object_lock_priority_burst=int(object_lock_priority_burst),
+        prelock_wait_budget_s=float(prelock_wait_budget_s),
+        prelock_wait_budget_mode=str(prelock_wait_budget_mode),
+        prelock_lease_mode=str(prelock_lease_mode),
         elapsed_s=elapsed_s,
     )
 
@@ -819,6 +867,9 @@ def _operation_policy(
         base = OperationPolicyTable.ycsb_atcc()
         variants = {
             "default": base,
+            "strict-tuned": OperationPolicyTable.ycsb_strict_tuned_atcc(),
+            "ycsb-strict-tuned": OperationPolicyTable.ycsb_strict_tuned_atcc(),
+            "paper-strict-tuned": OperationPolicyTable.ycsb_strict_tuned_atcc(),
             "aggressive": dataclasses.replace(
                 base,
                 min_feedback_observations=5,
@@ -925,7 +976,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Retry-aware operation ATCC experiments.")
     parser.add_argument("--mode", choices=("matrix", "search"), default="matrix")
     parser.add_argument("--workload", choices=("tpcc", "ycsb"), default="tpcc")
-    parser.add_argument("--strategies", default="occ,2pl-pre,adaptive-op-strict")
+    parser.add_argument("--strategies", default="occ,2pl,adaptive-op-strict")
     parser.add_argument("--policy-variant", default="default")
     parser.add_argument("--search-variants", default="aggressive,balanced,conservative")
     parser.add_argument("--task-count", type=int, default=500)
@@ -1027,7 +1078,8 @@ def build_parser() -> argparse.ArgumentParser:
             "'yield-refresh-regenerate' also refreshes the snapshot and rebuilds "
             "task candidates after reacquiring; "
             "'defer-until-after-planning' starts ATCC prelocking/snapshot after "
-            "the simulated planning delay. 2PL-pre is kept as a blocking baseline."
+            "the simulated planning delay. 2PL-pre is available as an explicit "
+            "blocking/oracle baseline but is not part of the default comparison."
         ),
     )
     parser.add_argument(

@@ -102,6 +102,9 @@ class AgentTransaction:
                 else {}
             ).items()
         }
+        self.prelock_committing_enters = 0
+        self.prelock_committing_exits = 0
+        self.prelock_committing_target_count = 0
         self.precomputed_operation_policy_decisions = tuple(
             precomputed_operation_policy_decisions
         )
@@ -258,16 +261,20 @@ class AgentTransaction:
         lease = self._prelock_lease
         if lease is None:
             return
+        targets = tuple(getattr(lease, "targets", ()) or ())
+        self.prelock_committing_enters += 1
+        self.prelock_committing_target_count += len(targets)
         lease.enter_committing()
         self._event(
             "prelock_committing_enter",
-            {"targets": list(getattr(lease, "targets", ()) or ())},
+            {"targets": list(targets)},
         )
 
     def _exit_prelock_committing(self) -> None:
         lease = self._prelock_lease
         if lease is None:
             return
+        self.prelock_committing_exits += 1
         lease.exit_committing()
         self._event(
             "prelock_committing_exit",
@@ -418,6 +425,11 @@ class AgentTransaction:
             ),
             "prelock_target_handoff_count": dict(
                 self.prelock_target_handoff_count
+            ),
+            "prelock_committing_enters": int(self.prelock_committing_enters),
+            "prelock_committing_exits": int(self.prelock_committing_exits),
+            "prelock_committing_target_count": int(
+                self.prelock_committing_target_count
             ),
             "events": [dataclasses.asdict(event) for event in self.events],
             "candidates": [candidate.to_trace() for candidate in self.candidates],

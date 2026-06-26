@@ -93,6 +93,21 @@ PROFILE_SPECS: Tuple[ATCCProfileSpec, ...] = (
         },
     ),
     ATCCProfileSpec(
+        name="tpcc-medium",
+        workload_kind="tpcc",
+        description="TPC-C NewOrder with moderate district-counter contention.",
+        config={
+            "warehouses": 2,
+            "districts_per_warehouse": 2,
+            "customers_per_district": 32,
+            "items": 128,
+            "initial_stock": 1000,
+            "order_lines": 8,
+            "candidates_per_task": 4,
+            "transaction_mix": (("new_order", 1.0),),
+        },
+    ),
+    ATCCProfileSpec(
         name="tpcc-high",
         workload_kind="tpcc",
         description="TPC-C NewOrder concentrated on a small hotspot.",
@@ -114,7 +129,7 @@ DEFAULT_TRAINING_PROFILE = {
     "ycsb": "ycsb-high",
     "tpcc": "tpcc-high",
 }
-EVAL_STRATEGIES = ("occ", "2pl-pre", "adaptive-op-strict")
+EVAL_STRATEGIES = ("occ", "2pl", "adaptive-op-strict")
 
 
 def run_profile_suite(
@@ -129,6 +144,7 @@ def run_profile_suite(
     seed: int = 0,
     workers: int = 16,
     agent_slots: int = 4,
+    agent_admission_mode: str = "planning-only",
     planning_delay_s: float = 0.010,
     latency_distribution: str = "lognormal",
     latency_cv: float = 0.8,
@@ -138,6 +154,11 @@ def run_profile_suite(
     background_workers: int = 4,
     background_interval_s: float = 0.002,
     background_strategy: str = "occ",
+    object_lock_scheduler: str = "race",
+    object_lock_priority_burst: int = 2,
+    prelock_wait_budget_s: float = 0.0,
+    prelock_wait_budget_mode: str = "transaction",
+    prelock_lease_mode: str = "hold",
     write_files: bool = True,
 ) -> Dict[str, Any]:
     selected = _select_profiles(profiles)
@@ -166,6 +187,7 @@ def run_profile_suite(
             seed=seed,
             workers=workers,
             agent_slots=agent_slots,
+            agent_admission_mode=agent_admission_mode,
             planning_delay_s=planning_delay_s,
             latency_distribution=latency_distribution,
             latency_cv=latency_cv,
@@ -175,6 +197,11 @@ def run_profile_suite(
             background_workers=background_workers,
             background_interval_s=background_interval_s,
             background_strategy=background_strategy,
+            object_lock_scheduler=object_lock_scheduler,
+            object_lock_priority_burst=object_lock_priority_burst,
+            prelock_wait_budget_s=prelock_wait_budget_s,
+            prelock_wait_budget_mode=prelock_wait_budget_mode,
+            prelock_lease_mode=prelock_lease_mode,
         )
         key = _artifact_key(train_spec, train_per_profile=train_per_profile)
         artifacts[key] = artifact
@@ -198,6 +225,7 @@ def run_profile_suite(
             repeats=eval_repeats,
             workers=workers,
             agent_slots=agent_slots,
+            agent_admission_mode=agent_admission_mode,
             planning_delay_s=planning_delay_s,
             latency_distribution=latency_distribution,
             latency_cv=latency_cv,
@@ -209,6 +237,11 @@ def run_profile_suite(
             background_workers=background_workers,
             background_interval_s=background_interval_s,
             background_strategy=background_strategy,
+            object_lock_scheduler=object_lock_scheduler,
+            object_lock_priority_burst=object_lock_priority_burst,
+            prelock_wait_budget_s=prelock_wait_budget_s,
+            prelock_wait_budget_mode=prelock_wait_budget_mode,
+            prelock_lease_mode=prelock_lease_mode,
         )
         aggregates = aggregate_retry_runs(runs)
         eval_report = {
@@ -228,6 +261,7 @@ def run_profile_suite(
             "repeats": eval_repeats,
             "workers": workers,
             "agent_slots": agent_slots,
+            "agent_admission_mode": agent_admission_mode,
             "planning_delay_s": planning_delay_s,
             "latency_distribution": latency_distribution,
             "latency_cv": latency_cv,
@@ -237,6 +271,11 @@ def run_profile_suite(
             "background_workers": background_workers,
             "background_interval_s": background_interval_s,
             "background_strategy": background_strategy,
+            "object_lock_scheduler": object_lock_scheduler,
+            "object_lock_priority_burst": object_lock_priority_burst,
+            "prelock_wait_budget_s": prelock_wait_budget_s,
+            "prelock_wait_budget_mode": prelock_wait_budget_mode,
+            "prelock_lease_mode": prelock_lease_mode,
             "runs": [run.to_dict() for run in runs],
             "aggregates": aggregates,
             "comparisons": _comparisons(aggregates),
@@ -264,6 +303,12 @@ def run_profile_suite(
         "source_system": "data-agent-runtime",
         "training_method": "offline-simulation-tabular-q-learning",
         "atcc_state_schema": atcc_state_schema(),
+        "agent_admission_mode": agent_admission_mode,
+        "object_lock_scheduler": object_lock_scheduler,
+        "object_lock_priority_burst": object_lock_priority_burst,
+        "prelock_wait_budget_s": prelock_wait_budget_s,
+        "prelock_wait_budget_mode": prelock_wait_budget_mode,
+        "prelock_lease_mode": prelock_lease_mode,
         "profiles": profile_reports,
         "config": {
             "train_per_profile": train_per_profile,
@@ -274,6 +319,7 @@ def run_profile_suite(
             "seed": seed,
             "workers": workers,
             "agent_slots": agent_slots,
+            "agent_admission_mode": agent_admission_mode,
             "planning_delay_s": planning_delay_s,
             "latency_distribution": latency_distribution,
             "latency_cv": latency_cv,
@@ -283,6 +329,11 @@ def run_profile_suite(
             "background_workers": background_workers,
             "background_interval_s": background_interval_s,
             "background_strategy": background_strategy,
+            "object_lock_scheduler": object_lock_scheduler,
+            "object_lock_priority_burst": object_lock_priority_burst,
+            "prelock_wait_budget_s": prelock_wait_budget_s,
+            "prelock_wait_budget_mode": prelock_wait_budget_mode,
+            "prelock_lease_mode": prelock_lease_mode,
             "strategies": list(EVAL_STRATEGIES),
         },
     }
@@ -353,7 +404,7 @@ def render_markdown_report(report: Mapping[str, Any]) -> str:
     for profile in report.get("profiles", ()):
         comparisons = profile.get("comparisons", {})
         lines.append(f"### {profile.get('profile', '')}")
-        for baseline in ("occ", "2pl-pre"):
+        for baseline in ("occ", "2pl"):
             delta = comparisons.get(f"adaptive-op-strict_vs_{baseline}")
             if not delta:
                 continue
@@ -393,6 +444,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--agent-slots", type=int, default=4)
+    parser.add_argument(
+        "--agent-admission-mode",
+        choices=("planning-only", "before-begin"),
+        default="planning-only",
+    )
     parser.add_argument("--planning-delay-ms", type=float, default=10.0)
     parser.add_argument(
         "--latency-distribution",
@@ -406,6 +462,28 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--background-workers", type=int, default=4)
     parser.add_argument("--background-interval-ms", type=float, default=2.0)
     parser.add_argument("--background-strategy", default="occ")
+    parser.add_argument(
+        "--object-lock-scheduler",
+        choices=("race", "priority", "bounded-priority"),
+        default="race",
+    )
+    parser.add_argument("--object-lock-priority-burst", type=int, default=2)
+    parser.add_argument("--prelock-wait-budget-ms", type=float, default=0.0)
+    parser.add_argument(
+        "--prelock-wait-budget-mode",
+        choices=("transaction", "object"),
+        default="transaction",
+    )
+    parser.add_argument(
+        "--prelock-lease-mode",
+        choices=(
+            "hold",
+            "yield-during-planning",
+            "yield-refresh-regenerate",
+            "defer-until-after-planning",
+        ),
+        default="hold",
+    )
     return parser
 
 
@@ -422,6 +500,7 @@ def main(argv: Optional[Sequence[str]] = None, *, stdout: Optional[TextIO] = Non
         seed=args.seed,
         workers=args.workers,
         agent_slots=args.agent_slots,
+        agent_admission_mode=args.agent_admission_mode,
         planning_delay_s=args.planning_delay_ms / 1000.0,
         latency_distribution=args.latency_distribution,
         latency_cv=args.latency_cv,
@@ -431,6 +510,11 @@ def main(argv: Optional[Sequence[str]] = None, *, stdout: Optional[TextIO] = Non
         background_workers=args.background_workers,
         background_interval_s=args.background_interval_ms / 1000.0,
         background_strategy=args.background_strategy,
+        object_lock_scheduler=args.object_lock_scheduler,
+        object_lock_priority_burst=args.object_lock_priority_burst,
+        prelock_wait_budget_s=args.prelock_wait_budget_ms / 1000.0,
+        prelock_wait_budget_mode=args.prelock_wait_budget_mode,
+        prelock_lease_mode=args.prelock_lease_mode,
     )
     (stdout or sys.stdout).write(json.dumps(report, indent=2, sort_keys=True) + "\n")
     return 0
@@ -505,7 +589,7 @@ def _comparisons(aggregates: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     if atcc is None:
         return {}
     comparisons = {}
-    for baseline_name in ("occ", "2pl-pre"):
+    for baseline_name in ("occ", "2pl"):
         baseline = by_strategy.get(baseline_name)
         if baseline is None:
             continue
@@ -546,8 +630,10 @@ def _strategy_label(row: Mapping[str, Any]) -> str:
     strategy = str(row.get("strategy", row))
     if strategy == "adaptive-op-strict":
         return "ATCC"
+    if strategy == "2pl":
+        return "2PL"
     if strategy == "2pl-pre":
-        return "2PL-pre"
+        return "2PL-pre-oracle"
     return strategy.upper()
 
 

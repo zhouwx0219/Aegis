@@ -322,6 +322,9 @@ class OperationPolicyDecision:
     atcc_global_abort_rate: float = 0.0
     atcc_global_lock_wait_s: float = 0.0
     atcc_global_latency_s: float = 0.0
+    atcc_global_lock_queue_depth: float = 0.0
+    atcc_global_lock_handoff_count: float = 0.0
+    atcc_global_committing_count: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return dataclasses.asdict(self)
@@ -863,6 +866,23 @@ class OperationPolicyTable:
             rl_enabled=False,
         )
 
+    @classmethod
+    def ycsb_strict_tuned_atcc(cls) -> "OperationPolicyTable":
+        base = cls.ycsb_atcc()
+        return dataclasses.replace(
+            base,
+            name="ycsb-strict-tuned-operation-atcc-table",
+            atcc_module=PhaseAwareATCCModule.ycsb_strict_tuned(),
+            rl_enabled=False,
+            min_feedback_observations=8,
+            exact_key_min_observations=3,
+            conflict_abort_cost=1.4,
+            lock_wait_cost_per_s=220.0,
+            lock_queue_depth_cost=0.08,
+            lock_overhead_cost=0.08,
+            hysteresis=1.25,
+        )
+
     def with_learned_state(
         self,
         artifact: Mapping[str, Any],
@@ -1102,6 +1122,15 @@ class OperationPolicyTable:
                     atcc_global_abort_rate=class_decision.global_abort_rate,
                     atcc_global_lock_wait_s=class_decision.global_lock_wait_s,
                     atcc_global_latency_s=class_decision.global_latency_s,
+                    atcc_global_lock_queue_depth=(
+                        class_decision.global_lock_queue_depth
+                    ),
+                    atcc_global_lock_handoff_count=(
+                        class_decision.global_lock_handoff_count
+                    ),
+                    atcc_global_committing_count=(
+                        class_decision.global_committing_count
+                    ),
                 )
             )
         return tuple(decisions)
@@ -1215,6 +1244,8 @@ class OperationPolicyTable:
         lock_wait_s: float = 0.0,
         lock_wait_by_object: Optional[Mapping[str, float]] = None,
         lock_queue_by_object: Optional[Mapping[str, float]] = None,
+        lock_handoff_by_object: Optional[Mapping[str, float]] = None,
+        committing_count: float = 0.0,
         latency_s: float = 0.0,
     ) -> None:
         if not self.online_feedback:
@@ -1228,6 +1259,10 @@ class OperationPolicyTable:
             str(object_id): max(0.0, float(depth))
             for object_id, depth in dict(lock_queue_by_object or {}).items()
         }
+        object_handoff_counts = {
+            str(object_id): max(0.0, float(count))
+            for object_id, count in dict(lock_handoff_by_object or {}).items()
+        }
         pessimistic_count = sum(
             1 for decision in decisions if decision.policy == "pessimistic"
         )
@@ -1237,6 +1272,8 @@ class OperationPolicyTable:
             else 0.0
         )
         phase_updates: Dict[Tuple[str, str], PhaseAwareATCCDecision] = {}
+        queue_samples: list[float] = []
+        handoff_samples: list[float] = []
         for decision in decisions:
             wait_for_decision = (
                 object_waits.get(decision.object_id, wait_per_pessimistic)
@@ -1248,6 +1285,14 @@ class OperationPolicyTable:
                 if decision.policy == "pessimistic"
                 else 0.0
             )
+            handoff_for_decision = (
+                object_handoff_counts.get(decision.object_id, 0.0)
+                if decision.policy == "pessimistic"
+                else 0.0
+            )
+            if decision.policy == "pessimistic":
+                queue_samples.append(queue_for_decision)
+                handoff_samples.append(handoff_for_decision)
             keys = (
                 decision.profile_key
                 or operation_profile_key(
@@ -1350,15 +1395,53 @@ class OperationPolicyTable:
                             getattr(decision, "atcc_global_latency_s", 0.0)
                             or 0.0
                         ),
+                        global_lock_queue_depth=float(
+                            getattr(
+                                decision,
+                                "atcc_global_lock_queue_depth",
+                                0.0,
+                            )
+                            or 0.0
+                        ),
+                        global_lock_handoff_count=float(
+                            getattr(
+                                decision,
+                                "atcc_global_lock_handoff_count",
+                                0.0,
+                            )
+                            or 0.0
+                        ),
+                        global_committing_count=float(
+                            getattr(
+                                decision,
+                                "atcc_global_committing_count",
+                                0.0,
+                            )
+                            or 0.0
+                        ),
                     ),
                 )
         if self.atcc_module is not None and phase_updates:
+            lock_queue_depth = (
+                sum(queue_samples) / len(queue_samples)
+                if queue_samples
+                else 0.0
+            )
+            lock_handoff_count = (
+                sum(handoff_samples) / len(handoff_samples)
+                if handoff_samples
+                else 0.0
+            )
+            committing_pressure = max(0.0, float(committing_count))
             self.atcc_runtime_stats.observe(
                 committed=bool(committed),
                 rejected=bool(rejected),
                 conflict_abort=bool(conflict_abort),
                 lock_wait_s=max(0.0, float(lock_wait_s)),
                 latency_s=max(0.0, float(latency_s)),
+                lock_queue_depth=lock_queue_depth,
+                lock_handoff_count=lock_handoff_count,
+                committing_count=committing_pressure,
             )
             for phase_decision in phase_updates.values():
                 self.atcc_module.update(
@@ -1368,6 +1451,9 @@ class OperationPolicyTable:
                     conflict_abort=bool(conflict_abort),
                     lock_wait_s=max(0.0, float(lock_wait_s)),
                     operation_count=len(decisions),
+                    lock_queue_depth=lock_queue_depth,
+                    lock_handoff_count=lock_handoff_count,
+                    committing_count=committing_pressure,
                 )
 
     def _rl_reward(

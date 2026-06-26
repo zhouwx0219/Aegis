@@ -10,6 +10,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from agent.native import load_cast_core
 from agent.runtime.branching import BranchSemantics, QualityRankedBranchSemantics
 from agent.runtime.cc_registry import ConcurrencyControlRegistry
+from agent.runtime.traditional_cc import TraditionalCCExecutor
 from agent.runtime.types import TransactionResult, TransactionState
 
 cc = load_cast_core()
@@ -484,6 +485,10 @@ class CostAwareCommitProtocol:
         self.branch_semantics = branch_semantics or QualityRankedBranchSemantics()
         self.lock_table = lock_table or ObjectLockTable()
         self.kernel = kernel or cc.CostAsymmetricCommit(store, model)
+        self.traditional_executor = TraditionalCCExecutor(
+            store,
+            lock_table=self.lock_table,
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -512,20 +517,8 @@ class CostAwareCommitProtocol:
         resolution = self.registry.resolve(strategy, txn)
         stats = cc.CostStats()
         regeneration_count = 0
-        while True:
+        if self.registry.is_full_traditional(resolution.requested_strategy):
             branches = self.branch_semantics.to_core_branches(txn)
-            operation_lock_targets = None
-            operation_policy_decisions = None
-            if self.registry.is_operation_adaptive(resolution.requested_strategy):
-                operation_lock_targets, operation_policy_decisions = (
-                    self.registry.pessimistic_operation_targets(txn)
-                )
-            prelocked_targets = set(getattr(txn, "prelocked_targets", ()))
-            commit_lock_targets = (
-                sorted(set(operation_lock_targets or ()) - prelocked_targets)
-                if operation_lock_targets is not None
-                else None
-            )
             txn._event(
                 "validate",
                 {
@@ -535,47 +528,86 @@ class CostAwareCommitProtocol:
                     "branch_semantics": self.branch_semantics.name,
                     "commit_protocol": self.name,
                     "candidates": len(branches),
-                    "attempt": regeneration_count,
-                    "operation_lock_targets": operation_lock_targets or [],
-                    "prelocked_targets": sorted(prelocked_targets),
-                    "commit_lock_targets": commit_lock_targets or [],
-                    "operation_policy_decisions": operation_policy_decisions or [],
+                    "attempt": 0,
+                    "operation_lock_targets": [],
+                    "prelocked_targets": sorted(
+                        set(getattr(txn, "prelocked_targets", ()))
+                    ),
+                    "commit_lock_targets": [],
+                    "operation_policy_decisions": [],
                 },
             )
-            with self.lock_table.scope_for_branches(
-                branches, resolution.module, commit_lock_targets
-            ):
-                if hasattr(txn, "_enter_prelock_committing"):
-                    txn._enter_prelock_committing()
-                try:
-                    outcome = self.kernel.commit_task(branches, resolution.module, stats)
-                finally:
-                    if hasattr(txn, "_exit_prelock_committing"):
-                        txn._exit_prelock_committing()
-
-            if not outcome.needs_regeneration:
-                break
-            if regenerator is None or regeneration_count >= max_regenerations:
-                break
-
-            regeneration_count += 1
-            stats.n_regen += 1
-            txn.snapshot = refresh_snapshot()
-            txn.read_set.clear()
-            txn.candidates.clear()
-            txn._event(
-                "regenerate",
-                {
-                    "attempt": regeneration_count,
-                    "snapshot_versions": {
-                        key: value.version for key, value in txn.snapshot.items()
+            outcome = self.traditional_executor.commit_task(
+                resolution.requested_strategy,
+                txn,
+                branches,
+                stats,
+            )
+        else:
+            while True:
+                branches = self.branch_semantics.to_core_branches(txn)
+                operation_lock_targets = None
+                operation_policy_decisions = None
+                if self.registry.is_operation_adaptive(resolution.requested_strategy):
+                    operation_lock_targets, operation_policy_decisions = (
+                        self.registry.pessimistic_operation_targets(txn)
+                    )
+                prelocked_targets = set(getattr(txn, "prelocked_targets", ()))
+                commit_lock_targets = (
+                    sorted(set(operation_lock_targets or ()) - prelocked_targets)
+                    if operation_lock_targets is not None
+                    else None
+                )
+                txn._event(
+                    "validate",
+                    {
+                        "cc": resolution.module.name,
+                        "strategy": resolution.requested_strategy,
+                        "selected_cc": resolution.selected_strategy,
+                        "branch_semantics": self.branch_semantics.name,
+                        "commit_protocol": self.name,
+                        "candidates": len(branches),
+                        "attempt": regeneration_count,
+                        "operation_lock_targets": operation_lock_targets or [],
+                        "prelocked_targets": sorted(prelocked_targets),
+                        "commit_lock_targets": commit_lock_targets or [],
+                        "operation_policy_decisions": operation_policy_decisions or [],
                     },
-                },
-            )
-            regenerator(txn)
-            if not txn.candidates:
-                raise RuntimeError("regenerator did not add any candidates")
-            resolution = self.registry.resolve(strategy, txn)
+                )
+                with self.lock_table.scope_for_branches(
+                    branches, resolution.module, commit_lock_targets
+                ):
+                    if hasattr(txn, "_enter_prelock_committing"):
+                        txn._enter_prelock_committing()
+                    try:
+                        outcome = self.kernel.commit_task(branches, resolution.module, stats)
+                    finally:
+                        if hasattr(txn, "_exit_prelock_committing"):
+                            txn._exit_prelock_committing()
+
+                if not outcome.needs_regeneration:
+                    break
+                if regenerator is None or regeneration_count >= max_regenerations:
+                    break
+
+                regeneration_count += 1
+                stats.n_regen += 1
+                txn.snapshot = refresh_snapshot()
+                txn.read_set.clear()
+                txn.candidates.clear()
+                txn._event(
+                    "regenerate",
+                    {
+                        "attempt": regeneration_count,
+                        "snapshot_versions": {
+                            key: value.version for key, value in txn.snapshot.items()
+                        },
+                    },
+                )
+                regenerator(txn)
+                if not txn.candidates:
+                    raise RuntimeError("regenerator did not add any candidates")
+                resolution = self.registry.resolve(strategy, txn)
 
         if outcome.committed:
             txn.state = TransactionState.COMMITTED

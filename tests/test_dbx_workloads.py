@@ -25,7 +25,9 @@ from agent.workloads import (
     YCSBAgentWorkload,
     YCSBFaithfulAgentWorkload,
     YCSBConfig,
+    build_agent_workload,
     execute_task,
+    prepare_task_transaction,
     register_workload,
 )
 
@@ -232,6 +234,20 @@ class PluggableConcurrencyControlTests(unittest.TestCase):
         self.assertFalse(holder.wounded)
         holder.exit_committing()
         holder.release()
+
+    def test_transaction_records_prelock_committing_pressure(self):
+        manager = AgentTransactionManager(object_lock_queue_policy="priority")
+        manager.register_object("counter", 0, kind="counter")
+        txn = manager.begin("commit-pressure", prelock_targets=("counter",))
+
+        txn._enter_prelock_committing()
+        txn._exit_prelock_committing()
+        trace = txn.to_trace()
+
+        self.assertEqual(trace["prelock_committing_enters"], 1)
+        self.assertEqual(trace["prelock_committing_exits"], 1)
+        self.assertEqual(trace["prelock_committing_target_count"], 1)
+        txn.abort("cleanup")
 
     def test_bounded_priority_lock_gives_low_priority_waiter_a_turn(self):
         manager = AgentTransactionManager(object_lock_queue_policy="bounded-priority")
@@ -521,6 +537,46 @@ class PluggableConcurrencyControlTests(unittest.TestCase):
             strategies["adaptive-op-strict"]["allows_semantic_rebase"]
         )
         self.assertEqual(strategies["2pl-pre"]["selector"], "all_operations_pessimistic")
+
+    def test_traditional_2pl_does_not_use_pre_snapshot_oracle_locks(self):
+        manager = AgentTransactionManager()
+        workload = build_agent_workload(
+            "ycsb",
+            "semantic",
+            ycsb_config=YCSBConfig(
+                record_count=4,
+                field_count=1,
+                requests_per_task=2,
+                candidates_per_task=1,
+                read_weight=0.0,
+                update_weight=1.0,
+                zipf_theta=0.0,
+            ),
+        )
+        register_workload(manager, workload)
+        task = workload.generate_tasks(1, seed=7)[0]
+
+        traditional_2pl = prepare_task_transaction(
+            manager,
+            task,
+            strategy="2pl",
+        )
+        pre_snapshot_2pl = prepare_task_transaction(
+            manager,
+            task,
+            strategy="2pl-pre",
+        )
+
+        self.assertEqual(traditional_2pl.prelocked_targets, ())
+        self.assertGreater(len(pre_snapshot_2pl.prelocked_targets), 0)
+        self.assertTrue(
+            all(
+                decision.rule == "pre-snapshot-2pl-all-operations"
+                for decision in pre_snapshot_2pl.precomputed_operation_policy_decisions
+            )
+        )
+        traditional_2pl.abort("done")
+        pre_snapshot_2pl.abort("done")
 
     def test_registered_semantic_cc_rebases_a_stale_delta(self):
         manager = AgentTransactionManager()
@@ -875,6 +931,76 @@ class PluggableConcurrencyControlTests(unittest.TestCase):
         self.assertEqual(guarded.atcc_action, "occ")
         self.assertEqual(guarded.rule, "phase-atcc-commit-occ")
 
+    def test_phase_aware_atcc_overrides_low_abort_lock_pressure_q_lock_to_occ(self):
+        policy = OperationPolicyTable.tpcc_phase_rl_atcc()
+        policy.atcc_module.learner.epsilon = 0.0
+        lock_pressure = OperationPolicyProfile(
+            object_id="tpcc:district:8:7:next_order_id",
+            access_kind="write",
+            intent_name="delta",
+            task_type="new_order",
+            workload="agent-tpcc-semantic",
+            candidate_count=4,
+            operation_count_for_object=1,
+            total_writes=6,
+            retry_count=0,
+            agent_interval_s=0.060,
+            agent_phase="refine",
+        )
+        for _ in range(4):
+            policy.atcc_runtime_stats.observe(
+                committed=True,
+                rejected=False,
+                conflict_abort=False,
+                lock_wait_s=0.020,
+                latency_s=0.080,
+                lock_queue_depth=2.0,
+                lock_handoff_count=2.0,
+                committing_count=0.0,
+            )
+
+        initial = policy.select_profiles((lock_pressure,))[0]
+        policy.atcc_module.learner.update(
+            initial.atcc_state_key,
+            "lock-write-set",
+            10.0,
+        )
+
+        guarded = policy.select_profiles((lock_pressure,))[0]
+
+        self.assertEqual(guarded.policy, "optimistic")
+        self.assertEqual(guarded.atcc_action, "occ")
+        self.assertEqual(guarded.rule, "phase-atcc-refine-occ")
+
+    def test_phase_aware_atcc_keeps_high_abort_counter_pessimistic(self):
+        policy = OperationPolicyTable.tpcc_phase_rl_atcc()
+        policy.atcc_module.learner.epsilon = 0.0
+        hot_counter = OperationPolicyProfile(
+            object_id="tpcc:district:0:0:next_order_id",
+            access_kind="write",
+            intent_name="delta",
+            task_type="new_order",
+            workload="agent-tpcc-semantic",
+            candidate_count=4,
+            operation_count_for_object=1,
+            total_writes=6,
+            retry_count=1,
+            agent_interval_s=0.120,
+            agent_phase="commit",
+        )
+        policy.atcc_runtime_stats.observe(
+            committed=False,
+            rejected=False,
+            conflict_abort=True,
+            lock_wait_s=0.0,
+            latency_s=0.120,
+        )
+
+        decision = policy.select_profiles((hot_counter,))[0]
+
+        self.assertEqual(decision.policy, "pessimistic")
+        self.assertNotEqual(decision.atcc_action, "occ")
+
     def test_phase_aware_atcc_state_tracks_retry_and_agent_interval(self):
         policy = OperationPolicyTable.ycsb_phase_rl_atcc()
         policy.atcc_module.learner.epsilon = 0.0
@@ -913,6 +1039,215 @@ class PluggableConcurrencyControlTests(unittest.TestCase):
         next_decision = policy.select_profiles((cold,))[0]
         self.assertIn("globalAbort=", next_decision.atcc_state_key)
         self.assertIn("globalLatency=", next_decision.atcc_state_key)
+
+    def test_atcc_runtime_stats_tracks_queue_pressure(self):
+        from agent.runtime.atcc import ATCCRuntimeStats
+
+        stats = ATCCRuntimeStats()
+        stats.observe(
+            committed=True,
+            rejected=False,
+            conflict_abort=False,
+            lock_wait_s=0.020,
+            latency_s=0.100,
+            lock_queue_depth=3.0,
+            lock_handoff_count=2,
+            committing_count=1,
+        )
+
+        exported = stats.to_dict()
+        self.assertEqual(exported["observations"], 1)
+        self.assertAlmostEqual(exported["ewma_lock_queue_depth"], 3.0)
+        self.assertAlmostEqual(exported["ewma_lock_handoff_count"], 2.0)
+        self.assertAlmostEqual(exported["ewma_committing_count"], 1.0)
+
+        restored = ATCCRuntimeStats.from_dict(exported)
+        self.assertEqual(restored.state_buckets()[4], "3-4")
+        self.assertEqual(restored.state_buckets()[5], "2")
+        self.assertEqual(restored.state_buckets()[6], "1")
+
+    def test_phase_aware_atcc_state_tracks_queue_pressure(self):
+        policy = OperationPolicyTable.tpcc_phase_rl_atcc()
+        policy.atcc_module.learner.epsilon = 0.0
+        profile = OperationPolicyProfile(
+            object_id="tpcc:district:1:1:next_order_id",
+            access_kind="write",
+            intent_name="delta",
+            task_type="new_order",
+            workload="agent-tpcc-semantic",
+            candidate_count=4,
+            operation_count_for_object=4,
+            total_writes=12,
+            retry_count=1,
+            agent_interval_s=0.120,
+            agent_phase="commit",
+        )
+
+        first = policy.select_profiles((profile,))[0]
+        self.assertEqual(first.policy, "pessimistic")
+        policy.observe_result(
+            (first,),
+            committed=True,
+            rejected=False,
+            conflict_abort=False,
+            lock_wait_s=0.030,
+            lock_queue_by_object={"tpcc:district:1:1:next_order_id": 4.0},
+            latency_s=0.100,
+        )
+
+        second = policy.select_profiles((profile,))[0]
+        self.assertIn("globalQueueDepth=3-4", second.atcc_state_key)
+        self.assertIn("globalHandoff=", second.atcc_state_key)
+        self.assertIn("globalCommitting=", second.atcc_state_key)
+
+    def test_phase_aware_atcc_omits_zero_queue_pressure_from_state_key(self):
+        policy = OperationPolicyTable.ycsb_phase_rl_atcc()
+        policy.atcc_module.learner.epsilon = 0.0
+        profile = OperationPolicyProfile(
+            object_id="ycsb:record:0:field:0",
+            access_kind="write",
+            intent_name="overwrite",
+            task_type="read-update",
+            workload="agent-ycsb-semantic",
+            candidate_count=4,
+            operation_count_for_object=1,
+            total_writes=4,
+            retry_count=0,
+            agent_interval_s=0.010,
+            agent_phase="commit",
+        )
+
+        decision = policy.select_profiles((profile,))[0]
+
+        self.assertNotIn("globalQueueDepth=", decision.atcc_state_key)
+        self.assertNotIn("globalHandoff=", decision.atcc_state_key)
+        self.assertNotIn("globalCommitting=", decision.atcc_state_key)
+
+    def test_phase_aware_atcc_reward_penalizes_queue_pressure(self):
+        module = OperationPolicyTable.ycsb_phase_rl_atcc().atcc_module
+        optimistic = module.reward(
+            "occ",
+            committed=True,
+            rejected=False,
+            conflict_abort=False,
+            lock_wait_s=0.0,
+            retry_count=0,
+            agent_interval_s=0.050,
+            operation_count=4,
+            lock_queue_depth=8.0,
+        )
+        pessimistic_low_queue = module.reward(
+            "lock-hot-writes",
+            committed=True,
+            rejected=False,
+            conflict_abort=False,
+            lock_wait_s=0.001,
+            retry_count=0,
+            agent_interval_s=0.050,
+            operation_count=4,
+            lock_queue_depth=0.0,
+        )
+        pessimistic_high_queue = module.reward(
+            "lock-hot-writes",
+            committed=True,
+            rejected=False,
+            conflict_abort=False,
+            lock_wait_s=0.001,
+            retry_count=0,
+            agent_interval_s=0.050,
+            operation_count=4,
+            lock_queue_depth=8.0,
+        )
+
+        self.assertEqual(optimistic, module.commit_reward)
+        self.assertLess(pessimistic_high_queue, pessimistic_low_queue)
+
+    def test_phase_aware_atcc_reward_penalizes_handoff_and_committing_pressure(self):
+        module = OperationPolicyTable.ycsb_phase_rl_atcc().atcc_module
+        pessimistic_low_pressure = module.reward(
+            "lock-hot-writes",
+            committed=True,
+            rejected=False,
+            conflict_abort=False,
+            lock_wait_s=0.001,
+            retry_count=0,
+            agent_interval_s=0.050,
+            operation_count=4,
+            lock_queue_depth=0.0,
+            lock_handoff_count=0.0,
+            committing_count=0.0,
+        )
+        pessimistic_high_pressure = module.reward(
+            "lock-hot-writes",
+            committed=True,
+            rejected=False,
+            conflict_abort=False,
+            lock_wait_s=0.001,
+            retry_count=0,
+            agent_interval_s=0.050,
+            operation_count=4,
+            lock_queue_depth=0.0,
+            lock_handoff_count=3.0,
+            committing_count=4.0,
+        )
+
+        self.assertLess(pessimistic_high_pressure, pessimistic_low_pressure)
+
+    def test_phase_aware_atcc_observes_handoff_and_committing_pressure(self):
+        policy = OperationPolicyTable.tpcc_phase_rl_atcc()
+        policy.atcc_module.learner.epsilon = 0.0
+        profile = OperationPolicyProfile(
+            object_id="tpcc:district:1:1:next_order_id",
+            access_kind="write",
+            intent_name="delta",
+            task_type="new_order",
+            workload="agent-tpcc-semantic",
+            candidate_count=4,
+            operation_count_for_object=4,
+            total_writes=12,
+            retry_count=1,
+            agent_interval_s=0.120,
+            agent_phase="commit",
+        )
+
+        first = policy.select_profiles((profile,))[0]
+        self.assertEqual(first.policy, "pessimistic")
+        policy.observe_result(
+            (first,),
+            committed=True,
+            rejected=False,
+            conflict_abort=False,
+            lock_wait_s=0.030,
+            lock_queue_by_object={"tpcc:district:1:1:next_order_id": 1.0},
+            lock_handoff_by_object={"tpcc:district:1:1:next_order_id": 2.0},
+            committing_count=3.0,
+            latency_s=0.100,
+        )
+
+        exported = policy.to_dict()["atcc_runtime_stats"]
+        self.assertAlmostEqual(exported["ewma_lock_handoff_count"], 2.0)
+        self.assertAlmostEqual(exported["ewma_committing_count"], 3.0)
+        second = policy.select_profiles((profile,))[0]
+        self.assertIn("globalHandoff=2", second.atcc_state_key)
+        self.assertIn("globalCommitting=3-4", second.atcc_state_key)
+
+    def test_phase_atcc_runtime_stats_loads_legacy_artifact_without_queue_pressure(self):
+        policy = OperationPolicyTable.ycsb_phase_rl_atcc()
+        artifact = policy.to_dict()
+        runtime = artifact["atcc_runtime_stats"]
+        runtime.pop("ewma_lock_queue_depth", None)
+        runtime.pop("ewma_lock_handoff_count", None)
+        runtime.pop("ewma_committing_count", None)
+
+        loaded = OperationPolicyTable.ycsb_phase_rl_atcc().with_learned_state(
+            artifact,
+            load_runtime_stats=True,
+        )
+
+        exported = loaded.to_dict()["atcc_runtime_stats"]
+        self.assertEqual(exported["ewma_lock_queue_depth"], 0.0)
+        self.assertEqual(exported["ewma_lock_handoff_count"], 0.0)
+        self.assertEqual(exported["ewma_committing_count"], 0.0)
 
 class AgentWorkloadTests(unittest.TestCase):
     def test_ycsb_is_deterministic_serializable_and_executable(self):

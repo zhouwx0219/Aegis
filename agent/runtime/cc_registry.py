@@ -27,6 +27,9 @@ class CCResolution:
 class ConcurrencyControlRegistry:
     """Registry for concrete CC modules and adaptive selectors."""
 
+    full_traditional_cc_names = frozenset(
+        {"2pl-nowait", "2pl-wait-die", "mvcc-full", "silo-full", "tictoc-full"}
+    )
     adaptive_cc_names = frozenset({"adaptive", "atcc", "atcc-table"})
     operation_adaptive_cc_names = frozenset(
         {"adaptive-op", "atcc-op", "operation-atcc"}
@@ -101,6 +104,59 @@ class ConcurrencyControlRegistry:
         )
         self._register_adaptive_cc_metadata()
         self._register_operation_adaptive_cc_metadata()
+        self._register_full_traditional_cc_metadata()
+
+    def _register_full_traditional_cc_metadata(self) -> None:
+        rows = {
+            "2pl-nowait": {
+                "family": "pessimistic",
+                "description": (
+                    "Full transaction-level strict 2PL using no-wait deadlock prevention"
+                ),
+                "requires_object_locks": True,
+                "lock_phase": "transaction",
+            },
+            "2pl-wait-die": {
+                "family": "pessimistic",
+                "description": (
+                    "Full transaction-level strict 2PL using wait-die deadlock prevention"
+                ),
+                "requires_object_locks": True,
+                "lock_phase": "transaction",
+            },
+            "mvcc-full": {
+                "family": "mvcc",
+                "description": "Full snapshot-isolation MVCC over agent transaction read/write sets",
+                "requires_object_locks": False,
+                "lock_phase": "",
+            },
+            "silo-full": {
+                "family": "silo",
+                "description": "Silo-style OCC with write-set locking and read-set TID validation",
+                "requires_object_locks": True,
+                "lock_phase": "commit",
+            },
+            "tictoc-full": {
+                "family": "tictoc",
+                "description": "TicToc-style timestamp validation with read/write timestamp metadata",
+                "requires_object_locks": True,
+                "lock_phase": "commit",
+            },
+        }
+        for name, metadata in rows.items():
+            self._cc_metadata[name] = {
+                "canonical_name": name,
+                "module_name": name,
+                "family": metadata["family"],
+                "description": metadata["description"],
+                "allows_semantic_rebase": False,
+                "requires_object_locks": bool(metadata["requires_object_locks"]),
+                "source": "agent-full",
+                "aliases": [],
+                "selector": "transaction_protocol",
+                "lock_phase": metadata["lock_phase"],
+                "lookup_name": name,
+            }
 
     def _register_adaptive_cc_metadata(self) -> None:
         metadata = {
@@ -260,6 +316,8 @@ class ConcurrencyControlRegistry:
     def resolve(self, strategy: str, txn: Any) -> CCResolution:
         requested = self.normalize_name(strategy)
         with self._lock:
+            if requested in self.full_traditional_cc_names:
+                return CCResolution(self._cc_modules["occ"], requested, requested)
             if requested in (
                 self.strict_operation_adaptive_cc_names
                 | self.pre_snapshot_2pl_names
@@ -292,6 +350,9 @@ class ConcurrencyControlRegistry:
             | self.strict_operation_adaptive_cc_names
             | self.pre_snapshot_2pl_names
         )
+
+    def is_full_traditional(self, strategy: str) -> bool:
+        return self.normalize_name(strategy) in self.full_traditional_cc_names
 
     def requires_pre_snapshot_locks(self, strategy: str) -> bool:
         normalized = self.normalize_name(strategy)
@@ -394,6 +455,12 @@ class ConcurrencyControlRegistry:
                 ),
                 lock_queue_by_object=dict(
                     getattr(txn, "prelock_target_queue_depth", {}) or {}
+                ),
+                lock_handoff_by_object=dict(
+                    getattr(txn, "prelock_target_handoff_count", {}) or {}
+                ),
+                committing_count=float(
+                    getattr(txn, "prelock_committing_target_count", 0.0) or 0.0
                 ),
                 latency_s=float(getattr(result, "elapsed_s", 0.0)),
             )
