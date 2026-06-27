@@ -767,6 +767,10 @@ class PhaseAwareATCCModule:
     ) -> str:
         writes = sum(1 for profile in profiles if getattr(profile, "access_kind", "") == "write")
         reads = sum(1 for profile in profiles if getattr(profile, "access_kind", "") == "read")
+        total_writes = max(
+            (int(getattr(profile, "total_writes", 0) or 0) for profile in profiles),
+            default=writes,
+        )
         if phase == "explore":
             return "occ"
         if int(retry_count) <= 0:
@@ -774,7 +778,7 @@ class PhaseAwareATCCModule:
                 return "lock-hot-writes"
             return "occ"
         if int(retry_count) >= 3 and (hot_read_ratio > 0.0 or hot_write_ratio > 0.0):
-            return "lock-read-write-set"
+            return "lock-write-set"
         if int(retry_count) >= 2 and hot_write_ratio >= 0.50:
             return "lock-write-set"
         if hot_write_ratio > 0.0:

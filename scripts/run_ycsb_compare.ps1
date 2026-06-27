@@ -6,6 +6,8 @@ param(
     [string]$StrategySet = "atcc",
 
     [string]$PolicyVariant = "ycsb-strict-tuned",
+    [ValidateSet("hold", "yield-during-planning", "yield-refresh-regenerate", "defer-until-after-planning")]
+    [string]$PrelockLeaseMode = "defer-until-after-planning",
     [int]$TaskCount = 60,
     [int]$Workers = 24,
     [string]$OutputDir = "results/handoff_ycsb_compare"
@@ -55,7 +57,7 @@ $Common = @(
     "--object-lock-priority-burst 2",
     "--prelock-wait-budget-ms 70",
     "--prelock-wait-budget-mode object",
-    "--prelock-lease-mode hold",
+    "--prelock-lease-mode $PrelockLeaseMode",
     "--policy-variant $PolicyVariant"
 ) -join " "
 

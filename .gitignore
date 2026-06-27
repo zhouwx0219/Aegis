@@ -10,8 +10,6 @@ venv/
 *.dylib
 build/
 dist/
-docs/
-results/
 
 .pytest_cache/
 .mypy_cache/

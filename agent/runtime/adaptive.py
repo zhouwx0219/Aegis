@@ -628,6 +628,12 @@ class OperationPolicyTable:
     atcc_runtime_stats: ATCCRuntimeStats = dataclasses.field(
         default_factory=ATCCRuntimeStats, compare=False
     )
+    atcc_cold_occ_fast_path: bool = False
+    atcc_fast_path_max_retry_count: int = 0
+    atcc_fast_path_max_agent_interval_s: float = 0.120
+    atcc_fast_path_max_global_abort_rate: float = 0.03
+    atcc_fast_path_max_lock_queue_depth: float = 0.0
+    atcc_fast_path_max_total_writes: int = 1
     telemetry: OperationPolicyTelemetry = dataclasses.field(
         default_factory=OperationPolicyTelemetry, compare=False
     )
@@ -770,6 +776,9 @@ class OperationPolicyTable:
             lock_overhead_cost=0.02,
             hysteresis=1.10,
             pinned_rules=("tpcc-order-counter-risk-prior",),
+            atcc_cold_occ_fast_path=True,
+            atcc_fast_path_max_agent_interval_s=0.080,
+            atcc_fast_path_max_global_abort_rate=0.02,
         )
 
     @classmethod
@@ -881,6 +890,10 @@ class OperationPolicyTable:
             lock_queue_depth_cost=0.08,
             lock_overhead_cost=0.08,
             hysteresis=1.25,
+            atcc_cold_occ_fast_path=False,
+            atcc_fast_path_max_agent_interval_s=0.120,
+            atcc_fast_path_max_global_abort_rate=0.03,
+            atcc_fast_path_max_total_writes=1,
         )
 
     def with_learned_state(
@@ -1047,6 +1060,9 @@ class OperationPolicyTable:
         module = self.atcc_module
         if module is None:
             return ()
+        fast_path = self._phase_atcc_fast_path_decisions(profiles)
+        if fast_path:
+            return fast_path
         decisions_by_class: Dict[str, PhaseAwareATCCDecision] = {}
         profiles_by_class: Dict[str, list[OperationPolicyProfile]] = {}
         for profile in profiles:
@@ -1134,6 +1150,119 @@ class OperationPolicyTable:
                 )
             )
         return tuple(decisions)
+
+    def _phase_atcc_fast_path_decisions(
+        self, profiles: Sequence[OperationPolicyProfile]
+    ) -> Tuple[OperationPolicyDecision, ...]:
+        if not self.atcc_cold_occ_fast_path or self.atcc_module is None:
+            return ()
+        rows = tuple(profiles)
+        if not rows:
+            return ()
+        max_retry = max(int(profile.retry_count) for profile in rows)
+        if max_retry > int(self.atcc_fast_path_max_retry_count):
+            return ()
+        max_interval_s = max(float(profile.agent_interval_s) for profile in rows)
+        if max_interval_s > float(self.atcc_fast_path_max_agent_interval_s):
+            return ()
+        max_total_writes = max(int(profile.total_writes) for profile in rows)
+        if max_total_writes > int(self.atcc_fast_path_max_total_writes):
+            return ()
+        runtime_stats = self.atcc_runtime_stats
+        if (
+            int(runtime_stats.observations) > 0
+            and float(runtime_stats.ewma_abort_rate)
+            > float(self.atcc_fast_path_max_global_abort_rate)
+        ):
+            return ()
+
+        decisions: list[OperationPolicyDecision] = []
+        for profile in rows:
+            object_class = operation_object_class(profile.object_id)
+            profile_key = operation_profile_key(profile, object_class=object_class)
+            exact_key = operation_profile_key(
+                profile,
+                object_class=object_class,
+                exact_object=True,
+            )
+            class_stats = self.telemetry.stats_for(profile_key)
+            exact_stats = self.telemetry.stats_for(exact_key)
+            if self._phase_atcc_fast_path_risk_seen(class_stats):
+                return ()
+            if self._phase_atcc_fast_path_risk_seen(exact_stats):
+                return ()
+            stats = exact_stats if exact_stats.observations else class_stats
+            optimistic_cost = stats.ewma_conflict_rate * float(self.conflict_abort_cost)
+            pessimistic_cost = (
+                stats.ewma_lock_wait_s * float(self.lock_wait_cost_per_s)
+                + stats.ewma_lock_queue_depth * float(self.lock_queue_depth_cost)
+                + float(self.lock_overhead_cost)
+            )
+            decisions.append(
+                OperationPolicyDecision(
+                    object_id=profile.object_id,
+                    access_kind=profile.access_kind,
+                    intent_name=profile.intent_name,
+                    policy="optimistic",
+                    rule="phase-atcc-fastpath-occ",
+                    task_type=profile.task_type,
+                    workload=profile.workload,
+                    candidate_count=profile.candidate_count,
+                    operation_count_for_object=profile.operation_count_for_object,
+                    total_writes=profile.total_writes,
+                    retry_count=profile.retry_count,
+                    agent_interval_s=profile.agent_interval_s,
+                    agent_phase=profile.agent_phase,
+                    object_class=object_class,
+                    profile_key=profile_key,
+                    exact_key=exact_key,
+                    optimistic_cost=optimistic_cost,
+                    pessimistic_cost=pessimistic_cost,
+                    telemetry_observations=stats.observations,
+                    atcc_state_key=(
+                        f"fastpath=occ|workload={profile.workload}|"
+                        f"task={profile.task_type}|class={object_class}|"
+                        f"retry={max_retry}"
+                    ),
+                    atcc_action="occ",
+                    atcc_phase="fastpath-occ",
+                    atcc_priority=0,
+                    atcc_explore=False,
+                    atcc_global_abort_rate=float(
+                        self.atcc_runtime_stats.ewma_abort_rate
+                    ),
+                    atcc_global_lock_wait_s=float(
+                        self.atcc_runtime_stats.ewma_lock_wait_s
+                    ),
+                    atcc_global_latency_s=float(
+                        self.atcc_runtime_stats.ewma_latency_s
+                    ),
+                    atcc_global_lock_queue_depth=float(
+                        self.atcc_runtime_stats.ewma_lock_queue_depth
+                    ),
+                    atcc_global_lock_handoff_count=float(
+                        self.atcc_runtime_stats.ewma_lock_handoff_count
+                    ),
+                    atcc_global_committing_count=float(
+                        self.atcc_runtime_stats.ewma_committing_count
+                    ),
+                )
+            )
+        return tuple(decisions)
+
+    def _phase_atcc_fast_path_risk_seen(self, stats: OperationPolicyStats) -> bool:
+        module = self.atcc_module
+        if module is None or int(stats.observations) <= 0:
+            return False
+        if int(stats.observations) < int(module.min_hot_observations):
+            return False
+        if float(stats.ewma_conflict_rate) >= float(module.hot_conflict_threshold):
+            return True
+        if float(stats.ewma_lock_wait_s) >= float(module.hot_lock_wait_threshold_s):
+            return True
+        return float(stats.ewma_lock_queue_depth) > float(
+            self.atcc_fast_path_max_lock_queue_depth
+        )
 
     def _rl_state_key_for_profile(
         self,
@@ -1498,6 +1627,20 @@ class OperationPolicyTable:
             "rl_learner": self.rl_learner.to_dict(),
             "atcc_module": self.atcc_module.to_dict() if self.atcc_module else None,
             "atcc_runtime_stats": self.atcc_runtime_stats.to_dict(),
+            "atcc_cold_occ_fast_path": self.atcc_cold_occ_fast_path,
+            "atcc_fast_path_max_retry_count": self.atcc_fast_path_max_retry_count,
+            "atcc_fast_path_max_agent_interval_s": (
+                self.atcc_fast_path_max_agent_interval_s
+            ),
+            "atcc_fast_path_max_global_abort_rate": (
+                self.atcc_fast_path_max_global_abort_rate
+            ),
+            "atcc_fast_path_max_lock_queue_depth": (
+                self.atcc_fast_path_max_lock_queue_depth
+            ),
+            "atcc_fast_path_max_total_writes": (
+                self.atcc_fast_path_max_total_writes
+            ),
             "telemetry": self.telemetry.to_dict(),
         }
 

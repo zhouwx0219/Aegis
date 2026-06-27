@@ -13,7 +13,7 @@
 - MVCC
 - SILO
 - TicToc
-- ATCC / `adaptive-op-strict`
+- ATCC 
 
 ## 1. 项目结构
 
