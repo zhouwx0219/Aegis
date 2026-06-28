@@ -13,6 +13,7 @@ from agent.runtime.adaptive import (
     OperationPolicyTable,
     profile_agent_operations,
 )
+from agent.runtime.atcc import TransactionAwareATCCModule
 
 cc = load_cast_core()
 
@@ -37,6 +38,13 @@ class ConcurrencyControlRegistry:
     strict_operation_adaptive_cc_names = frozenset(
         {"adaptive-op-strict", "atcc-op-strict", "operation-atcc-strict"}
     )
+    transaction_adaptive_cc_names = frozenset(
+        {
+            "transaction-atcc-strict",
+            "atcc-tx-strict",
+            "transaction-aware-atcc",
+        }
+    )
     pre_snapshot_2pl_names = frozenset(
         {"2pl-pre", "pre-snapshot-2pl", "strict-2pl-pre"}
     )
@@ -46,12 +54,16 @@ class ConcurrencyControlRegistry:
         *,
         adaptive_policy: Optional[AdaptivePolicyTable] = None,
         operation_policy: Optional[OperationPolicyTable] = None,
+        transaction_atcc_policy: Optional[TransactionAwareATCCModule] = None,
     ):
         self._lock = threading.RLock()
         self._cc_modules: Dict[str, Any] = {}
         self._cc_metadata: Dict[str, Dict[str, Any]] = {}
         self._adaptive_policy = adaptive_policy or AdaptivePolicyTable.default()
         self._operation_policy = operation_policy or OperationPolicyTable.default()
+        self._transaction_atcc_policy = (
+            transaction_atcc_policy or TransactionAwareATCCModule.default()
+        )
         self._install_builtin_cc_modules()
 
     @staticmethod
@@ -104,6 +116,7 @@ class ConcurrencyControlRegistry:
         )
         self._register_adaptive_cc_metadata()
         self._register_operation_adaptive_cc_metadata()
+        self._register_transaction_adaptive_cc_metadata()
         self._register_full_traditional_cc_metadata()
 
     def _register_full_traditional_cc_metadata(self) -> None:
@@ -243,6 +256,31 @@ class ConcurrencyControlRegistry:
             alias_metadata["lookup_name"] = name
             self._cc_metadata[name] = alias_metadata
 
+    def _register_transaction_adaptive_cc_metadata(self) -> None:
+        metadata = {
+            "canonical_name": "transaction-atcc-strict",
+            "module_name": "transaction-aware-atcc",
+            "family": "adaptive-transaction",
+            "description": (
+                "Transaction-context ATCC with one phase-level action, hot/cold "
+                "read/write set protection, and an OCC fast path"
+            ),
+            "allows_semantic_rebase": False,
+            "requires_object_locks": True,
+            "source": "agent",
+            "aliases": sorted(
+                self.transaction_adaptive_cc_names - {"transaction-atcc-strict"}
+            ),
+            "selector": "transaction_policy_table",
+            "base_strategy": "occ",
+            "lock_phase": "pre_snapshot",
+            "transaction_policy_table": self._transaction_atcc_policy.to_dict(),
+        }
+        for name in self.transaction_adaptive_cc_names:
+            alias_metadata = dict(metadata)
+            alias_metadata["lookup_name"] = name
+            self._cc_metadata[name] = alias_metadata
+
     def register_cc(
         self,
         name: str,
@@ -313,6 +351,13 @@ class ConcurrencyControlRegistry:
             self._operation_policy = policy
             self._register_operation_adaptive_cc_metadata()
 
+    def set_transaction_atcc_policy(self, policy: TransactionAwareATCCModule) -> None:
+        if not isinstance(policy, TransactionAwareATCCModule):
+            raise TypeError("policy must be a TransactionAwareATCCModule")
+        with self._lock:
+            self._transaction_atcc_policy = policy
+            self._register_transaction_adaptive_cc_metadata()
+
     def resolve(self, strategy: str, txn: Any) -> CCResolution:
         requested = self.normalize_name(strategy)
         with self._lock:
@@ -320,11 +365,14 @@ class ConcurrencyControlRegistry:
                 return CCResolution(self._cc_modules["occ"], requested, requested)
             if requested in (
                 self.strict_operation_adaptive_cc_names
+                | self.transaction_adaptive_cc_names
                 | self.pre_snapshot_2pl_names
             ):
                 selected = (
                     "adaptive-op-strict"
                     if requested in self.strict_operation_adaptive_cc_names
+                    else "transaction-atcc-strict"
+                    if requested in self.transaction_adaptive_cc_names
                     else "2pl-pre"
                 )
                 return CCResolution(self._cc_modules["occ"], requested, selected)
@@ -348,6 +396,7 @@ class ConcurrencyControlRegistry:
         return normalized in (
             self.operation_adaptive_cc_names
             | self.strict_operation_adaptive_cc_names
+            | self.transaction_adaptive_cc_names
             | self.pre_snapshot_2pl_names
         )
 
@@ -358,11 +407,15 @@ class ConcurrencyControlRegistry:
         normalized = self.normalize_name(strategy)
         return normalized in (
             self.strict_operation_adaptive_cc_names
+            | self.transaction_adaptive_cc_names
             | self.pre_snapshot_2pl_names
         )
 
     def records_operation_feedback(self, strategy: str) -> bool:
-        return self.normalize_name(strategy) in self.strict_operation_adaptive_cc_names
+        return self.normalize_name(strategy) in (
+            self.strict_operation_adaptive_cc_names
+            | self.transaction_adaptive_cc_names
+        )
 
     def pre_snapshot_operation_plan(
         self,
@@ -376,6 +429,48 @@ class ConcurrencyControlRegistry:
             candidates = _scope_agent_candidates(candidates, metadata=metadata)
             decisions = self._operation_policy.select_agent_operations(
                 candidates, metadata=metadata
+            )
+        elif normalized in self.transaction_adaptive_cc_names:
+            candidates = _scope_agent_candidates(candidates, metadata=metadata)
+            profiles = profile_agent_operations(candidates, metadata=metadata)
+            transaction_decision = self._transaction_atcc_policy.select_transaction(
+                profiles
+            )
+            target_set = set(transaction_decision.prelock_targets)
+            decisions = tuple(
+                OperationPolicyDecision(
+                    object_id=profile.object_id,
+                    access_kind=profile.access_kind,
+                    intent_name=profile.intent_name,
+                    policy=(
+                        "pessimistic"
+                        if profile.object_id in target_set
+                        else "optimistic"
+                    ),
+                    rule=(
+                        "transaction-atcc-occ-fast-path"
+                        if transaction_decision.fast_path
+                        else f"transaction-atcc-{transaction_decision.action}"
+                    ),
+                    task_type=profile.task_type,
+                    workload=profile.workload,
+                    candidate_count=profile.candidate_count,
+                    operation_count_for_object=profile.operation_count_for_object,
+                    total_writes=profile.total_writes,
+                    retry_count=profile.retry_count,
+                    agent_interval_s=profile.agent_interval_s,
+                    agent_phase=profile.agent_phase,
+                    atcc_state_key=transaction_decision.state_key,
+                    atcc_action=transaction_decision.action,
+                    atcc_phase=transaction_decision.phase,
+                    atcc_priority=transaction_decision.priority,
+                    atcc_explore=transaction_decision.explore,
+                    atcc_q_values=transaction_decision.q_values,
+                    atcc_global_abort_rate=transaction_decision.global_abort_rate,
+                    atcc_global_lock_wait_s=transaction_decision.global_lock_wait_s,
+                    atcc_global_latency_s=transaction_decision.global_latency_s,
+                )
+                for profile in profiles
             )
         elif normalized in self.pre_snapshot_2pl_names:
             decisions = tuple(
@@ -444,27 +539,37 @@ class ConcurrencyControlRegistry:
             and getattr(result, "action", "") in {"regenerate_required", "abort"}
         )
         with self._lock:
-            self._operation_policy.observe_result(
-                decisions,
-                committed=bool(getattr(result, "committed", False)),
-                rejected=bool(getattr(result, "rejected", False)),
-                conflict_abort=bool(conflict_abort),
-                conflict_object_ids=conflict_object_ids,
-                lock_wait_s=float(getattr(txn, "prelock_wait_s", 0.0)),
-                lock_wait_by_object=dict(
-                    getattr(txn, "prelock_target_wait_s", {}) or {}
-                ),
-                lock_queue_by_object=dict(
-                    getattr(txn, "prelock_target_queue_depth", {}) or {}
-                ),
-                lock_handoff_by_object=dict(
-                    getattr(txn, "prelock_target_handoff_count", {}) or {}
-                ),
-                committing_count=float(
-                    getattr(txn, "prelock_committing_target_count", 0.0) or 0.0
-                ),
-                latency_s=float(getattr(result, "elapsed_s", 0.0)),
-            )
+            if self.normalize_name(strategy) in self.transaction_adaptive_cc_names:
+                self._transaction_atcc_policy.observe_decisions(
+                    decisions,
+                    committed=bool(getattr(result, "committed", False)),
+                    rejected=bool(getattr(result, "rejected", False)),
+                    conflict_abort=bool(conflict_abort),
+                    lock_wait_s=float(getattr(txn, "prelock_wait_s", 0.0)),
+                    latency_s=float(getattr(result, "elapsed_s", 0.0)),
+                )
+            else:
+                self._operation_policy.observe_result(
+                    decisions,
+                    committed=bool(getattr(result, "committed", False)),
+                    rejected=bool(getattr(result, "rejected", False)),
+                    conflict_abort=bool(conflict_abort),
+                    conflict_object_ids=conflict_object_ids,
+                    lock_wait_s=float(getattr(txn, "prelock_wait_s", 0.0)),
+                    lock_wait_by_object=dict(
+                        getattr(txn, "prelock_target_wait_s", {}) or {}
+                    ),
+                    lock_queue_by_object=dict(
+                        getattr(txn, "prelock_target_queue_depth", {}) or {}
+                    ),
+                    lock_handoff_by_object=dict(
+                        getattr(txn, "prelock_target_handoff_count", {}) or {}
+                    ),
+                    committing_count=float(
+                        getattr(txn, "prelock_committing_target_count", 0.0) or 0.0
+                    ),
+                    latency_s=float(getattr(result, "elapsed_s", 0.0)),
+                )
 
 
 def _scope_agent_candidates(

@@ -42,9 +42,9 @@ if ($PolicyEpsilon -ge 0.0) {
 }
 
 $Strategies = if ($StrategySet -eq "full") {
-    "occ,2pl-nowait,2pl-wait-die,mvcc-full,silo-full,tictoc-full,adaptive-op-strict,adaptive-hybrid"
+    "occ,2pl-nowait,2pl-wait-die,mvcc-full,silo-full,tictoc-full,adaptive-op-strict,transaction-atcc-strict,adaptive-hybrid"
 } else {
-    "occ,tictoc-full,adaptive-op-strict,adaptive-hybrid"
+    "occ,tictoc-full,adaptive-op-strict,transaction-atcc-strict,adaptive-hybrid"
 }
 
 $Profiles = if ($Profile -eq "all") { @("low", "medium", "high") } else { @($Profile) }

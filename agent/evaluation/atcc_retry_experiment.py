@@ -21,7 +21,12 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, TextIO, Tuple
 
 from agent.evaluation.atcc_schema import atcc_artifact_schema_status
-from agent.runtime import AgentTransactionManager, OperationPolicyTable, TransactionState
+from agent.runtime import (
+    AgentTransactionManager,
+    OperationPolicyTable,
+    TransactionAwareATCCModule,
+    TransactionState,
+)
 from agent.runtime.adaptive import operation_object_class
 from agent.runtime.hybrid import ATCCFamilyPolicyTable, is_atcc_family_strategy
 from agent.workloads import (
@@ -1619,6 +1624,7 @@ def _run_one_retry(
     )
     manager = AgentTransactionManager(
         operation_policy=policy,
+        transaction_atcc_policy=_transaction_atcc_policy(workload_kind),
         object_lock_queue_policy=object_lock_scheduler,
         object_lock_priority_burst=object_lock_priority_burst,
         prelock_wait_budget_s=prelock_wait_budget_s,
@@ -1695,6 +1701,9 @@ def _run_one_retry(
             and interaction_gate is not None
         )
         for attempt in range(max_attempts):
+            strict_atcc = manager.cc_registry.records_operation_feedback(
+                execution_strategy
+            )
             delay_s = _sample_latency_s(
                 rng,
                 mean_s=planning_delay_s,
@@ -1704,7 +1713,7 @@ def _run_one_retry(
             )
             defer_prelocks = (
                 str(prelock_lease_mode) == "defer-until-after-planning"
-                and str(execution_strategy) == "adaptive-op-strict"
+                and strict_atcc
                 and execution_mode == "legacy"
             )
             admitted = False
@@ -1715,9 +1724,7 @@ def _run_one_retry(
                 if execution_mode in {"staged", "staged-local"}:
                     stage_local_atcc = (
                         execution_mode == "staged-local"
-                        and manager.cc_registry.records_operation_feedback(
-                            execution_strategy
-                        )
+                        and strict_atcc
                     )
                     stage_delays = _stage_delay_plan(task, delay_s)
                     if timing == "after-planning":
@@ -1807,7 +1814,7 @@ def _run_one_retry(
                     should_yield_prelocks = (
                         str(prelock_lease_mode)
                         in {"yield-during-planning", "yield-refresh-regenerate"}
-                        and str(execution_strategy) == "adaptive-op-strict"
+                        and strict_atcc
                         and txn.state == TransactionState.ACTIVE
                         and bool(txn.prelocked_targets)
                         and not stage_local_atcc
@@ -1817,7 +1824,7 @@ def _run_one_retry(
                         and (
                             should_yield_prelocks
                             or (
-                                str(execution_strategy) == "adaptive-op-strict"
+                                strict_atcc
                                 and _task_has_hotspot_refresh_pressure(task)
                             )
                         )
@@ -1952,7 +1959,7 @@ def _run_one_retry(
                 should_yield_prelocks = (
                     str(prelock_lease_mode)
                     in {"yield-during-planning", "yield-refresh-regenerate"}
-                    and str(execution_strategy) == "adaptive-op-strict"
+                    and strict_atcc
                     and txn.state == TransactionState.ACTIVE
                 )
                 should_refresh_regenerate = (
@@ -2287,6 +2294,13 @@ def _operation_policy(
             policy_epsilon=policy_epsilon,
         )
     return policy
+
+
+def _transaction_atcc_policy(workload_kind: str) -> TransactionAwareATCCModule:
+    workload = str(workload_kind or "").strip().lower()
+    if workload == "tpcc" or "tpcc" in workload:
+        return TransactionAwareATCCModule.tpcc()
+    return TransactionAwareATCCModule.ycsb()
 
 
 def _run_background_worker(
@@ -3387,7 +3401,7 @@ def _can_object_refresh_commit_writes(
 
 
 def _operation_candidate_scope(task: AgentTask, strategy: str) -> str:
-    if str(strategy) != "adaptive-op-strict":
+    if str(strategy) not in {"adaptive-op-strict", "transaction-atcc-strict"}:
         return "all"
     if not _can_object_refresh_commit_writes(task, yielded_prelocks=False):
         return "all"

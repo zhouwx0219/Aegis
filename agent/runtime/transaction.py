@@ -15,6 +15,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from agent.native import load_cast_core
 from agent.runtime.adaptive import AdaptivePolicyTable, OperationPolicyTable
+from agent.runtime.atcc import TransactionAwareATCCModule
 from agent.runtime.branching import (
     BranchSemantics,
     CandidateDraft,
@@ -657,6 +658,7 @@ class AgentTransactionManager:
         store: Optional[Any] = None,
         adaptive_policy: Optional[AdaptivePolicyTable] = None,
         operation_policy: Optional[OperationPolicyTable] = None,
+        transaction_atcc_policy: Optional[TransactionAwareATCCModule] = None,
         branch_semantics: Optional[BranchSemantics] = None,
         cc_registry: Optional[ConcurrencyControlRegistry] = None,
         commit_protocol: Optional[Any] = None,
@@ -674,12 +676,15 @@ class AgentTransactionManager:
         self.cc_registry = cc_registry or ConcurrencyControlRegistry(
             adaptive_policy=adaptive_policy,
             operation_policy=operation_policy,
+            transaction_atcc_policy=transaction_atcc_policy,
         )
         if cc_registry is not None:
             if adaptive_policy is not None:
                 self.cc_registry.set_adaptive_policy(adaptive_policy)
             if operation_policy is not None:
                 self.cc_registry.set_operation_policy(operation_policy)
+            if transaction_atcc_policy is not None:
+                self.cc_registry.set_transaction_atcc_policy(transaction_atcc_policy)
 
         self.branch_semantics = branch_semantics or QualityRankedBranchSemantics()
         self.object_locks = ObjectLockTable(

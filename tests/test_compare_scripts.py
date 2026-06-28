@@ -21,6 +21,7 @@ class CompareScriptContractTests(unittest.TestCase):
         self.assertIn("--policy-epsilon", script)
         self.assertIn("Convert-ToWslPath $PolicyArtifact", script)
         self.assertIn("adaptive-hybrid", script)
+        self.assertIn("transaction-atcc-strict", script)
 
     def test_tpcc_compare_accepts_policy_artifact(self):
         script = (REPO_ROOT / "scripts" / "run_tpcc_compare.ps1").read_text(
@@ -33,6 +34,7 @@ class CompareScriptContractTests(unittest.TestCase):
         self.assertIn("--policy-epsilon", script)
         self.assertIn("Convert-ToWslPath $PolicyArtifact", script)
         self.assertIn("adaptive-hybrid", script)
+        self.assertIn("transaction-atcc-strict", script)
 
     def test_compare_scripts_append_optional_policy_args_before_join(self):
         for name in ("run_ycsb_compare.ps1", "run_tpcc_compare.ps1"):

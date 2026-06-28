@@ -1074,6 +1074,609 @@ class PhaseAwareATCCModule:
         )
 
 
+@dataclasses.dataclass(frozen=True)
+class TransactionAwareATCCDecision:
+    """One ATCC action for a whole agent transaction."""
+
+    state_key: str
+    action: str
+    phase: str
+    priority: int
+    fast_path: bool
+    explore: bool
+    q_values: Mapping[str, float]
+    read_set: Tuple[str, ...]
+    write_set: Tuple[str, ...]
+    hot_read_set: Tuple[str, ...]
+    hot_write_set: Tuple[str, ...]
+    cold_read_set: Tuple[str, ...]
+    cold_write_set: Tuple[str, ...]
+    prelock_targets: Tuple[str, ...]
+    retry_count: int
+    agent_interval_s: float
+    global_abort_rate: float = 0.0
+    global_lock_wait_s: float = 0.0
+    global_latency_s: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return dataclasses.asdict(self)
+
+
+class TransactionAwareATCCModule:
+    """Transaction-context ATCC table closer to the original paper shape.
+
+    The operation-level table decides one object at a time.  This module first
+    summarizes the whole agent transaction, picks a single ATCC action, then
+    derives the protected hot/cold read/write sets from that action.
+    """
+
+    ACTIONS: Tuple[ATCCActionSpec, ...] = PhaseAwareATCCModule.ACTIONS
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        learner: Optional[ATCCPolicyQLearner] = None,
+        hot_conflict_threshold: float = 0.20,
+        hot_lock_wait_threshold_s: float = 0.050,
+        min_hot_observations: int = 2,
+        commit_reward: float = 1.0,
+        abort_penalty: float = 2.0,
+        reject_penalty: float = 0.5,
+        lock_wait_cost_per_s: float = 80.0,
+        lock_action_cost: float = 0.02,
+        interval_cost_per_s: float = 1.0,
+    ):
+        self.name = str(name)
+        self.action_specs = {spec.name: spec for spec in self.ACTIONS}
+        self.learner = learner or ATCCPolicyQLearner(
+            tuple(self.action_specs),
+            learning_rate=0.20,
+            epsilon=0.0,
+            min_epsilon=0.0,
+            epsilon_decay=1.0,
+            seed=2706,
+        )
+        self.hot_conflict_threshold = float(hot_conflict_threshold)
+        self.hot_lock_wait_threshold_s = float(hot_lock_wait_threshold_s)
+        self.min_hot_observations = int(min_hot_observations)
+        self.commit_reward = float(commit_reward)
+        self.abort_penalty = float(abort_penalty)
+        self.reject_penalty = float(reject_penalty)
+        self.lock_wait_cost_per_s = float(lock_wait_cost_per_s)
+        self.lock_action_cost = float(lock_action_cost)
+        self.interval_cost_per_s = float(interval_cost_per_s)
+        self.runtime_stats = ATCCRuntimeStats()
+
+    @classmethod
+    def tpcc(cls) -> "TransactionAwareATCCModule":
+        return cls(
+            name="tpcc-transaction-aware-atcc",
+            learner=ATCCPolicyQLearner(
+                tuple(spec.name for spec in cls.ACTIONS),
+                learning_rate=0.25,
+                epsilon=0.0,
+                min_epsilon=0.0,
+                epsilon_decay=1.0,
+                seed=2604,
+            ),
+            hot_conflict_threshold=0.15,
+            hot_lock_wait_threshold_s=0.080,
+            min_hot_observations=2,
+            abort_penalty=3.0,
+            lock_wait_cost_per_s=70.0,
+            interval_cost_per_s=2.0,
+        )
+
+    @classmethod
+    def ycsb(cls) -> "TransactionAwareATCCModule":
+        return cls(
+            name="ycsb-transaction-aware-atcc",
+            learner=ATCCPolicyQLearner(
+                tuple(spec.name for spec in cls.ACTIONS),
+                learning_rate=0.20,
+                epsilon=0.0,
+                min_epsilon=0.0,
+                epsilon_decay=1.0,
+                seed=13908,
+            ),
+            hot_conflict_threshold=0.20,
+            hot_lock_wait_threshold_s=0.030,
+            min_hot_observations=1,
+            abort_penalty=2.0,
+            lock_wait_cost_per_s=180.0,
+            lock_action_cost=0.04,
+            interval_cost_per_s=1.2,
+        )
+
+    @classmethod
+    def default(cls) -> "TransactionAwareATCCModule":
+        return cls.ycsb()
+
+    def select_transaction(
+        self,
+        profiles: Sequence[Any],
+        *,
+        runtime_stats: Optional[ATCCRuntimeStats] = None,
+    ) -> TransactionAwareATCCDecision:
+        rows = tuple(profiles)
+        stats = runtime_stats or self.runtime_stats
+        phase = self._infer_phase(rows)
+        retry_count = max(
+            (int(getattr(profile, "retry_count", 0) or 0) for profile in rows),
+            default=0,
+        )
+        interval_s = max(
+            (
+                float(getattr(profile, "agent_interval_s", 0.0) or 0.0)
+                for profile in rows
+            ),
+            default=0.0,
+        )
+        read_set, write_set, hot_read_set, hot_write_set = self._partition_sets(rows)
+        cold_read_set = tuple(object_id for object_id in read_set if object_id not in hot_read_set)
+        cold_write_set = tuple(
+            object_id for object_id in write_set if object_id not in hot_write_set
+        )
+        priority = self._priority_score(
+            operation_count=len(rows),
+            retry_count=retry_count,
+            agent_interval_s=interval_s,
+            hot_read_count=len(hot_read_set),
+            hot_write_count=len(hot_write_set),
+            global_abort_rate=stats.ewma_abort_rate,
+        )
+        prior = self._prior_action(
+            phase=phase,
+            retry_count=retry_count,
+            agent_interval_s=interval_s,
+            read_count=len(read_set),
+            write_count=len(write_set),
+            hot_read_count=len(hot_read_set),
+            hot_write_count=len(hot_write_set),
+            global_abort_rate=stats.ewma_abort_rate,
+        )
+        state_key = self._state_key(
+            rows,
+            phase=phase,
+            retry_count=retry_count,
+            agent_interval_s=interval_s,
+            priority=priority,
+            read_count=len(read_set),
+            write_count=len(write_set),
+            hot_read_count=len(hot_read_set),
+            hot_write_count=len(hot_write_set),
+            runtime_stats=stats,
+        )
+        if self._is_occ_fast_path(
+            phase=phase,
+            retry_count=retry_count,
+            agent_interval_s=interval_s,
+            hot_read_count=len(hot_read_set),
+            hot_write_count=len(hot_write_set),
+            runtime_stats=stats,
+            prior_action=prior,
+        ):
+            action = "occ"
+            explore = False
+            q_values = self.learner.q_values(state_key)
+            fast_path = True
+        else:
+            action, explore, q_values = self.learner.select(
+                state_key,
+                prior_action=prior,
+            )
+            fast_path = False
+        prelock_targets = self._prelock_targets(
+            action,
+            read_set=read_set,
+            write_set=write_set,
+            hot_read_set=hot_read_set,
+            hot_write_set=hot_write_set,
+        )
+        return TransactionAwareATCCDecision(
+            state_key=state_key,
+            action=action,
+            phase=phase,
+            priority=priority,
+            fast_path=fast_path,
+            explore=explore,
+            q_values=q_values,
+            read_set=read_set,
+            write_set=write_set,
+            hot_read_set=hot_read_set,
+            hot_write_set=hot_write_set,
+            cold_read_set=cold_read_set,
+            cold_write_set=cold_write_set,
+            prelock_targets=prelock_targets,
+            retry_count=retry_count,
+            agent_interval_s=interval_s,
+            global_abort_rate=stats.ewma_abort_rate,
+            global_lock_wait_s=stats.ewma_lock_wait_s,
+            global_latency_s=stats.ewma_latency_s,
+        )
+
+    def observe_result(
+        self,
+        decision: TransactionAwareATCCDecision,
+        *,
+        committed: bool,
+        rejected: bool,
+        conflict_abort: bool,
+        lock_wait_s: float,
+        latency_s: float,
+    ) -> float:
+        self.runtime_stats.observe(
+            committed=bool(committed),
+            rejected=bool(rejected),
+            conflict_abort=bool(conflict_abort),
+            lock_wait_s=float(lock_wait_s),
+            latency_s=float(latency_s),
+        )
+        reward = self._reward(
+            decision.action,
+            committed=committed,
+            rejected=rejected,
+            conflict_abort=conflict_abort,
+            lock_wait_s=lock_wait_s,
+            retry_count=decision.retry_count,
+            agent_interval_s=decision.agent_interval_s,
+            operation_count=len(decision.read_set) + len(decision.write_set),
+        )
+        self.learner.update(decision.state_key, decision.action, reward)
+        return reward
+
+    def observe_decisions(
+        self,
+        decisions: Sequence[Any],
+        *,
+        committed: bool,
+        rejected: bool,
+        conflict_abort: bool,
+        lock_wait_s: float,
+        latency_s: float,
+    ) -> float:
+        rows = tuple(decisions)
+        if not rows:
+            return 0.0
+        first = rows[0]
+        decision = TransactionAwareATCCDecision(
+            state_key=str(getattr(first, "atcc_state_key", "")),
+            action=str(getattr(first, "atcc_action", "occ") or "occ"),
+            phase=str(getattr(first, "atcc_phase", "")),
+            priority=int(getattr(first, "atcc_priority", 0) or 0),
+            fast_path=str(getattr(first, "rule", "")) == "transaction-atcc-occ-fast-path",
+            explore=bool(getattr(first, "atcc_explore", False)),
+            q_values=dict(getattr(first, "atcc_q_values", {}) or {}),
+            read_set=tuple(
+                sorted(
+                    {
+                        str(getattr(row, "object_id", ""))
+                        for row in rows
+                        if getattr(row, "access_kind", "") == "read"
+                    }
+                )
+            ),
+            write_set=tuple(
+                sorted(
+                    {
+                        str(getattr(row, "object_id", ""))
+                        for row in rows
+                        if getattr(row, "access_kind", "") == "write"
+                    }
+                )
+            ),
+            hot_read_set=(),
+            hot_write_set=tuple(
+                sorted(
+                    {
+                        str(getattr(row, "object_id", ""))
+                        for row in rows
+                        if getattr(row, "policy", "") == "pessimistic"
+                    }
+                )
+            ),
+            cold_read_set=(),
+            cold_write_set=(),
+            prelock_targets=tuple(
+                sorted(
+                    {
+                        str(getattr(row, "object_id", ""))
+                        for row in rows
+                        if getattr(row, "policy", "") == "pessimistic"
+                    }
+                )
+            ),
+            retry_count=max(
+                (int(getattr(row, "retry_count", 0) or 0) for row in rows),
+                default=0,
+            ),
+            agent_interval_s=max(
+                (float(getattr(row, "agent_interval_s", 0.0) or 0.0) for row in rows),
+                default=0.0,
+            ),
+        )
+        return self.observe_result(
+            decision,
+            committed=committed,
+            rejected=rejected,
+            conflict_abort=conflict_abort,
+            lock_wait_s=lock_wait_s,
+            latency_s=latency_s,
+        )
+
+    def _partition_sets(
+        self,
+        profiles: Sequence[Any],
+    ) -> Tuple[Tuple[str, ...], Tuple[str, ...], Tuple[str, ...], Tuple[str, ...]]:
+        read_set = sorted(
+            {
+                str(getattr(profile, "object_id", ""))
+                for profile in profiles
+                if getattr(profile, "access_kind", "") == "read"
+            }
+        )
+        write_set = sorted(
+            {
+                str(getattr(profile, "object_id", ""))
+                for profile in profiles
+                if getattr(profile, "access_kind", "") == "write"
+            }
+        )
+        hot_read_set = sorted(
+            object_id
+            for object_id in read_set
+            if any(
+                str(getattr(profile, "object_id", "")) == object_id
+                and self._is_hot_profile(profile)
+                for profile in profiles
+            )
+        )
+        hot_write_set = sorted(
+            object_id
+            for object_id in write_set
+            if any(
+                str(getattr(profile, "object_id", "")) == object_id
+                and self._is_hot_profile(profile)
+                for profile in profiles
+            )
+        )
+        return (
+            tuple(read_set),
+            tuple(write_set),
+            tuple(hot_read_set),
+            tuple(hot_write_set),
+        )
+
+    def _prelock_targets(
+        self,
+        action: str,
+        *,
+        read_set: Sequence[str],
+        write_set: Sequence[str],
+        hot_read_set: Sequence[str],
+        hot_write_set: Sequence[str],
+    ) -> Tuple[str, ...]:
+        if action == "lock-hot-writes":
+            return tuple(sorted(set(hot_write_set)))
+        if action == "lock-hot-read-write":
+            return tuple(sorted(set(hot_read_set) | set(hot_write_set)))
+        if action == "lock-write-set":
+            return tuple(sorted(set(write_set)))
+        if action == "lock-read-write-set":
+            return tuple(sorted(set(read_set) | set(write_set)))
+        return ()
+
+    def _infer_phase(self, profiles: Sequence[Any]) -> str:
+        explicit = sorted(
+            {
+                str(getattr(profile, "agent_phase", ""))
+                for profile in profiles
+                if str(getattr(profile, "agent_phase", ""))
+            }
+        )
+        if explicit:
+            return explicit[0]
+        writes = sum(1 for profile in profiles if getattr(profile, "access_kind", "") == "write")
+        if writes:
+            return "commit"
+        return "explore"
+
+    def _prior_action(
+        self,
+        *,
+        phase: str,
+        retry_count: int,
+        agent_interval_s: float,
+        read_count: int,
+        write_count: int,
+        hot_read_count: int,
+        hot_write_count: int,
+        global_abort_rate: float,
+    ) -> str:
+        if phase != "commit":
+            return "occ"
+        if int(retry_count) >= 3 and (hot_read_count or hot_write_count):
+            return "lock-read-write-set"
+        if int(retry_count) >= 2 and write_count:
+            return "lock-write-set"
+        if hot_write_count:
+            return "lock-hot-writes"
+        if hot_read_count and (
+            int(retry_count) > 0 or max(0.0, float(agent_interval_s)) >= 0.100
+        ):
+            return "lock-hot-read-write"
+        if max(0.0, float(global_abort_rate)) >= 0.20 and write_count:
+            return "lock-write-set"
+        if write_count >= 8 and max(0.0, float(global_abort_rate)) >= 0.10:
+            return "lock-hot-writes"
+        _ = read_count
+        return "occ"
+
+    def _is_occ_fast_path(
+        self,
+        *,
+        phase: str,
+        retry_count: int,
+        agent_interval_s: float,
+        hot_read_count: int,
+        hot_write_count: int,
+        runtime_stats: ATCCRuntimeStats,
+        prior_action: str,
+    ) -> bool:
+        if prior_action != "occ":
+            return False
+        if phase not in {"explore", "refine", "commit"}:
+            return False
+        if int(retry_count) > 0:
+            return False
+        if hot_read_count or hot_write_count:
+            return False
+        if float(runtime_stats.ewma_abort_rate) >= 0.05:
+            return False
+        if float(runtime_stats.ewma_lock_wait_s) >= 0.010:
+            return False
+        return max(0.0, float(agent_interval_s)) <= 0.050 or phase != "commit"
+
+    def _is_hot_profile(self, profile: Any) -> bool:
+        object_id = str(getattr(profile, "object_id", ""))
+        hot_record_count = int(getattr(profile, "hotspot_record_count", 0) or 0)
+        if object_id.startswith("ycsb:record:") and hot_record_count > 0:
+            parts = object_id.split(":")
+            if len(parts) >= 3:
+                try:
+                    return int(parts[2]) < hot_record_count
+                except ValueError:
+                    pass
+        if "next_order_id" in object_id:
+            return True
+        if int(getattr(profile, "retry_count", 0) or 0) >= 2:
+            return True
+        return False
+
+    def _priority_score(
+        self,
+        *,
+        operation_count: int,
+        retry_count: int,
+        agent_interval_s: float,
+        hot_read_count: int,
+        hot_write_count: int,
+        global_abort_rate: float,
+    ) -> int:
+        interval_ms = max(0.0, float(agent_interval_s)) * 1000.0
+        return int(
+            max(0, int(operation_count)) // 4
+            + max(0, int(retry_count)) * 5
+            + min(10, int(interval_ms // 25))
+            + max(0, int(hot_read_count))
+            + max(0, int(hot_write_count)) * 2
+            + math.ceil(max(0.0, float(global_abort_rate)) * 5)
+        )
+
+    def _state_key(
+        self,
+        profiles: Sequence[Any],
+        *,
+        phase: str,
+        retry_count: int,
+        agent_interval_s: float,
+        priority: int,
+        read_count: int,
+        write_count: int,
+        hot_read_count: int,
+        hot_write_count: int,
+        runtime_stats: ATCCRuntimeStats,
+    ) -> str:
+        workloads = sorted({str(getattr(profile, "workload", "")) for profile in profiles})
+        task_types = sorted({str(getattr(profile, "task_type", "")) for profile in profiles})
+        return "|".join(
+            (
+                "scope=transaction",
+                "workload=" + ",".join(workloads),
+                "task=" + ",".join(task_types),
+                "phase=" + str(phase),
+                "reads=" + _bucket_count(read_count),
+                "writes=" + _bucket_count(write_count),
+                "hotR=" + _bucket_count(hot_read_count),
+                "hotW=" + _bucket_count(hot_write_count),
+                "retry=" + _bucket_count(retry_count),
+                "interval=" + _bucket_latency_s(agent_interval_s),
+                "priority=" + _bucket_count(priority),
+                "globalObs=" + runtime_stats.state_buckets()[0],
+                "globalAbort=" + runtime_stats.state_buckets()[1],
+                "globalLockWait=" + runtime_stats.state_buckets()[2],
+            )
+        )
+
+    def _reward(
+        self,
+        action: str,
+        *,
+        committed: bool,
+        rejected: bool,
+        conflict_abort: bool,
+        lock_wait_s: float,
+        retry_count: int,
+        agent_interval_s: float,
+        operation_count: int,
+    ) -> float:
+        value = self.commit_reward if committed else 0.0
+        if rejected:
+            value -= self.reject_penalty
+        if conflict_abort:
+            value -= self.abort_penalty * (1.0 + max(0, int(retry_count)))
+            value -= max(0.0, float(agent_interval_s)) * self.interval_cost_per_s
+        if action != "occ":
+            value -= self.lock_action_cost
+            value -= max(0.0, float(lock_wait_s)) * self.lock_wait_cost_per_s
+            value -= 0.001 * max(0, int(operation_count))
+        return value
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "actions": [dataclasses.asdict(spec) for spec in self.ACTIONS],
+            "hot_conflict_threshold": self.hot_conflict_threshold,
+            "hot_lock_wait_threshold_s": self.hot_lock_wait_threshold_s,
+            "min_hot_observations": self.min_hot_observations,
+            "commit_reward": self.commit_reward,
+            "abort_penalty": self.abort_penalty,
+            "reject_penalty": self.reject_penalty,
+            "lock_wait_cost_per_s": self.lock_wait_cost_per_s,
+            "lock_action_cost": self.lock_action_cost,
+            "interval_cost_per_s": self.interval_cost_per_s,
+            "runtime_stats": self.runtime_stats.to_dict(),
+            "learner": self.learner.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "TransactionAwareATCCModule":
+        learner = ATCCPolicyQLearner.from_dict(
+            dict(data.get("learner", {})),
+            fallback_actions=tuple(spec.name for spec in cls.ACTIONS),
+        )
+        module = cls(
+            name=str(data.get("name", "transaction-aware-atcc")),
+            learner=learner,
+            hot_conflict_threshold=float(data.get("hot_conflict_threshold", 0.20)),
+            hot_lock_wait_threshold_s=float(
+                data.get("hot_lock_wait_threshold_s", 0.050)
+            ),
+            min_hot_observations=int(data.get("min_hot_observations", 2)),
+            commit_reward=float(data.get("commit_reward", 1.0)),
+            abort_penalty=float(data.get("abort_penalty", 2.0)),
+            reject_penalty=float(data.get("reject_penalty", 0.5)),
+            lock_wait_cost_per_s=float(data.get("lock_wait_cost_per_s", 80.0)),
+            lock_action_cost=float(data.get("lock_action_cost", 0.02)),
+            interval_cost_per_s=float(data.get("interval_cost_per_s", 1.0)),
+        )
+        module.runtime_stats = ATCCRuntimeStats.from_dict(
+            dict(data.get("runtime_stats", {}))
+        )
+        return module
+
+
 def _bucket_count(value: int) -> str:
     count = int(value)
     if count <= 0:
