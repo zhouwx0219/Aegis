@@ -1,6 +1,9 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
-from agent.evaluation.atcc_policy_training import train_phase_atcc_policy
+from agent.evaluation.atcc_policy_training import main, train_phase_atcc_policy
 from agent.runtime import OperationPolicyTable
 from agent.workloads import YCSBConfig, build_agent_workload
 
@@ -116,6 +119,105 @@ class ATCCPolicyTrainingTests(unittest.TestCase):
         self.assertEqual(loaded_table["atcc_module"]["lock_queue_depth_cost"], 0.11)
         self.assertEqual(loaded_table["atcc_module"]["lock_handoff_cost"], 0.13)
         self.assertEqual(loaded_table["atcc_module"]["committing_count_cost"], 0.17)
+
+    def test_training_cli_accepts_ycsb_hotspot_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "policy.json"
+            exit_code = main(
+                [
+                    "--workload",
+                    "ycsb",
+                    "--episodes",
+                    "1",
+                    "--task-count",
+                    "2",
+                    "--workers",
+                    "1",
+                    "--agent-slots",
+                    "0",
+                    "--planning-delay-ms",
+                    "0",
+                    "--latency-distribution",
+                    "fixed",
+                    "--latency-max-ms",
+                    "0",
+                    "--max-attempts",
+                    "2",
+                    "--records",
+                    "8",
+                    "--fields",
+                    "2",
+                    "--requests-per-task",
+                    "2",
+                    "--candidates",
+                    "2",
+                    "--read-weight",
+                    "0.9",
+                    "--update-weight",
+                    "0.1",
+                    "--zipf-theta",
+                    "0.7",
+                    "--hotspot-fraction",
+                    "0.25",
+                    "--hotspot-access-probability",
+                    "0.5",
+                    "--output",
+                    str(output),
+                ]
+            )
+
+            self.assertEqual(exit_code, 0)
+            artifact = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(artifact["workload_config"]["hotspot_fraction"], 0.25)
+            self.assertEqual(
+                artifact["workload_config"]["hotspot_access_probability"],
+                0.5,
+            )
+
+    def test_training_can_use_strict_tuned_policy_variant(self):
+        workload = build_agent_workload(
+            "ycsb",
+            "semantic",
+            ycsb_config=YCSBConfig(
+                record_count=4,
+                field_count=1,
+                requests_per_task=2,
+                candidates_per_task=2,
+                read_weight=0.0,
+                update_weight=1.0,
+                zipf_theta=0.0,
+                hotspot_fraction=0.5,
+                hotspot_access_probability=1.0,
+            ),
+        )
+
+        artifact = train_phase_atcc_policy(
+            workload,
+            workload_kind="ycsb",
+            workload_config={"record_count": 4},
+            policy_variant="ycsb-strict-tuned",
+            episodes=1,
+            task_count=2,
+            seed=13,
+            workers=1,
+            agent_slots=0,
+            planning_delay_s=0.0,
+            latency_distribution="fixed",
+            latency_cv=0.8,
+            latency_max_s=0.0,
+            max_attempts=2,
+            tokens_per_operation=10.0,
+        )
+
+        self.assertEqual(artifact["policy_variant"], "ycsb-strict-tuned")
+        self.assertEqual(
+            artifact["training_config"]["policy_variant"],
+            "ycsb-strict-tuned",
+        )
+        self.assertEqual(
+            artifact["operation_policy_table"]["name"],
+            "ycsb-strict-tuned-operation-atcc-table",
+        )
 
 
 if __name__ == "__main__":

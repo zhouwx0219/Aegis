@@ -7,7 +7,13 @@ param(
 
     [string]$PolicyVariant = "default",
     [ValidateSet("hold", "yield-during-planning", "yield-refresh-regenerate", "defer-until-after-planning")]
-    [string]$PrelockLeaseMode = "defer-until-after-planning",
+    [string]$PrelockLeaseMode = "hold",
+    [ValidateSet("legacy", "staged", "staged-local")]
+    [string]$AgentExecutionMode = "staged",
+    [ValidateSet("before-planning", "after-planning")]
+    [string]$SnapshotTiming = "before-planning",
+    [string]$PolicyArtifact = "",
+    [double]$PolicyEpsilon = -1.0,
     [int]$TaskCount = 60,
     [int]$Workers = 24,
     [string]$OutputDir = "results/handoff_tpcc_compare"
@@ -27,16 +33,23 @@ function Convert-ToWslPath([string]$Path) {
 
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $WslRepo = Convert-ToWslPath $RepoRoot
+$PolicyArtifactArgs = @()
+if ($PolicyArtifact) {
+    $PolicyArtifactArgs += "--policy-artifact $(Convert-ToWslPath $PolicyArtifact)"
+}
+if ($PolicyEpsilon -ge 0.0) {
+    $PolicyArtifactArgs += "--policy-epsilon $PolicyEpsilon"
+}
 
 $Strategies = if ($StrategySet -eq "full") {
-    "occ,2pl-nowait,2pl-wait-die,mvcc-full,silo-full,tictoc-full,adaptive-op-strict"
+    "occ,2pl-nowait,2pl-wait-die,mvcc-full,silo-full,tictoc-full,adaptive-op-strict,adaptive-hybrid"
 } else {
-    "occ,tictoc-full,adaptive-op-strict"
+    "occ,tictoc-full,adaptive-op-strict,adaptive-hybrid"
 }
 
 $Profiles = if ($Profile -eq "all") { @("low", "medium", "high") } else { @($Profile) }
 
-$Common = @(
+$CommonArgs = @(
     "--workload tpcc",
     "--strategies $Strategies",
     "--task-count $TaskCount",
@@ -58,9 +71,15 @@ $Common = @(
     "--prelock-wait-budget-ms 70",
     "--prelock-wait-budget-mode object",
     "--prelock-lease-mode $PrelockLeaseMode",
+    "--agent-execution-mode $AgentExecutionMode",
+    "--snapshot-timing $SnapshotTiming",
     "--policy-variant $PolicyVariant",
     "--transaction-mix new_order:1.0"
-) -join " "
+)
+if ($PolicyArtifactArgs.Count -gt 0) {
+    $CommonArgs += $PolicyArtifactArgs
+}
+$Common = $CommonArgs -join " "
 
 $ProfileArgs = @{
     low = "--warehouses 8 --districts-per-warehouse 5 --customers-per-district 100 --items 500 --order-lines 5"

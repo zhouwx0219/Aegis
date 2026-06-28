@@ -7,7 +7,9 @@ from agent.runtime.adaptive import (
     OperationPolicyProfile,
     operation_object_class,
     operation_profile_key,
+    profile_agent_operations,
 )
+from agent.workloads import YCSBConfig, build_agent_workload
 
 
 class YCSBStrictTunedATCCTests(unittest.TestCase):
@@ -114,6 +116,27 @@ class YCSBStrictTunedATCCTests(unittest.TestCase):
         self.assertEqual("lock-write-set", by_access["read"].atcc_action)
         self.assertEqual("optimistic", by_access["read"].policy)
 
+    def test_refine_stage_hot_reads_stay_optimistic_after_retry(self):
+        policy = OperationPolicyTable.ycsb_strict_tuned_atcc()
+        profile = OperationPolicyProfile(
+            object_id="ycsb:record:0:field:0",
+            access_kind="read",
+            intent_name="read",
+            task_type="read-update",
+            workload="agent-ycsb-semantic",
+            total_writes=0,
+            retry_count=3,
+            agent_phase="refine",
+            agent_interval_s=0.100,
+            hotspot_record_count=2,
+        )
+
+        decisions = policy.select_profiles((profile,))
+
+        self.assertEqual("optimistic", decisions[0].policy)
+        self.assertEqual("occ", decisions[0].atcc_action)
+        self.assertEqual("refine", decisions[0].atcc_phase)
+
     def test_retry_hot_write_locks_hot_writes_before_full_read_write_set(self):
         policy = OperationPolicyTable.ycsb_strict_tuned_atcc()
         profile = OperationPolicyProfile(
@@ -148,6 +171,101 @@ class YCSBStrictTunedATCCTests(unittest.TestCase):
 
         self.assertEqual("pessimistic", decisions[0].policy)
         self.assertEqual("lock-hot-writes", decisions[0].atcc_action)
+
+    def test_commit_hot_write_with_observed_conflict_locks_on_first_attempt(self):
+        policy = OperationPolicyTable.ycsb_strict_tuned_atcc()
+        profile = OperationPolicyProfile(
+            object_id="ycsb:record:0:field:0",
+            access_kind="write",
+            intent_name="overwrite",
+            task_type="read-update",
+            workload="agent-ycsb-semantic",
+            total_writes=8,
+            retry_count=0,
+            agent_phase="commit",
+            agent_interval_s=0.080,
+        )
+        object_class = operation_object_class(profile.object_id)
+        policy.telemetry.observe(
+            (
+                operation_profile_key(profile, object_class=object_class),
+                operation_profile_key(
+                    profile,
+                    object_class=object_class,
+                    exact_object=True,
+                ),
+            ),
+            policy="optimistic",
+            conflict_abort=True,
+            committed=False,
+            rejected=False,
+            lock_wait_s=0.0,
+        )
+
+        decisions = policy.select_profiles((profile,))
+
+        self.assertEqual("pessimistic", decisions[0].policy)
+        self.assertEqual("lock-hot-writes", decisions[0].atcc_action)
+
+    def test_commit_static_hotspot_write_locks_on_first_attempt(self):
+        policy = OperationPolicyTable.ycsb_strict_tuned_atcc()
+        hot_profile = OperationPolicyProfile(
+            object_id="ycsb:record:0:field:0",
+            access_kind="write",
+            intent_name="overwrite",
+            task_type="read-update",
+            workload="agent-ycsb-semantic",
+            total_writes=8,
+            retry_count=0,
+            agent_phase="commit",
+            agent_interval_s=0.080,
+            hotspot_record_count=2,
+        )
+        cold_profile = dataclasses.replace(
+            hot_profile,
+            object_id="ycsb:record:7:field:0",
+        )
+
+        hot_decision = policy.select_profiles((hot_profile,))[0]
+        cold_decision = policy.select_profiles((cold_profile,))[0]
+
+        self.assertEqual("pessimistic", hot_decision.policy)
+        self.assertEqual("lock-hot-writes", hot_decision.atcc_action)
+        self.assertEqual("optimistic", cold_decision.policy)
+
+    def test_ycsb_workload_hotspot_context_reaches_operation_profile(self):
+        workload = build_agent_workload(
+            "ycsb",
+            "semantic",
+            ycsb_config=YCSBConfig(
+                record_count=8,
+                field_count=6,
+                requests_per_task=6,
+                candidates_per_task=1,
+                read_weight=0.0,
+                update_weight=1.0,
+                zipf_theta=0.0,
+                hotspot_fraction=0.25,
+                hotspot_access_probability=1.0,
+            ),
+        )
+        task = workload.generate_tasks(1, seed=5)[0]
+
+        profiles = profile_agent_operations(
+            task.candidates,
+            metadata={
+                "workload": task.workload,
+                "task_type": task.task_type,
+                "context": task.context,
+                "agent_phase": "commit",
+            },
+        )
+        decisions = OperationPolicyTable.ycsb_strict_tuned_atcc().select_profiles(
+            profiles
+        )
+
+        self.assertTrue(all(profile.hotspot_record_count == 2 for profile in profiles))
+        self.assertTrue(any(decision.policy == "pessimistic" for decision in decisions))
 
     def test_runner_accepts_ycsb_strict_tuned_policy_variant(self):
         policy = _operation_policy("ycsb", "ycsb-strict-tuned")

@@ -120,6 +120,46 @@ class AgentOperation:
     def to_dict(self) -> Dict[str, Any]:
         return dataclasses.asdict(self)
 
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "AgentOperation":
+        return cls(
+            kind=str(data.get("kind", "")),
+            object_id=str(data.get("object_id", "")),
+            value=str(data.get("value", "")),
+            payload=str(data.get("payload", "")),
+            expected=str(data.get("expected", "")),
+            amount=int(data.get("amount", 0) or 0),
+            constrained=bool(data.get("constrained", False)),
+            lower_bound=int(data.get("lower_bound", 0) or 0),
+            commutative=bool(data.get("commutative", False)),
+            metadata=dict(data.get("metadata", {}) or {}),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class AgentStage:
+    phase: str
+    operations: Tuple[AgentOperation, ...]
+    delay_weight: float = 1.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "phase": self.phase,
+            "delay_weight": float(self.delay_weight),
+            "operations": [operation.to_dict() for operation in self.operations],
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "AgentStage":
+        return cls(
+            phase=str(data.get("phase", "")),
+            operations=tuple(
+                AgentOperation.from_dict(operation)
+                for operation in data.get("operations", ()) or ()
+            ),
+            delay_weight=float(data.get("delay_weight", 1.0) or 1.0),
+        )
+
 
 @dataclasses.dataclass(frozen=True)
 class AgentCandidate:
@@ -168,6 +208,72 @@ class AgentTask:
         }
 
 
+def task_agent_stages(task: AgentTask) -> Tuple[AgentStage, ...]:
+    raw_stages = task.context.get("agent_stages", ())
+    stages = []
+    for row in raw_stages or ():
+        if isinstance(row, AgentStage):
+            stages.append(row)
+        elif isinstance(row, Mapping):
+            stages.append(AgentStage.from_dict(row))
+    if stages:
+        return tuple(stages)
+    return tuple(
+        AgentStage(str(phase), (), 1.0)
+        for phase in task.context.get("agent_phase_sequence", ()) or ()
+    )
+
+
+def stage_operations(task: AgentTask, phase: str) -> Tuple[AgentOperation, ...]:
+    requested = str(phase)
+    return tuple(
+        operation
+        for stage in task_agent_stages(task)
+        if stage.phase == requested
+        for operation in stage.operations
+    )
+
+
+def task_stage_view(task: AgentTask, phase: str) -> AgentTask:
+    """Return a task view containing only operations declared for one stage."""
+
+    requested = str(phase)
+    allowed = {_operation_key(operation) for operation in stage_operations(task, requested)}
+    candidates = []
+    for candidate in task.candidates:
+        operations = tuple(
+            operation
+            for operation in candidate.operations
+            if _operation_key(operation) in allowed
+        )
+        if not operations:
+            continue
+        candidates.append(
+            AgentCandidate(
+                candidate_id=candidate.candidate_id,
+                quality=candidate.quality,
+                operations=operations,
+                generation_cost=candidate.generation_cost,
+                metadata=dict(candidate.metadata),
+            )
+        )
+    context = dict(task.context)
+    context["agent_phase"] = requested
+    context["agent_stage_local"] = True
+    context["agent_phase_sequence"] = (requested,)
+    context["agent_stages"] = [
+        AgentStage(requested, tuple(stage_operations(task, requested))).to_dict()
+    ]
+    return AgentTask(
+        task_id=task.task_id,
+        workload=task.workload,
+        task_type=task.task_type,
+        request=task.request,
+        candidates=tuple(candidates),
+        context=context,
+    )
+
+
 class AgentWorkload(ABC):
     name: str
 
@@ -214,6 +320,7 @@ def prepare_task_transaction(
     *,
     strategy: Optional[str] = None,
     runtime_context: Optional[Mapping[str, Any]] = None,
+    populate: bool = True,
 ) -> AgentTransaction:
     """Create a transaction, optionally locking selected targets before snapshot."""
 
@@ -246,7 +353,8 @@ def prepare_task_transaction(
         prelock_targets=prelock_targets,
         operation_policy_decisions=operation_policy_decisions,
     )
-    populate_task_transaction(transaction, task)
+    if populate:
+        populate_task_transaction(transaction, task)
     return transaction
 
 
@@ -268,43 +376,115 @@ def populate_task_transaction(
                 return transaction
             transaction.read(object_id)
 
-        for plan in task.candidates:
-            if transaction.state != TransactionState.ACTIVE:
-                return transaction
-            candidate = transaction.add_candidate(
-                plan.candidate_id,
-                quality=plan.quality,
-                gen_cost=plan.generation_cost,
-                metadata={**dict(plan.metadata), "workload": task.workload},
-            )
-            for operation in plan.operations:
-                if transaction.state != TransactionState.ACTIVE:
-                    return transaction
-                if operation.kind == "read":
-                    continue
-                if operation.kind == "overwrite":
-                    candidate.overwrite(operation.object_id, operation.value)
-                elif operation.kind == "append":
-                    candidate.append(
-                        operation.object_id,
-                        operation.payload,
-                        commutative=operation.commutative,
-                    )
-                elif operation.kind == "delta":
-                    candidate.delta(
-                        operation.object_id,
-                        operation.amount,
-                        constrained=operation.constrained,
-                        lower_bound=operation.lower_bound,
-                    )
-                elif operation.kind == "cas":
-                    candidate.cas(
-                        operation.object_id, operation.expected, operation.value
-                    )
-                else:
-                    raise ValueError(f"unsupported workload operation: {operation.kind}")
+        _populate_candidate_writes(transaction, task)
     except RuntimeError:
         if transaction.state != TransactionState.ACTIVE:
             return transaction
         raise
     return transaction
+
+
+def populate_task_stage(
+    transaction: AgentTransaction,
+    task: AgentTask,
+    phase: str,
+) -> AgentTransaction:
+    """Replay one workload-declared agent phase into an active transaction."""
+
+    operations = stage_operations(task, phase)
+    read_ids = {
+        operation.object_id for operation in operations if operation.kind == "read"
+    }
+    try:
+        for object_id in sorted(read_ids):
+            if transaction.state != TransactionState.ACTIVE:
+                return transaction
+            transaction.read(object_id)
+        if str(phase) == "commit" or any(
+            operation.kind != "read" for operation in operations
+        ):
+            _populate_candidate_writes(
+                transaction,
+                task,
+                allowed_operations=operations,
+            )
+    except RuntimeError:
+        if transaction.state != TransactionState.ACTIVE:
+            return transaction
+        raise
+    return transaction
+
+
+def _populate_candidate_writes(
+    transaction: AgentTransaction,
+    task: AgentTask,
+    *,
+    allowed_operations: Optional[Iterable[AgentOperation]] = None,
+) -> None:
+    allowed = None
+    if allowed_operations is not None:
+        allowed = {
+            _operation_key(operation)
+            for operation in allowed_operations
+            if operation.kind != "read"
+        }
+    existing = {
+        str(getattr(candidate, "branch_id", ""))
+        for candidate in getattr(transaction, "candidates", ())
+    }
+    for plan in task.candidates:
+        if transaction.state != TransactionState.ACTIVE:
+            return
+        if plan.candidate_id in existing:
+            continue
+        candidate = transaction.add_candidate(
+            plan.candidate_id,
+            quality=plan.quality,
+            gen_cost=plan.generation_cost,
+            metadata={**dict(plan.metadata), "workload": task.workload},
+        )
+        existing.add(plan.candidate_id)
+        for operation in plan.operations:
+            if transaction.state != TransactionState.ACTIVE:
+                return
+            if operation.kind == "read":
+                continue
+            if allowed is not None and _operation_key(operation) not in allowed:
+                continue
+            _apply_candidate_operation(candidate, operation)
+
+
+def _operation_key(operation: AgentOperation) -> Tuple[Any, ...]:
+    return (
+        operation.kind,
+        operation.object_id,
+        operation.value,
+        operation.payload,
+        operation.expected,
+        int(operation.amount),
+        bool(operation.constrained),
+        int(operation.lower_bound),
+        bool(operation.commutative),
+    )
+
+
+def _apply_candidate_operation(candidate: Any, operation: AgentOperation) -> None:
+    if operation.kind == "overwrite":
+        candidate.overwrite(operation.object_id, operation.value)
+    elif operation.kind == "append":
+        candidate.append(
+            operation.object_id,
+            operation.payload,
+            commutative=operation.commutative,
+        )
+    elif operation.kind == "delta":
+        candidate.delta(
+            operation.object_id,
+            operation.amount,
+            constrained=operation.constrained,
+            lower_bound=operation.lower_bound,
+        )
+    elif operation.kind == "cas":
+        candidate.cas(operation.object_id, operation.expected, operation.value)
+    else:
+        raise ValueError(f"unsupported workload operation: {operation.kind}")

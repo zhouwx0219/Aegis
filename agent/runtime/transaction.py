@@ -354,6 +354,119 @@ class AgentTransaction:
             )
             self._yielded_prelock_targets = ()
 
+    def replace_prelocks_for_stage(
+        self,
+        targets: Iterable[str],
+        operation_policy_decisions: Iterable[Any],
+        *,
+        reason: str = "stage-local-atcc",
+    ) -> tuple[Any, ...]:
+        """Replace the active ATCC lease with a stage-local lock plan."""
+
+        with self._lifecycle_lock:
+            self._ensure_active()
+            self._release_prelocks()
+            self._yielded_prelock_targets = ()
+            self._yielded_prelock_priority = 0
+            effective_decisions = tuple(operation_policy_decisions)
+            normalized_targets = tuple(sorted(set(str(target) for target in targets)))
+            lease = None
+            if normalized_targets:
+                budget_s = (
+                    self.manager.prelock_wait_budget_s
+                    if self.manager._should_budget_prelock(effective_decisions)
+                    else 0.0
+                )
+                if budget_s > 0.0 and self.manager.prelock_wait_budget_mode == "object":
+                    lease, skipped_targets = self.manager.object_locks.acquire_budgeted_lease(
+                        normalized_targets,
+                        priority=self.manager._prelock_priority(
+                            self.metadata,
+                            effective_decisions,
+                        ),
+                        reason=str(reason),
+                        wait_timeout_s=budget_s,
+                    )
+                    if skipped_targets:
+                        effective_decisions = self.manager._fallback_prelock_decisions(
+                            effective_decisions,
+                            object_ids=skipped_targets,
+                        )
+                        self.manager._record_prelock_fallback(
+                            self.metadata,
+                            reason="stage_prelock_object_wait_budget_exceeded",
+                            targets=skipped_targets,
+                            budget_s=budget_s,
+                            detail="per-object stage prelock wait budget exhausted",
+                        )
+                else:
+                    try:
+                        lease = self.manager.object_locks.acquire_lease(
+                            normalized_targets,
+                            priority=self.manager._prelock_priority(
+                                self.metadata,
+                                effective_decisions,
+                            ),
+                            reason=str(reason),
+                            wait_timeout_s=(budget_s if budget_s > 0.0 else None),
+                        )
+                    except ObjectLockTimeout as exc:
+                        effective_decisions = self.manager._fallback_prelock_decisions(
+                            effective_decisions
+                        )
+                        self.manager._record_prelock_fallback(
+                            self.metadata,
+                            reason="stage_prelock_wait_budget_exceeded",
+                            targets=normalized_targets,
+                            budget_s=budget_s,
+                            detail=str(exc),
+                        )
+            if lease is not None:
+                lease.bind_owner(self)
+                self._prelock_lease = lease
+                self.prelocked_targets = tuple(getattr(lease, "targets", ()) or ())
+                self.prelock_wait_s += float(getattr(lease, "wait_s", 0.0) or 0.0)
+                for object_id, wait_s in dict(
+                    getattr(lease, "target_wait_s", {}) or {}
+                ).items():
+                    key = str(object_id)
+                    self.prelock_target_wait_s[key] = (
+                        self.prelock_target_wait_s.get(key, 0.0) + float(wait_s)
+                    )
+                for object_id, depth in dict(
+                    getattr(lease, "target_queue_depth", {}) or {}
+                ).items():
+                    self.prelock_target_queue_depth[str(object_id)] = int(depth)
+                for object_id, priority in dict(
+                    getattr(lease, "target_owner_priority", {}) or {}
+                ).items():
+                    self.prelock_target_owner_priority[str(object_id)] = int(priority)
+                for object_id, count in dict(
+                    getattr(lease, "target_handoff_count", {}) or {}
+                ).items():
+                    key = str(object_id)
+                    self.prelock_target_handoff_count[key] = (
+                        self.prelock_target_handoff_count.get(key, 0) + int(count)
+                    )
+            else:
+                self._prelock_lease = None
+                self.prelocked_targets = ()
+            self.precomputed_operation_policy_decisions = tuple(effective_decisions)
+            self._event(
+                "stage_prelock",
+                {
+                    "reason": str(reason),
+                    "targets": list(self.prelocked_targets),
+                    "operation_policy_decisions": [
+                        decision.to_dict()
+                        if hasattr(decision, "to_dict")
+                        else dict(decision)
+                        for decision in effective_decisions
+                    ],
+                },
+            )
+            return tuple(effective_decisions)
+
     def refresh_snapshot_for_regeneration(
         self,
         reason: str = "lease-refresh-regenerate",
@@ -371,6 +484,94 @@ class AgentTransaction:
                         key: value.version for key, value in self.snapshot.items()
                     },
                     "prelocked_targets": list(self.prelocked_targets),
+                },
+            )
+
+    def refresh_candidate_write_bases(
+        self,
+        targets: Iterable[str],
+        *,
+        reason: str = "lease-refresh-rebase",
+        clear_read_set: bool = False,
+        candidate_scope: str = "all",
+    ) -> int:
+        """Refresh selected candidate write bases without dropping candidates."""
+
+        target_set = {str(target) for target in targets}
+        scope = str(candidate_scope or "all").strip().lower()
+        if scope not in {"all", "best"}:
+            raise ValueError(f"unsupported candidate refresh scope: {candidate_scope}")
+        with self._lifecycle_lock:
+            self._ensure_active()
+            if not target_set:
+                return 0
+            latest_snapshot = self.manager._snapshot_entries_threadsafe(target_set)
+            self.snapshot.update(latest_snapshot)
+            if clear_read_set:
+                cleared_reads = len(self.read_set)
+                self.read_set.clear()
+                refreshed_reads = 0
+            else:
+                cleared_reads = 0
+                refreshed_reads = 0
+                for object_id in tuple(self.read_set):
+                    if object_id in target_set and object_id in latest_snapshot:
+                        self.read_set[object_id] = latest_snapshot[object_id]
+                        refreshed_reads += 1
+            refreshed_writes = 0
+            candidates = tuple(self.candidates)
+            if scope == "best" and candidates:
+                candidates = (
+                    max(
+                        candidates,
+                        key=lambda candidate: float(
+                            getattr(candidate, "quality", 0.0) or 0.0
+                        ),
+                    ),
+                )
+            for candidate in candidates:
+                for write in getattr(candidate, "_writes", ()):
+                    object_id = str(getattr(write, "object_id", ""))
+                    if object_id not in target_set or object_id not in latest_snapshot:
+                        continue
+                    snapshot = latest_snapshot[object_id]
+                    write.base_value = snapshot.value
+                    write.base_version = snapshot.version
+                    refreshed_writes += 1
+            self._event(
+                "refresh_rebase",
+                {
+                    "reason": str(reason),
+                    "targets": sorted(target_set),
+                    "refreshed_writes": int(refreshed_writes),
+                    "refreshed_reads": int(refreshed_reads),
+                    "cleared_reads": int(cleared_reads),
+                    "candidate_scope": scope,
+                    "refreshed_candidates": [
+                        str(getattr(candidate, "branch_id", ""))
+                        for candidate in candidates
+                    ],
+                    "snapshot_versions": {
+                        key: value.version
+                        for key, value in latest_snapshot.items()
+                    },
+                    "prelocked_targets": list(self.prelocked_targets),
+                },
+            )
+            return refreshed_writes
+
+    def record_refresh_replay(
+        self,
+        *,
+        operation_count: int,
+        phases: Iterable[str] = (),
+    ) -> None:
+        with self._lifecycle_lock:
+            self._event(
+                "refresh_replay",
+                {
+                    "operation_count": max(0, int(operation_count)),
+                    "phases": [str(phase) for phase in phases],
                 },
             )
 
@@ -731,6 +932,22 @@ class AgentTransactionManager:
     def _snapshot_threadsafe(self) -> Dict[str, SnapshotValue]:
         with self._lock:
             return self._snapshot_locked()
+
+    def _snapshot_entries_threadsafe(
+        self,
+        object_ids: Iterable[str],
+    ) -> Dict[str, SnapshotValue]:
+        targets = tuple(dict.fromkeys(str(object_id) for object_id in object_ids))
+        with self._lock:
+            return {
+                oid: SnapshotValue(
+                    value=(value := self.store.get(oid)).value,
+                    version=int(value.version),
+                    exists=bool(value.exists),
+                )
+                for oid in targets
+                if oid in self._catalog
+            }
 
     def _resolve_cc_module(self, strategy: str, txn: AgentTransaction) -> tuple[Any, str, str]:
         resolution = self.cc_registry.resolve(strategy, txn)

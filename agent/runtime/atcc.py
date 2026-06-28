@@ -771,9 +771,11 @@ class PhaseAwareATCCModule:
             (int(getattr(profile, "total_writes", 0) or 0) for profile in profiles),
             default=writes,
         )
-        if phase == "explore":
+        if phase != "commit":
             return "occ"
         if int(retry_count) <= 0:
+            if phase == "commit" and hot_write_ratio > 0.0 and total_writes >= 6:
+                return "lock-hot-writes"
             if hot_write_ratio >= 0.75 and max(0.0, float(global_abort_rate)) >= 0.25:
                 return "lock-hot-writes"
             return "occ"
@@ -957,6 +959,15 @@ class PhaseAwareATCCModule:
         object_class: str,
     ) -> bool:
         object_id = str(getattr(profile, "object_id", ""))
+        if object_id.startswith("ycsb:record:"):
+            hot_record_count = int(getattr(profile, "hotspot_record_count", 0) or 0)
+            if hot_record_count > 0:
+                parts = object_id.split(":")
+                if len(parts) >= 3:
+                    try:
+                        return int(parts[2]) < hot_record_count
+                    except ValueError:
+                        pass
         if "next_order_id" in object_id:
             if float(getattr(profile, "agent_interval_s", 0.0) or 0.0) >= 0.050:
                 return True

@@ -42,6 +42,21 @@ def _row(profile: str, aggregate: Dict[str, Any]) -> Dict[str, Any]:
         "p95_latency_s": aggregate.get("agent_latency_p95_s", 0.0),
         "p99_latency_s": aggregate.get("agent_latency_p99_s", 0.0),
         "conflict_aborts": aggregate.get("conflict_aborts", 0),
+        "lease_refresh_regenerations": aggregate.get(
+            "lease_refresh_regenerations", 0
+        ),
+        "lease_refresh_replayed_operations": aggregate.get(
+            "lease_refresh_replayed_operations", 0
+        ),
+        "lease_refresh_replayed_operations_per_task": aggregate.get(
+            "lease_refresh_replayed_operations_per_task", 0.0
+        ),
+        "lease_refresh_rebased_writes": aggregate.get(
+            "lease_refresh_rebased_writes", 0
+        ),
+        "lease_refresh_rebased_writes_per_task": aggregate.get(
+            "lease_refresh_rebased_writes_per_task", 0.0
+        ),
         "background_commits": aggregate.get("background_commits", 0),
         "background_aborts": aggregate.get("background_aborts", 0),
         "operation_policy_counts": json.dumps(
@@ -49,6 +64,9 @@ def _row(profile: str, aggregate: Dict[str, Any]) -> Dict[str, Any]:
         ),
         "operation_rule_counts": json.dumps(
             aggregate.get("operation_rule_counts", {}), ensure_ascii=False
+        ),
+        "selected_strategy_counts": json.dumps(
+            aggregate.get("selected_strategy_counts", {}), ensure_ascii=False
         ),
     }
 
@@ -82,7 +100,7 @@ def main() -> int:
     rows = summarize(args.input_dir, output)
     print(f"wrote {output} ({len(rows)} rows)")
     for row in rows:
-        if row["strategy"] == "adaptive-op-strict":
+        if row["strategy"] in {"adaptive-op-strict", "adaptive-hybrid"}:
             print(
                 f"{row['profile']}: ATCC throughput={float(row['throughput']):.2f}, "
                 f"commit={float(row['commit_rate']):.2%}, "

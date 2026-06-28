@@ -16,6 +16,23 @@ class ATCCProfileRunnerTests(unittest.TestCase):
         self.assertIn("tpcc-medium", PROFILE_BY_NAME)
         self.assertIn("tpcc-high", PROFILE_BY_NAME)
 
+    def test_ycsb_profiles_use_paper_aligned_hotspot_parameters(self):
+        low = PROFILE_BY_NAME["ycsb-low"].config
+        medium = PROFILE_BY_NAME["ycsb-medium"].config
+        high = PROFILE_BY_NAME["ycsb-high"].config
+
+        self.assertEqual(low["read_weight"], 0.95)
+        self.assertEqual(low["update_weight"], 0.05)
+        self.assertEqual(low["hotspot_fraction"], 0.0)
+        self.assertEqual(medium["read_weight"], 0.90)
+        self.assertEqual(medium["update_weight"], 0.10)
+        self.assertEqual(medium["hotspot_fraction"], 0.10)
+        self.assertEqual(medium["hotspot_access_probability"], 0.50)
+        self.assertEqual(high["read_weight"], 0.50)
+        self.assertEqual(high["update_weight"], 0.50)
+        self.assertEqual(high["hotspot_fraction"], 0.10)
+        self.assertEqual(high["hotspot_access_probability"], 0.75)
+
     def test_profile_suite_writes_training_eval_and_markdown(self):
         with tempfile.TemporaryDirectory() as tmp:
             output_dir = Path(tmp)
@@ -101,6 +118,8 @@ class ATCCProfileRunnerTests(unittest.TestCase):
                 prelock_wait_budget_s=0.007,
                 prelock_wait_budget_mode="object",
                 prelock_lease_mode="defer-until-after-planning",
+                agent_execution_mode="staged",
+                snapshot_timing="before-planning",
             )
 
             self.assertEqual(report["agent_admission_mode"], "before-begin")
@@ -109,6 +128,8 @@ class ATCCProfileRunnerTests(unittest.TestCase):
             self.assertEqual(report["prelock_wait_budget_s"], 0.007)
             self.assertEqual(report["prelock_wait_budget_mode"], "object")
             self.assertEqual(report["prelock_lease_mode"], "defer-until-after-planning")
+            self.assertEqual(report["agent_execution_mode"], "staged")
+            self.assertEqual(report["snapshot_timing"], "before-planning")
 
             policy_path = output_dir / "phase_atcc_ycsb-high_policy.json"
             eval_path = output_dir / "phase_atcc_ycsb-low_eval.json"
@@ -129,6 +150,87 @@ class ATCCProfileRunnerTests(unittest.TestCase):
             self.assertEqual(eval_report["agent_admission_mode"], "before-begin")
             self.assertEqual(eval_report["object_lock_scheduler"], "bounded-priority")
             self.assertEqual(eval_report["prelock_wait_budget_mode"], "object")
+            self.assertEqual(eval_report["agent_execution_mode"], "staged")
+            self.assertEqual(eval_report["snapshot_timing"], "before-planning")
+            self.assertEqual(
+                artifact["training_config"]["agent_execution_mode"],
+                "staged",
+            )
+            self.assertEqual(
+                artifact["training_config"]["snapshot_timing"],
+                "before-planning",
+            )
+            self.assertTrue(artifact["runs"])
+            self.assertTrue(eval_report["runs"])
+            self.assertEqual(
+                artifact["runs"][0]["agent_execution_mode"],
+                "staged",
+            )
+            self.assertEqual(
+                artifact["runs"][0]["snapshot_timing"],
+                "before-planning",
+            )
+            self.assertEqual(
+                eval_report["runs"][0]["agent_execution_mode"],
+                "staged",
+            )
+            self.assertEqual(
+                eval_report["runs"][0]["snapshot_timing"],
+                "before-planning",
+            )
+
+    def test_profile_suite_can_apply_profile_specific_eval_costs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            report = run_profile_suite(
+                profiles=("ycsb-low", "ycsb-high"),
+                output_dir=output_dir,
+                train_episodes=1,
+                train_task_count=2,
+                eval_task_count=2,
+                eval_repeats=1,
+                seed=29,
+                workers=1,
+                agent_slots=0,
+                planning_delay_s=0.0,
+                abort_retry_delay_s=0.0,
+                latency_distribution="fixed",
+                latency_cv=0.8,
+                latency_max_s=0.0,
+                max_attempts=2,
+                tokens_per_operation=10.0,
+                background_workers=0,
+                background_interval_s=0.0,
+                profile_eval_overrides={
+                    "ycsb-high": {
+                        "planning_delay_s": 0.123,
+                        "abort_retry_delay_s": 0.456,
+                        "workload_config": {"candidates_per_task": 5},
+                    }
+                },
+            )
+
+            low_eval = json.loads(
+                (output_dir / "phase_atcc_ycsb-low_eval.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            high_eval = json.loads(
+                (output_dir / "phase_atcc_ycsb-high_eval.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+            self.assertEqual(low_eval["planning_delay_s"], 0.0)
+            self.assertEqual(low_eval["abort_retry_delay_s"], 0.0)
+            self.assertEqual(low_eval["workload_config"]["candidates_per_task"], 4)
+            self.assertEqual(high_eval["planning_delay_s"], 0.123)
+            self.assertEqual(high_eval["abort_retry_delay_s"], 0.456)
+            self.assertEqual(high_eval["workload_config"]["candidates_per_task"], 5)
+            self.assertEqual(
+                report["profiles"][1]["eval_overrides"]["planning_delay_s"],
+                0.123,
+            )
 
     def test_profile_runner_cli_emits_suite_json(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -171,6 +273,175 @@ class ATCCProfileRunnerTests(unittest.TestCase):
             self.assertEqual(report["profiles"][0]["profile"], "ycsb-low")
             self.assertTrue(
                 (Path(tmp) / "phase_atcc_profile_suite.md").exists()
+            )
+
+    def test_profile_runner_cli_accepts_profile_eval_overrides(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stdout = io.StringIO()
+            exit_code = main(
+                [
+                    "--profiles",
+                    "ycsb-high",
+                    "--output-dir",
+                    tmp,
+                    "--train-episodes",
+                    "1",
+                    "--train-task-count",
+                    "2",
+                    "--eval-task-count",
+                    "2",
+                    "--eval-repeats",
+                    "1",
+                    "--workers",
+                    "1",
+                    "--agent-slots",
+                    "0",
+                    "--planning-delay-ms",
+                    "0",
+                    "--abort-retry-delay-ms",
+                    "0",
+                    "--latency-distribution",
+                    "fixed",
+                    "--max-attempts",
+                    "2",
+                    "--tokens-per-operation",
+                    "10",
+                    "--background-workers",
+                    "0",
+                    "--profile-eval-overrides",
+                    '{"ycsb-high":{"planning_delay_ms":123,"abort_retry_delay_ms":456,"workload_config":{"candidates_per_task":5}}}',
+                ],
+                stdout=stdout,
+            )
+
+            self.assertEqual(exit_code, 0)
+            report = json.loads(stdout.getvalue())
+            eval_report = json.loads(
+                (Path(tmp) / "phase_atcc_ycsb-high_eval.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(eval_report["planning_delay_s"], 0.123)
+            self.assertEqual(eval_report["abort_retry_delay_s"], 0.456)
+            self.assertEqual(eval_report["workload_config"]["candidates_per_task"], 5)
+            self.assertEqual(
+                report["config"]["profile_eval_overrides"]["ycsb-high"][
+                    "planning_delay_s"
+                ],
+                0.123,
+            )
+
+    def test_profile_runner_cli_loads_profile_eval_overrides_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            override_path = Path(tmp) / "profile-eval-overrides.json"
+            override_path.write_text(
+                json.dumps(
+                    {
+                        "ycsb-high": {
+                            "planning_delay_ms": 100,
+                            "abort_retry_delay_ms": 500,
+                            "workload_config": {"candidates_per_task": 5},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stdout = io.StringIO()
+            exit_code = main(
+                [
+                    "--profiles",
+                    "ycsb-high",
+                    "--output-dir",
+                    tmp,
+                    "--train-episodes",
+                    "1",
+                    "--train-task-count",
+                    "2",
+                    "--eval-task-count",
+                    "2",
+                    "--eval-repeats",
+                    "1",
+                    "--workers",
+                    "1",
+                    "--agent-slots",
+                    "0",
+                    "--planning-delay-ms",
+                    "0",
+                    "--abort-retry-delay-ms",
+                    "0",
+                    "--latency-distribution",
+                    "fixed",
+                    "--max-attempts",
+                    "2",
+                    "--tokens-per-operation",
+                    "10",
+                    "--background-workers",
+                    "0",
+                    "--profile-eval-overrides-file",
+                    str(override_path),
+                    "--profile-eval-overrides",
+                    '{"ycsb-high":{"planning_delay_ms":123}}',
+                ],
+                stdout=stdout,
+            )
+
+            self.assertEqual(exit_code, 0)
+            report = json.loads(stdout.getvalue())
+            eval_report = json.loads(
+                (Path(tmp) / "phase_atcc_ycsb-high_eval.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(eval_report["planning_delay_s"], 0.123)
+            self.assertEqual(eval_report["abort_retry_delay_s"], 0.5)
+            self.assertEqual(eval_report["workload_config"]["candidates_per_task"], 5)
+            self.assertEqual(
+                report["config"]["profile_eval_overrides"]["ycsb-high"],
+                {
+                    "planning_delay_s": 0.123,
+                    "abort_retry_delay_s": 0.5,
+                    "workload_config": {"candidates_per_task": 5},
+                },
+            )
+
+    def test_profile_suite_can_run_full_traditional_cc_family(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = run_profile_suite(
+                profiles=("ycsb-low",),
+                output_dir=Path(tmp),
+                strategy_set="full",
+                train_episodes=1,
+                train_task_count=2,
+                eval_task_count=2,
+                eval_repeats=1,
+                seed=23,
+                workers=1,
+                agent_slots=0,
+                planning_delay_s=0.0,
+                latency_distribution="fixed",
+                latency_cv=0.8,
+                latency_max_s=0.0,
+                max_attempts=2,
+                tokens_per_operation=10.0,
+                background_workers=0,
+                background_interval_s=0.0,
+            )
+
+            self.assertEqual(
+                set(report["config"]["strategies"]),
+                {
+                    "occ",
+                    "2pl-nowait",
+                    "2pl-wait-die",
+                    "mvcc-full",
+                    "silo-full",
+                    "tictoc-full",
+                    "adaptive-op-strict",
+                },
+            )
+            self.assertEqual(
+                {row["strategy"] for row in report["profiles"][0]["aggregates"]},
+                set(report["config"]["strategies"]),
             )
 
 

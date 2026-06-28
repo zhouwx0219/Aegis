@@ -25,6 +25,7 @@ from .atcc import (
 )
 from .cc_registry import CCResolution, ConcurrencyControlRegistry
 from .commit_protocol import CostAwareCommitProtocol, ObjectLockTable
+from .hybrid import ATCCFamilyDecision, ATCCFamilyPolicyTable
 from .transaction import (
     AgentTransaction,
     AgentTransactionManager,
@@ -52,6 +53,8 @@ __all__ = [
     "ATCCActionSpec",
     "ATCCPolicyQLearner",
     "ATCCRuntimeStats",
+    "ATCCFamilyDecision",
+    "ATCCFamilyPolicyTable",
     "PhaseAwareATCCDecision",
     "PhaseAwareATCCModule",
     "CCResolution",

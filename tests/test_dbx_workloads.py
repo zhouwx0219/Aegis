@@ -22,13 +22,17 @@ from agent.workloads import (
     TPCCAgentWorkload,
     TPCCFaithfulAgentWorkload,
     TPCCConfig,
+    AgentStage,
     YCSBAgentWorkload,
     YCSBFaithfulAgentWorkload,
     YCSBConfig,
     build_agent_workload,
     execute_task,
+    populate_task_stage,
     prepare_task_transaction,
     register_workload,
+    stage_operations,
+    task_agent_stages,
 )
 
 
@@ -545,7 +549,7 @@ class PluggableConcurrencyControlTests(unittest.TestCase):
             "semantic",
             ycsb_config=YCSBConfig(
                 record_count=4,
-                field_count=1,
+                field_count=2,
                 requests_per_task=2,
                 candidates_per_task=1,
                 read_weight=0.0,
@@ -1250,6 +1254,63 @@ class PluggableConcurrencyControlTests(unittest.TestCase):
         self.assertEqual(exported["ewma_committing_count"], 0.0)
 
 class AgentWorkloadTests(unittest.TestCase):
+    def test_agent_stage_metadata_is_json_serializable_and_queryable(self):
+        workload = YCSBAgentWorkload(
+            YCSBConfig(
+                record_count=8,
+                field_count=2,
+                requests_per_task=4,
+                candidates_per_task=2,
+                read_weight=0.5,
+                update_weight=0.5,
+                hotspot_fraction=0.25,
+                hotspot_access_probability=0.5,
+            )
+        )
+        task = workload.generate_tasks(1, seed=17)[0]
+
+        stages = task_agent_stages(task)
+        self.assertEqual(["explore", "refine", "commit"], [stage.phase for stage in stages])
+        self.assertTrue(all(isinstance(stage, AgentStage) for stage in stages))
+        json.dumps(task.to_dict())
+
+        commit_ops = stage_operations(task, "commit")
+        self.assertTrue(commit_ops)
+        self.assertTrue(all(operation.kind != "read" for operation in commit_ops))
+
+    def test_staged_task_can_be_replayed_phase_by_phase(self):
+        workload = build_agent_workload(
+            "ycsb",
+            "semantic",
+            ycsb_config=YCSBConfig(
+                record_count=4,
+                field_count=2,
+                requests_per_task=2,
+                candidates_per_task=1,
+                read_weight=0.5,
+                update_weight=0.5,
+                zipf_theta=0.0,
+                hotspot_fraction=0.25,
+                hotspot_access_probability=1.0,
+            ),
+        )
+        manager = AgentTransactionManager()
+        register_workload(manager, workload)
+        task = workload.generate_tasks(1, seed=17)[0]
+
+        txn = prepare_task_transaction(manager, task, strategy="occ", populate=False)
+        self.assertEqual(txn.read_set, {})
+        self.assertEqual(txn.candidates, [])
+
+        populate_task_stage(txn, task, "explore")
+        self.assertEqual(txn.candidates, [])
+
+        populate_task_stage(txn, task, "refine")
+        self.assertEqual(txn.candidates, [])
+
+        populate_task_stage(txn, task, "commit")
+        self.assertEqual(len(txn.candidates), len(task.candidates))
+
     def test_ycsb_is_deterministic_serializable_and_executable(self):
         workload = YCSBAgentWorkload(
             YCSBConfig(
@@ -1316,6 +1377,50 @@ class AgentWorkloadTests(unittest.TestCase):
                 requests_per_task=2,
             )
 
+    def test_ycsb_explicit_hotspot_profiles_match_paper_contention(self):
+        medium = YCSBAgentWorkload(
+            YCSBConfig(
+                record_count=100,
+                field_count=1,
+                requests_per_task=4,
+                candidates_per_task=2,
+                read_weight=0.9,
+                update_weight=0.1,
+                zipf_theta=0.0,
+                hotspot_fraction=0.10,
+                hotspot_access_probability=0.50,
+            )
+        )
+        high = YCSBAgentWorkload(
+            dataclasses.replace(
+                medium.config,
+                read_weight=0.5,
+                update_weight=0.5,
+                hotspot_access_probability=0.75,
+            )
+        )
+
+        def hot_ratio(workload):
+            hot_records = int(workload.config.record_count * workload.config.hotspot_fraction)
+            operations = [
+                operation
+                for task in workload.generate_tasks(200, seed=91)
+                for candidate in task.candidates
+                for operation in candidate.operations
+            ]
+            hot = 0
+            for operation in operations:
+                record = int(operation.object_id.split(":")[2])
+                hot += int(record < hot_records)
+            return hot / len(operations)
+
+        medium_ratio = hot_ratio(medium)
+        high_ratio = hot_ratio(high)
+        self.assertGreater(medium_ratio, 0.40)
+        self.assertLess(medium_ratio, 0.60)
+        self.assertGreater(high_ratio, 0.65)
+        self.assertGreater(high_ratio, medium_ratio + 0.15)
+
     def test_tpcc_new_order_preserves_stock_and_exposes_candidates(self):
         workload = TPCCAgentWorkload(
             TPCCConfig(
@@ -1351,6 +1456,29 @@ class AgentWorkloadTests(unittest.TestCase):
         ]
         self.assertTrue(stock_values)
         self.assertTrue(all(value >= 0 for value in stock_values))
+
+    def test_tpcc_new_order_exposes_paper_aligned_agent_stages(self):
+        workload = TPCCAgentWorkload(
+            TPCCConfig(
+                warehouses=1,
+                districts_per_warehouse=1,
+                customers_per_district=3,
+                items=6,
+                initial_stock=20,
+                order_lines=3,
+                candidates_per_task=2,
+                transaction_mix=(("new_order", 1.0),),
+            )
+        )
+        task = workload.generate_tasks(1, seed=4)[0]
+
+        stages = task_agent_stages(task)
+        self.assertEqual(["explore", "refine", "commit"], [stage.phase for stage in stages])
+        self.assertTrue(stage_operations(task, "explore"))
+        self.assertTrue(all(op.kind == "read" for op in stage_operations(task, "explore")))
+        commit_ops = stage_operations(task, "commit")
+        self.assertTrue(any("next_order_id" in op.object_id for op in commit_ops))
+        self.assertTrue(any(op.kind != "read" for op in commit_ops))
 
     def test_tpcc_transaction_families_generate_independently(self):
         for transaction_type in (

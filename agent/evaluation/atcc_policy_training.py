@@ -43,6 +43,7 @@ def train_phase_atcc_policy(
     latency_cv: float,
     latency_max_s: float,
     max_attempts: int,
+    policy_variant: str = "phase-rl",
     agent_admission_mode: str = "planning-only",
     tokens_per_operation: float = 2703.0,
     background_workers: int = 0,
@@ -58,15 +59,19 @@ def train_phase_atcc_policy(
     prelock_wait_budget_s: float = 0.0,
     prelock_wait_budget_mode: str = "transaction",
     prelock_lease_mode: str = "hold",
+    agent_execution_mode: str = "legacy",
+    snapshot_timing: str = "before-planning",
 ) -> Dict[str, Any]:
     if episodes <= 0:
         raise ValueError("episodes must be positive")
     if task_count <= 0:
         raise ValueError("task_count must be positive")
 
-    policy = _operation_policy(str(workload_kind), "phase-rl")
+    policy = _operation_policy(str(workload_kind), str(policy_variant))
     if policy.atcc_module is None:
-        raise ValueError("phase-rl policy did not create a phase-aware ATCC module")
+        raise ValueError(
+            f"{policy_variant} policy did not create a phase-aware ATCC module"
+        )
     if atcc_lock_wait_cost_per_s is not None:
         policy.atcc_module.lock_wait_cost_per_s = float(atcc_lock_wait_cost_per_s)
     if atcc_lock_action_cost is not None:
@@ -89,7 +94,7 @@ def train_phase_atcc_policy(
                 tasks,
                 "adaptive-op-strict",
                 workload_kind=str(workload_kind),
-                policy_variant="phase-rl",
+                policy_variant=str(policy_variant),
                 seed=run_seed,
                 workers=workers,
                 agent_slots=agent_slots,
@@ -109,6 +114,8 @@ def train_phase_atcc_policy(
                 prelock_wait_budget_s=prelock_wait_budget_s,
                 prelock_wait_budget_mode=prelock_wait_budget_mode,
                 prelock_lease_mode=prelock_lease_mode,
+                agent_execution_mode=agent_execution_mode,
+                snapshot_timing=snapshot_timing,
             )
         )
 
@@ -132,11 +139,14 @@ def train_phase_atcc_policy(
         "background_workers": int(background_workers),
         "background_interval_s": float(background_interval_s),
         "background_strategy": str(background_strategy),
+        "policy_variant": str(policy_variant),
         "object_lock_scheduler": str(object_lock_scheduler),
         "object_lock_priority_burst": int(object_lock_priority_burst),
         "prelock_wait_budget_s": float(prelock_wait_budget_s),
         "prelock_wait_budget_mode": str(prelock_wait_budget_mode),
         "prelock_lease_mode": str(prelock_lease_mode),
+        "agent_execution_mode": str(agent_execution_mode),
+        "snapshot_timing": str(snapshot_timing),
         "atcc_lock_wait_cost_per_s": (
             None
             if atcc_lock_wait_cost_per_s is None
@@ -171,7 +181,7 @@ def train_phase_atcc_policy(
         "workload_kind": str(workload_kind),
         "workload_config": dict(workload_config or {}),
         "strategy": "adaptive-op-strict",
-        "policy_variant": "phase-rl",
+        "policy_variant": str(policy_variant),
         "training_config": training_config,
         "training_elapsed_s": time.perf_counter() - started_at,
         "runs": [run.to_dict() for run in runs],
@@ -233,6 +243,7 @@ def _artifact_stats(table: Dict[str, Any]) -> Dict[str, Any]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train a phase-aware ATCC policy table.")
     parser.add_argument("--workload", choices=("tpcc", "ycsb"), default="tpcc")
+    parser.add_argument("--policy-variant", default="phase-rl")
     parser.add_argument("--episodes", type=int, default=3)
     parser.add_argument("--task-count", type=int, default=500)
     parser.add_argument("--seed", type=int, default=0)
@@ -279,6 +290,16 @@ def build_parser() -> argparse.ArgumentParser:
         default="hold",
     )
     parser.add_argument(
+        "--agent-execution-mode",
+        choices=("legacy", "staged", "staged-local"),
+        default="legacy",
+    )
+    parser.add_argument(
+        "--snapshot-timing",
+        choices=("before-planning", "after-planning"),
+        default="before-planning",
+    )
+    parser.add_argument(
         "--atcc-lock-wait-cost-per-s",
         type=float,
         help="Override the phase-aware ATCC reward penalty for one second of lock wait.",
@@ -313,6 +334,8 @@ def build_parser() -> argparse.ArgumentParser:
     ycsb.add_argument("--read-weight", type=float, default=0.2)
     ycsb.add_argument("--update-weight", type=float, default=0.8)
     ycsb.add_argument("--zipf-theta", type=float, default=0.99)
+    ycsb.add_argument("--hotspot-fraction", type=float, default=0.0)
+    ycsb.add_argument("--hotspot-access-probability", type=float, default=0.0)
 
     tpcc = parser.add_argument_group("TPC-C options")
     tpcc.add_argument("--warehouses", type=int, default=1)
@@ -332,6 +355,7 @@ def main(argv: Optional[Sequence[str]] = None, *, stdout: Optional[TextIO] = Non
         workload,
         workload_kind=args.workload,
         workload_config=workload_config,
+        policy_variant=args.policy_variant,
         episodes=args.episodes,
         task_count=args.task_count,
         seed=args.seed,
@@ -352,6 +376,8 @@ def main(argv: Optional[Sequence[str]] = None, *, stdout: Optional[TextIO] = Non
         prelock_wait_budget_s=args.prelock_wait_budget_ms / 1000.0,
         prelock_wait_budget_mode=args.prelock_wait_budget_mode,
         prelock_lease_mode=args.prelock_lease_mode,
+        agent_execution_mode=args.agent_execution_mode,
+        snapshot_timing=args.snapshot_timing,
         atcc_lock_wait_cost_per_s=args.atcc_lock_wait_cost_per_s,
         atcc_lock_action_cost=args.atcc_lock_action_cost,
         atcc_lock_queue_depth_cost=args.atcc_lock_queue_depth_cost,

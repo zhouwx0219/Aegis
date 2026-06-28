@@ -1,0 +1,17 @@
+{
+  "artifact_type": "atcc-family-policy-artifact",
+  "artifact_version": 1,
+  "family_policy_table": {
+    "cold_hotspot_probability_threshold": 0.01,
+    "cold_read_heavy_strategy": "adaptive-mvcc-tictoc",
+    "read_heavy_strategy": "adaptive-mvcc-tictoc",
+    "adaptive_cold_mvcc_write_ratio_threshold": 0.05,
+    "adaptive_hotspot_mvcc_write_ratio_threshold": 0.11,
+    "fallback_strategy": "tictoc-full",
+    "hot_write_ratio_threshold": 0.25,
+    "hot_write_strategy": "adaptive-op-strict",
+    "hotspot_probability_threshold": 0.7,
+    "read_heavy_write_ratio": 0.25
+  },
+  "source_system": "data-agent-runtime"
+}

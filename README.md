@@ -1,216 +1,240 @@
 # Data Agent System / CAST-DAS
 
-这是一个面向 **Data Agent 事务处理** 的研究原型。项目的核心思想是：
+本项目是一个面向 **Data Agent 事务处理** 的研究原型。当前版本的核心目标是：底层提供版本化 KV 存储，agent runtime 负责事务语义、候选计划、并发控制策略选择、提交和重试。
 
-- 底层只负责 **版本化 KV 存储**；
-- Agent runtime 负责 **事务语义、候选分支、并发控制选择、提交协议和重试/再生成边界**；
-- ATCC、传统 CC、语义 CC 都作为可插拔模块接入，而不是写死进底层存储。
+当前交接重点是 ATCC 在 agent-style TPCC/YCSB workload 上的自适应并发控制实验。
 
-当前项目重点支持在类 Agent 的 YCSB / TPC-C 改造负载上，对比：
+## 核心交接文件
+
+- 汇报文档：`docs/ATCC项目-2026.06.28.03/ATCC汇报.md`
+- ATCC 论文：`docs/ATCC.pdf`
+- 最终结果：`results/atcc_final_handoff_20260628/`
+
+最终结果目录结构：
+
+```text
+results/atcc_final_handoff_20260628/
+├── policies/
+│   ├── tpcc-family-policy-window.json
+│   ├── tpcc-family-search.json
+│   └── ycsb-adaptive-readheavy-family-policy.json
+├── tpcc/
+│   ├── summary.csv
+│   ├── tpcc-low.json
+│   ├── tpcc-medium.json
+│   └── tpcc-high.json
+└── ycsb/
+    ├── summary.csv
+    ├── ycsb-low.json
+    ├── ycsb-medium.json
+    └── ycsb-high.json
+```
+
+## 项目结构
+
+```text
+agent/runtime/       Agent 事务运行时、并发控制注册、ATCC、提交协议
+agent/workloads/     Agent-style YCSB / TPCC 工作负载
+agent/evaluation/    实验 runner、策略训练、结果聚合
+core/                版本化 KV 和底层绑定
+scripts/             实验脚本和结果汇总脚本
+tests/               单元测试和实验入口回归测试
+docs/                汇报文档和论文
+results/             精简后的核心实验结果
+```
+
+## Data Agent System 架构
+
+系统分两层：
+
+- 底层：版本化 KV 存储，只负责对象版本、读写、条件提交和原子更新。
+- 上层：agent runtime，负责事务语义、候选计划、多阶段 workflow、并发控制策略选择和失败重试。
+
+一个 agent task 会被表示成：
+
+```text
+AgentTask
+  -> 多个 ranked candidates
+  -> explore / refine / commit 阶段
+  -> AgentTransactionManager
+  -> CC registry / ATCC policy / commit protocol
+  -> Versioned KV Store
+```
+
+## 自适应混合策略
+
+自适应混合策略不是新的底层协议，而是策略族选择器。它会按 task 或 task window 判断应该使用哪类并发控制：
 
 - OCC
-- 2PL No-wait / Wait-die
+- 2PL-nowait / 2PL-wait-die
 - MVCC
-- SILO
-- TicToc
-- ATCC 
+- Silo 类协议
+- TicToc 类协议
+- 操作级 ATCC
 
-## 1. 项目结构
+操作级 ATCC 负责按每个操作决定乐观执行、提前加锁或提交前刷新。自适应混合策略负责决定整个任务走哪个策略族。
 
-```text
-cast-das/
-├── agent/
-│   ├── runtime/        # Agent 事务运行时、CC registry、ATCC、提交协议
-│   ├── workloads/      # Agent-YCSB / Agent-TPCC 改造负载
-│   └── evaluation/     # 实验 runner、profile 训练、DBx1000 native runner
-├── core/               # C++ 核心接口：版本化 KV、并发控制、事务提交内核
-├── tests/              # 单元测试
-├── third_party/dbx1000 # DBx1000 源码，用作参考和 native baseline
-├── scripts/            # 交接用简化运行脚本
-├── docs/               # 精简后的说明文档；历史过程已归档到 docs/archive/
-├── results/            # 精简后的关键结果；历史结果已归档到 results/archive/
-├── build.sh            # 构建 Linux/WSL Python 扩展
-├── pyproject.toml
-└── README.md
-```
+## 工作负载
 
-## 2. 系统架构
+### YCSB
 
-系统边界可以理解为：
+YCSB 对象：
 
 ```text
-Agent Task
-  -> K 个候选计划
-  -> AgentTransactionManager
-  -> Branch Semantics / CC Registry / Commit Protocol
-  -> VersionedKVStore
+ycsb:record:{record}:field:{field}
 ```
 
-关键模块：
+值类型是字符串字段值。操作包括 `read` 和 `overwrite`。每个 task 有多个候选计划，并按 `explore -> refine -> commit` 分阶段执行。
 
-- `agent/runtime/transaction.py`
-  - 管理事务生命周期、snapshot、prelock lease、提交/abort 结果。
-- `agent/runtime/cc_registry.py`
-  - 注册和选择并发控制策略。
-- `agent/runtime/adaptive.py`
-  - Operation-level ATCC 策略表。
-- `agent/runtime/atcc.py`
-  - Phase-aware ATCC 模块、Q 表、reward 和 priority。
-- `agent/runtime/traditional_cc.py`
-  - Agent runtime 层的传统 CC baseline：2PL、MVCC、SILO、TicToc。
-- `agent/workloads/ycsb.py`
-  - 类 Agent 的 YCSB 改造负载。
-- `agent/workloads/tpcc.py`
-  - 类 Agent 的 TPC-C 改造负载。
-- `agent/evaluation/atcc_retry_experiment.py`
-  - 当前主要实验入口。
+### TPCC
 
-底层 DBx1000 在这个项目里主要作为 **进程内、非持久化、版本化 KV substrate**。Agent 事务语义不依赖 DBx1000 原生事务线程模型。
-
-## 3. 环境与构建
-
-推荐使用 WSL/Linux 运行，因为 `cast_core.cpython-312-x86_64-linux-gnu.so` 是 Linux Python 扩展。
-
-```bash
-python3 -m pip install -e .
-bash build.sh
-python3 -m unittest discover -s tests -v
-```
-
-如果在 Windows PowerShell 中操作，涉及运行实验时请通过 WSL：
-
-```powershell
-wsl -e bash -lc "cd /mnt/z/Data-Agent-System-master/cast-das && python3 -m unittest discover -s tests -v"
-```
-
-## 4. 快速验证
-
-交接时建议先跑一组轻量测试：
-
-```bash
-python3 -m unittest \
-  tests.test_atcc_ycsb_strict_tuned \
-  tests.test_traditional_cc_full \
-  tests.test_atcc_retry_experiment \
-  -v
-```
-
-这能覆盖：
-
-- 新的 YCSB tuned ATCC variant；
-- 传统 CC baseline；
-- retry experiment 的核心指标汇总。
-
-## 5. 简化实验命令
-
-新增了 PowerShell 包装脚本。
-
-### 5.1 跑 YCSB
-
-```powershell
-.\scripts\run_ycsb_compare.ps1 -Profile high -StrategySet atcc -PolicyVariant ycsb-strict-tuned
-```
-
-常用参数：
-
-- `-Profile low|medium|high|all`
-- `-StrategySet atcc|full`
-  - `atcc`：`occ,tictoc-full,adaptive-op-strict`
-  - `full`：`occ,2pl-nowait,2pl-wait-die,mvcc-full,silo-full,tictoc-full,adaptive-op-strict`
-- `-PolicyVariant ycsb-strict-tuned|default`
-- `-TaskCount 60`
-- `-OutputDir results/handoff_ycsb_compare`
-
-输出：
+TPCC 对象被展开成版本化 KV：
 
 ```text
-results/handoff_ycsb_compare/
-├── ycsb-low.json
-├── ycsb-medium.json
-├── ycsb-high.json
-└── summary.csv
+tpcc:warehouse:{w}:ytd
+tpcc:district:{w}:{d}:next_order_id
+tpcc:district:{w}:{d}:orders
+tpcc:district:{w}:{d}:history
+tpcc:customer:{w}:{d}:{c}:balance
+tpcc:customer:{w}:{d}:{c}:payment_count
+tpcc:customer:{w}:{d}:{c}:status
+tpcc:stock:{w}:{item}:quantity
+tpcc:stock:{w}:{item}:ytd
 ```
 
-### 5.2 跑 TPC-C
+值类型包括 counter、append stream、status row、constrained counter。当前核心实验使用 NewOrder，workflow 是先读取库存，再提交订单号、订单流和库存更新。
+
+## 核心实验结果
+
+YCSB 自适应混合策略相对传统 CC 的吞吐收益：
+
+| Profile | OCC | 2PL-nowait | 2PL-wait-die | MVCC | Silo | TicToc |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| low | 1.016x | 1.286x | 1.319x | 1.523x | 1.647x | 1.259x |
+| medium | 1.514x | 2.333x | 2.559x | 0.901x | 2.251x | 0.826x |
+| high | 5.819x | 18.809x | 17.444x | 1.766x | 11.504x | 1.358x |
+
+TPCC 窗口感知自适应策略结果：
+
+| Profile | Selected strategy | Throughput | Commit rate | vs OCC | vs MVCC | vs TicToc |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| low | OCC | 5.415 | 100% | 1.116x | 1.205x | 1.290x |
+| medium | operation-level ATCC | 20.106 | 100% | 2.154x | 2.377x | 1.840x |
+| high | operation-level ATCC | 23.930 | 100% | 24.480x | 186.260x | 41.213x |
+
+注意：TPCC high 的传统协议提交率很低，因此高倍数必须和 commit rate、attempts/task、p99 一起解释。TPCC low 的 `1.116x` 也不应解释成 OCC 算法本身更快，而是低冲突下自适应策略选择 OCC 快路径且本轮单 seed p99 略低。
+
+## 环境和测试
+
+推荐用 WSL/Linux 运行：
 
 ```powershell
-.\scripts\run_tpcc_compare.ps1 -Profile high -StrategySet full
+wsl -e bash -lc "cd /mnt/z/Data-Agent-System-master/cast-das && python3 -m unittest tests.test_core tests.test_compare_scripts tests.test_atcc_family_policy tests.test_atcc_policy_training tests.test_atcc_profile_runner tests.test_atcc_manifest_runner tests.test_atcc_retry_experiment tests.test_atcc_ycsb_strict_tuned tests.test_traditional_cc_full -v"
 ```
 
-输出：
+最后一次相关回归结果：
 
 ```text
-results/handoff_tpcc_compare/
-├── tpcc-low.json
-├── tpcc-medium.json
-├── tpcc-high.json
-└── summary.csv
+Ran 124 tests in 3.919s
+OK
 ```
 
-### 5.3 手动汇总已有 JSON
+## 查看原始结果
 
 ```powershell
-python .\scripts\summarize_retry_results.py --input-dir .\results\ycsb_strict_tuned_atcc_20260625
+Import-Csv results\atcc_final_handoff_20260628\ycsb\summary.csv
+Import-Csv results\atcc_final_handoff_20260628\tpcc\summary.csv
 ```
 
-## 6. 当前推荐实验入口
-
-如果只想复现当前最重要的 YCSB 结果：
+查看单个 JSON 聚合：
 
 ```powershell
-.\scripts\run_ycsb_compare.ps1 `
-  -Profile all `
-  -StrategySet atcc `
-  -PolicyVariant ycsb-strict-tuned `
-  -OutputDir results/handoff_ycsb_tuned
+wsl -e bash -lc "cd /mnt/z/Data-Agent-System-master/cast-das && python3 - <<'PY'
+import json
+from pathlib import Path
+for path in [
+    'results/atcc_final_handoff_20260628/ycsb/ycsb-high.json',
+    'results/atcc_final_handoff_20260628/tpcc/tpcc-high.json',
+]:
+    data = json.loads(Path(path).read_text())
+    print('\\n', path)
+    for row in data['aggregates']:
+        print(row['strategy'], row['committed_throughput'], row['commit_rate'], row.get('selected_strategy_counts'))
+PY"
 ```
 
-如果要覆盖所有传统 CC：
+## 复现实验
+
+### YCSB
 
 ```powershell
-.\scripts\run_ycsb_compare.ps1 `
+powershell -ExecutionPolicy Bypass -File .\scripts\run_ycsb_compare.ps1 `
   -Profile all `
   -StrategySet full `
-  -PolicyVariant ycsb-strict-tuned `
-  -OutputDir results/handoff_ycsb_tuned_full
+  -TaskCount 40 `
+  -Workers 24 `
+  -OutputDir results/atcc_matrix_ycsb_reproduce `
+  -PolicyArtifact results/atcc_final_handoff_20260628\policies\ycsb-adaptive-readheavy-family-policy.json
 ```
 
-## 7. 当前关键结果
+### TPCC
 
-保留在 results 顶层的关键实验：
+TPCC 最终结果需要开启 `--hybrid-selected-fast-through`，因此直接调用 runner。下面是 high 档示例，low/medium 替换最后的规模参数即可。
 
-- `results/ycsb_strict_tuned_atcc_20260625/`
-  - YCSB default ATCC vs tuned ATCC A/B。
-- `results/ycsb_strict_tuned_full_cc_20260625/`
-  - tuned ATCC 与完整传统 CC 矩阵。
-- `results/full_traditional_cc_ycsb_20260625/`
-  - 调优前 YCSB 完整传统 CC 对比。
-- `results/full_traditional_cc_tpcc_20260625/`
-  - TPCC 完整传统 CC 对比。
-- `results/atcc_pressure_reactive_guard_obs4_profiles_20260624_23_confirm/`
-  - 当前保留的 ATCC policy artifact。
+```powershell
+wsl -e bash -lc "cd /mnt/z/Data-Agent-System-master/cast-das && python3 -m agent.evaluation.atcc_retry_experiment \
+  --workload tpcc \
+  --strategies occ,2pl-nowait,2pl-wait-die,mvcc-full,silo-full,tictoc-full,adaptive-op-strict,adaptive-hybrid \
+  --task-count 40 \
+  --seed 920104 \
+  --repeats 1 \
+  --workers 24 \
+  --agent-slots 4 \
+  --agent-admission-mode before-begin \
+  --planning-delay-ms 50 \
+  --latency-distribution lognormal \
+  --latency-cv 0.8 \
+  --latency-max-ms 500 \
+  --max-attempts 8 \
+  --background-workers 4 \
+  --background-interval-ms 2 \
+  --background-strategy occ \
+  --object-lock-scheduler bounded-priority \
+  --object-lock-priority-burst 2 \
+  --prelock-wait-budget-ms 70 \
+  --prelock-wait-budget-mode object \
+  --prelock-lease-mode yield-refresh-regenerate \
+  --agent-execution-mode staged \
+  --snapshot-timing before-planning \
+  --policy-variant default \
+  --policy-artifact results/atcc_final_handoff_20260628/policies/tpcc-family-policy-window.json \
+  --hybrid-selected-fast-through \
+  --transaction-mix new_order:1.0 \
+  --warehouses 1 \
+  --districts-per-warehouse 2 \
+  --customers-per-district 40 \
+  --items 100 \
+  --order-lines 10 \
+  --output results/atcc_matrix_tpcc_reproduce/tpcc-high.json"
+```
 
-历史 smoke、probe、cost sweep 和旧 profile 已归档到：
+规模参数：
 
 ```text
-results/archive/exploratory_20260624/
+low:    --warehouses 8 --districts-per-warehouse 5 --customers-per-district 100 --items 500 --order-lines 5
+medium: --warehouses 2 --districts-per-warehouse 3 --customers-per-district 60 --items 200 --order-lines 8
+high:   --warehouses 1 --districts-per-warehouse 2 --customers-per-district 40 --items 100 --order-lines 10
 ```
 
-## 8. ATCC policy variant
+生成 summary：
 
-当前最值得关注的 ATCC variant 是：
-
-```text
-ycsb-strict-tuned
+```powershell
+python .\scripts\summarize_retry_results.py --input-dir .\results\atcc_matrix_tpcc_reproduce
 ```
 
-它通过 `--policy-variant ycsb-strict-tuned` 启用，只影响 YCSB policy table，不改变默认 ATCC、底层 KV、事务边界或传统 CC。
+## 下一步
 
-设计意图：
-
-- 低风险首轮保持 OCC；
-- retry 后优先保护 hot writes；
-- 更高 retry 才扩大锁范围；
-- 避免 medium 下过早进入 full read-write locking；
-- 在 high 下减少 retry 和 token waste。
-
+- 对 TPCC 窗口感知策略做 multi-seed 验证。
+- 优化 YCSB medium 边界，使其不输给 MVCC/TicToc。
+- 将 TPCC 窗口阈值从手工规则推进到在线自适应策略。
+- 继续把多分支事务语义、语义感知并发控制、成本感知提交协议和 ATCC 策略表做成可插拔模块。

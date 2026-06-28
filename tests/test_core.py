@@ -53,6 +53,24 @@ class StoreAndCommitTests(unittest.TestCase):
         self.assertTrue(store.put_if_version("key", deleted.version, "new"))
         self.assertGreater(store.get_version("key"), deleted.version)
 
+    def test_batch_put_if_version_is_atomic(self):
+        store = cc.VersionedObjectStore()
+        store.put("a", "old-a")
+        store.put("b", "old-b")
+        version_a = store.get_version("a")
+        stale_b = store.get_version("b")
+        store.put("b", "newer-b")
+
+        self.assertFalse(
+            store.batch_put_if_version(
+                [("a", version_a), ("b", stale_b)],
+                [("a", "new-a"), ("b", "new-b")],
+            )
+        )
+
+        self.assertEqual(store.get("a").value, "old-a")
+        self.assertEqual(store.get("b").value, "newer-b")
+
     def test_raw_duplicate_write_is_rejected(self):
         store = cc.VersionedObjectStore()
         store.put("counter", "0")

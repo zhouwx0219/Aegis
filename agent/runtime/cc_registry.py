@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import threading
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from agent.native import load_cast_core
 from agent.runtime.adaptive import (
@@ -373,6 +373,7 @@ class ConcurrencyControlRegistry:
     ) -> Tuple[List[str], Tuple[OperationPolicyDecision, ...]]:
         normalized = self.normalize_name(strategy)
         if normalized in self.strict_operation_adaptive_cc_names:
+            candidates = _scope_agent_candidates(candidates, metadata=metadata)
             decisions = self._operation_policy.select_agent_operations(
                 candidates, metadata=metadata
             )
@@ -464,3 +465,32 @@ class ConcurrencyControlRegistry:
                 ),
                 latency_s=float(getattr(result, "elapsed_s", 0.0)),
             )
+
+
+def _scope_agent_candidates(
+    candidates: Sequence[Any],
+    *,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> Tuple[Any, ...]:
+    rows = tuple(candidates or ())
+    metadata = dict(metadata or {})
+    context = metadata.get("context", {})
+    if not isinstance(context, Mapping):
+        context = {}
+    scope = str(
+        context.get(
+            "operation_candidate_scope",
+            metadata.get("operation_candidate_scope", "all"),
+        )
+        or "all"
+    ).strip().lower()
+    if scope == "all" or not rows:
+        return rows
+    if scope != "best":
+        raise ValueError(f"unsupported operation candidate scope: {scope}")
+    return (
+        max(
+            rows,
+            key=lambda candidate: float(getattr(candidate, "quality", 0.0) or 0.0),
+        ),
+    )

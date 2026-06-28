@@ -7,7 +7,13 @@ param(
 
     [string]$PolicyVariant = "ycsb-strict-tuned",
     [ValidateSet("hold", "yield-during-planning", "yield-refresh-regenerate", "defer-until-after-planning")]
-    [string]$PrelockLeaseMode = "defer-until-after-planning",
+    [string]$PrelockLeaseMode = "yield-refresh-regenerate",
+    [ValidateSet("legacy", "staged", "staged-local")]
+    [string]$AgentExecutionMode = "staged",
+    [ValidateSet("before-planning", "after-planning")]
+    [string]$SnapshotTiming = "before-planning",
+    [string]$PolicyArtifact = "",
+    [double]$PolicyEpsilon = -1.0,
     [int]$TaskCount = 60,
     [int]$Workers = 24,
     [string]$OutputDir = "results/handoff_ycsb_compare"
@@ -27,16 +33,23 @@ function Convert-ToWslPath([string]$Path) {
 
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $WslRepo = Convert-ToWslPath $RepoRoot
+$PolicyArtifactArgs = @()
+if ($PolicyArtifact) {
+    $PolicyArtifactArgs += "--policy-artifact $(Convert-ToWslPath $PolicyArtifact)"
+}
+if ($PolicyEpsilon -ge 0.0) {
+    $PolicyArtifactArgs += "--policy-epsilon $PolicyEpsilon"
+}
 
 $Strategies = if ($StrategySet -eq "full") {
-    "occ,2pl-nowait,2pl-wait-die,mvcc-full,silo-full,tictoc-full,adaptive-op-strict"
+    "occ,2pl-nowait,2pl-wait-die,mvcc-full,silo-full,tictoc-full,adaptive-op-strict,adaptive-hybrid"
 } else {
-    "occ,tictoc-full,adaptive-op-strict"
+    "occ,tictoc-full,adaptive-op-strict,adaptive-hybrid"
 }
 
 $Profiles = if ($Profile -eq "all") { @("low", "medium", "high") } else { @($Profile) }
 
-$Common = @(
+$CommonArgs = @(
     "--workload ycsb",
     "--strategies $Strategies",
     "--task-count $TaskCount",
@@ -58,13 +71,19 @@ $Common = @(
     "--prelock-wait-budget-ms 70",
     "--prelock-wait-budget-mode object",
     "--prelock-lease-mode $PrelockLeaseMode",
+    "--agent-execution-mode $AgentExecutionMode",
+    "--snapshot-timing $SnapshotTiming",
     "--policy-variant $PolicyVariant"
-) -join " "
+)
+if ($PolicyArtifactArgs.Count -gt 0) {
+    $CommonArgs += $PolicyArtifactArgs
+}
+$Common = $CommonArgs -join " "
 
 $ProfileArgs = @{
-    low = "--records 512 --fields 10 --requests-per-task 6 --candidates 3 --read-weight 0.95 --update-weight 0.05 --zipf-theta 0.0"
-    medium = "--records 128 --fields 10 --requests-per-task 6 --candidates 3 --read-weight 0.5 --update-weight 0.5 --zipf-theta 0.8"
-    high = "--records 64 --fields 10 --requests-per-task 8 --candidates 3 --read-weight 0.2 --update-weight 0.8 --zipf-theta 0.99"
+    low = "--records 512 --fields 10 --requests-per-task 10 --candidates 3 --read-weight 0.95 --update-weight 0.05 --zipf-theta 0.0 --hotspot-fraction 0.0 --hotspot-access-probability 0.0"
+    medium = "--records 128 --fields 10 --requests-per-task 10 --candidates 3 --read-weight 0.90 --update-weight 0.10 --zipf-theta 0.7 --hotspot-fraction 0.10 --hotspot-access-probability 0.50"
+    high = "--records 64 --fields 10 --requests-per-task 10 --candidates 3 --read-weight 0.50 --update-weight 0.50 --zipf-theta 0.99 --hotspot-fraction 0.10 --hotspot-access-probability 0.75"
 }
 
 foreach ($p in $Profiles) {

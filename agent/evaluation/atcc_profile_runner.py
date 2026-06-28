@@ -47,6 +47,8 @@ PROFILE_SPECS: Tuple[ATCCProfileSpec, ...] = (
             "read_weight": 0.95,
             "update_weight": 0.05,
             "zipf_theta": 0.0,
+            "hotspot_fraction": 0.0,
+            "hotspot_access_probability": 0.0,
         },
     ),
     ATCCProfileSpec(
@@ -61,6 +63,8 @@ PROFILE_SPECS: Tuple[ATCCProfileSpec, ...] = (
             "read_weight": 0.90,
             "update_weight": 0.10,
             "zipf_theta": 0.7,
+            "hotspot_fraction": 0.10,
+            "hotspot_access_probability": 0.50,
         },
     ),
     ATCCProfileSpec(
@@ -75,6 +79,8 @@ PROFILE_SPECS: Tuple[ATCCProfileSpec, ...] = (
             "read_weight": 0.50,
             "update_weight": 0.50,
             "zipf_theta": 0.99,
+            "hotspot_fraction": 0.10,
+            "hotspot_access_probability": 0.75,
         },
     ),
     ATCCProfileSpec(
@@ -129,13 +135,23 @@ DEFAULT_TRAINING_PROFILE = {
     "ycsb": "ycsb-high",
     "tpcc": "tpcc-high",
 }
-EVAL_STRATEGIES = ("occ", "2pl", "adaptive-op-strict")
+CORE_EVAL_STRATEGIES = ("occ", "2pl", "adaptive-op-strict")
+FULL_EVAL_STRATEGIES = (
+    "occ",
+    "2pl-nowait",
+    "2pl-wait-die",
+    "mvcc-full",
+    "silo-full",
+    "tictoc-full",
+    "adaptive-op-strict",
+)
 
 
 def run_profile_suite(
     *,
     profiles: Iterable[str] = (),
     output_dir: Path = Path("results/phase_atcc_profiles"),
+    strategy_set: str = "core",
     train_per_profile: bool = False,
     train_episodes: int = 3,
     train_task_count: int = 500,
@@ -146,6 +162,7 @@ def run_profile_suite(
     agent_slots: int = 4,
     agent_admission_mode: str = "planning-only",
     planning_delay_s: float = 0.010,
+    abort_retry_delay_s: float = 0.0,
     latency_distribution: str = "lognormal",
     latency_cv: float = 0.8,
     latency_max_s: float = 0.080,
@@ -159,6 +176,9 @@ def run_profile_suite(
     prelock_wait_budget_s: float = 0.0,
     prelock_wait_budget_mode: str = "transaction",
     prelock_lease_mode: str = "hold",
+    agent_execution_mode: str = "legacy",
+    snapshot_timing: str = "before-planning",
+    profile_eval_overrides: Optional[Mapping[str, Mapping[str, Any]]] = None,
     write_files: bool = True,
 ) -> Dict[str, Any]:
     selected = _select_profiles(profiles)
@@ -168,6 +188,7 @@ def run_profile_suite(
         raise ValueError("task counts must be positive")
     if eval_repeats <= 0:
         raise ValueError("eval_repeats must be positive")
+    eval_strategies = _eval_strategies(strategy_set)
 
     output_dir = Path(output_dir)
     artifacts: Dict[str, Dict[str, Any]] = {}
@@ -202,6 +223,8 @@ def run_profile_suite(
             prelock_wait_budget_s=prelock_wait_budget_s,
             prelock_wait_budget_mode=prelock_wait_budget_mode,
             prelock_lease_mode=prelock_lease_mode,
+            agent_execution_mode=agent_execution_mode,
+            snapshot_timing=snapshot_timing,
         )
         key = _artifact_key(train_spec, train_per_profile=train_per_profile)
         artifacts[key] = artifact
@@ -211,14 +234,29 @@ def run_profile_suite(
             _write_json(artifact_path, artifact)
 
     profile_reports = []
+    eval_overrides = {
+        str(name): dict(value)
+        for name, value in dict(profile_eval_overrides or {}).items()
+    }
     for spec in selected:
-        workload = _build_workload(spec)
+        profile_override = dict(eval_overrides.get(spec.name, {}) or {})
+        workload_config_override = dict(
+            profile_override.get("workload_config", {}) or {}
+        )
+        eval_spec = _with_config_override(spec, workload_config_override)
+        workload = _build_workload(eval_spec)
         key = _artifact_key(spec, train_per_profile=train_per_profile)
         artifact = artifacts[key]
+        eval_planning_delay_s = float(
+            profile_override.get("planning_delay_s", planning_delay_s)
+        )
+        eval_abort_retry_delay_s = float(
+            profile_override.get("abort_retry_delay_s", abort_retry_delay_s)
+        )
         runs = run_retry_matrix(
             workload,
-            EVAL_STRATEGIES,
-            workload_kind=spec.workload_kind,
+            eval_strategies,
+            workload_kind=eval_spec.workload_kind,
             policy_variant="phase-rl",
             task_count=eval_task_count,
             seed=seed,
@@ -226,7 +264,8 @@ def run_profile_suite(
             workers=workers,
             agent_slots=agent_slots,
             agent_admission_mode=agent_admission_mode,
-            planning_delay_s=planning_delay_s,
+            planning_delay_s=eval_planning_delay_s,
+            abort_retry_delay_s=eval_abort_retry_delay_s,
             latency_distribution=latency_distribution,
             latency_cv=latency_cv,
             latency_max_s=latency_max_s,
@@ -242,6 +281,8 @@ def run_profile_suite(
             prelock_wait_budget_s=prelock_wait_budget_s,
             prelock_wait_budget_mode=prelock_wait_budget_mode,
             prelock_lease_mode=prelock_lease_mode,
+            agent_execution_mode=agent_execution_mode,
+            snapshot_timing=snapshot_timing,
         )
         aggregates = aggregate_retry_runs(runs)
         eval_report = {
@@ -250,9 +291,9 @@ def run_profile_suite(
             "profile": spec.name,
             "description": spec.description,
             "workload": workload.name,
-            "workload_kind": spec.workload_kind,
+            "workload_kind": eval_spec.workload_kind,
             "workload_config": dict(dataclasses.asdict(workload.config)),
-            "strategies": list(EVAL_STRATEGIES),
+            "strategies": list(eval_strategies),
             "policy_variant": "phase-rl",
             "policy_artifact": str(artifact_paths[key]),
             "policy_artifact_schema": atcc_artifact_schema_status(artifact),
@@ -262,7 +303,8 @@ def run_profile_suite(
             "workers": workers,
             "agent_slots": agent_slots,
             "agent_admission_mode": agent_admission_mode,
-            "planning_delay_s": planning_delay_s,
+            "planning_delay_s": eval_planning_delay_s,
+            "abort_retry_delay_s": eval_abort_retry_delay_s,
             "latency_distribution": latency_distribution,
             "latency_cv": latency_cv,
             "latency_max_s": latency_max_s,
@@ -276,6 +318,8 @@ def run_profile_suite(
             "prelock_wait_budget_s": prelock_wait_budget_s,
             "prelock_wait_budget_mode": prelock_wait_budget_mode,
             "prelock_lease_mode": prelock_lease_mode,
+            "agent_execution_mode": agent_execution_mode,
+            "snapshot_timing": snapshot_timing,
             "runs": [run.to_dict() for run in runs],
             "aggregates": aggregates,
             "comparisons": _comparisons(aggregates),
@@ -287,8 +331,9 @@ def run_profile_suite(
             {
                 "profile": spec.name,
                 "description": spec.description,
-                "workload_kind": spec.workload_kind,
+                "workload_kind": eval_spec.workload_kind,
                 "workload_config": eval_report["workload_config"],
+                "eval_overrides": profile_override,
                 "policy_artifact": str(artifact_paths[key]),
                 "policy_artifact_schema": eval_report["policy_artifact_schema"],
                 "evaluation": str(eval_path),
@@ -309,8 +354,11 @@ def run_profile_suite(
         "prelock_wait_budget_s": prelock_wait_budget_s,
         "prelock_wait_budget_mode": prelock_wait_budget_mode,
         "prelock_lease_mode": prelock_lease_mode,
+        "agent_execution_mode": agent_execution_mode,
+        "snapshot_timing": snapshot_timing,
         "profiles": profile_reports,
         "config": {
+            "strategy_set": str(strategy_set),
             "train_per_profile": train_per_profile,
             "train_episodes": train_episodes,
             "train_task_count": train_task_count,
@@ -321,6 +369,7 @@ def run_profile_suite(
             "agent_slots": agent_slots,
             "agent_admission_mode": agent_admission_mode,
             "planning_delay_s": planning_delay_s,
+            "abort_retry_delay_s": abort_retry_delay_s,
             "latency_distribution": latency_distribution,
             "latency_cv": latency_cv,
             "latency_max_s": latency_max_s,
@@ -334,7 +383,10 @@ def run_profile_suite(
             "prelock_wait_budget_s": prelock_wait_budget_s,
             "prelock_wait_budget_mode": prelock_wait_budget_mode,
             "prelock_lease_mode": prelock_lease_mode,
-            "strategies": list(EVAL_STRATEGIES),
+            "agent_execution_mode": agent_execution_mode,
+            "snapshot_timing": snapshot_timing,
+            "strategies": list(eval_strategies),
+            "profile_eval_overrides": eval_overrides,
         },
     }
     report["markdown"] = render_markdown_report(report)
@@ -436,6 +488,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--output-dir", type=Path, default=Path("results/phase_atcc_profiles"))
+    parser.add_argument(
+        "--strategy-set",
+        choices=("core", "full"),
+        default="core",
+        help=(
+            "'core' compares OCC/2PL/ATCC; 'full' also includes "
+            "2PL nowait/wait-die, MVCC, SILO, and TicToc."
+        ),
+    )
     parser.add_argument("--train-per-profile", action="store_true")
     parser.add_argument("--train-episodes", type=int, default=3)
     parser.add_argument("--train-task-count", type=int, default=500)
@@ -450,6 +511,25 @@ def build_parser() -> argparse.ArgumentParser:
         default="planning-only",
     )
     parser.add_argument("--planning-delay-ms", type=float, default=10.0)
+    parser.add_argument("--abort-retry-delay-ms", type=float, default=0.0)
+    parser.add_argument(
+        "--profile-eval-overrides",
+        default="",
+        help=(
+            "JSON object keyed by profile name. Supports workload_config plus "
+            "planning_delay_ms/planning_delay_s and "
+            "abort_retry_delay_ms/abort_retry_delay_s."
+        ),
+    )
+    parser.add_argument(
+        "--profile-eval-overrides-file",
+        default="",
+        help=(
+            "Path to a JSON object keyed by profile name. File overrides are "
+            "loaded before --profile-eval-overrides, so inline JSON can "
+            "override file defaults."
+        ),
+    )
     parser.add_argument(
         "--latency-distribution",
         choices=("fixed", "lognormal", "pareto"),
@@ -484,6 +564,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         default="hold",
     )
+    parser.add_argument(
+        "--agent-execution-mode",
+        choices=("legacy", "staged", "staged-local"),
+        default="legacy",
+    )
+    parser.add_argument(
+        "--snapshot-timing",
+        choices=("before-planning", "after-planning"),
+        default="before-planning",
+    )
     return parser
 
 
@@ -492,6 +582,7 @@ def main(argv: Optional[Sequence[str]] = None, *, stdout: Optional[TextIO] = Non
     report = run_profile_suite(
         profiles=_split_csv(args.profiles),
         output_dir=args.output_dir,
+        strategy_set=args.strategy_set,
         train_per_profile=args.train_per_profile,
         train_episodes=args.train_episodes,
         train_task_count=args.train_task_count,
@@ -502,6 +593,7 @@ def main(argv: Optional[Sequence[str]] = None, *, stdout: Optional[TextIO] = Non
         agent_slots=args.agent_slots,
         agent_admission_mode=args.agent_admission_mode,
         planning_delay_s=args.planning_delay_ms / 1000.0,
+        abort_retry_delay_s=args.abort_retry_delay_ms / 1000.0,
         latency_distribution=args.latency_distribution,
         latency_cv=args.latency_cv,
         latency_max_s=args.latency_max_ms / 1000.0,
@@ -515,6 +607,12 @@ def main(argv: Optional[Sequence[str]] = None, *, stdout: Optional[TextIO] = Non
         prelock_wait_budget_s=args.prelock_wait_budget_ms / 1000.0,
         prelock_wait_budget_mode=args.prelock_wait_budget_mode,
         prelock_lease_mode=args.prelock_lease_mode,
+        agent_execution_mode=args.agent_execution_mode,
+        snapshot_timing=args.snapshot_timing,
+        profile_eval_overrides=_merge_profile_eval_overrides(
+            _load_profile_eval_overrides_file(args.profile_eval_overrides_file),
+            _parse_profile_eval_overrides(args.profile_eval_overrides),
+        ),
     )
     (stdout or sys.stdout).write(json.dumps(report, indent=2, sort_keys=True) + "\n")
     return 0
@@ -581,6 +679,26 @@ def _build_workload(spec: ATCCProfileSpec) -> AgentWorkload:
             tpcc_config=TPCCConfig(**dict(spec.config)),
         )
     raise ValueError(f"unsupported workload kind: {spec.workload_kind}")
+
+
+def _with_config_override(
+    spec: ATCCProfileSpec,
+    override: Mapping[str, Any],
+) -> ATCCProfileSpec:
+    if not override:
+        return spec
+    config = dict(spec.config)
+    config.update(dict(override))
+    return dataclasses.replace(spec, config=config)
+
+
+def _eval_strategies(strategy_set: str) -> Tuple[str, ...]:
+    normalized = str(strategy_set or "core").strip().lower()
+    if normalized == "core":
+        return CORE_EVAL_STRATEGIES
+    if normalized == "full":
+        return FULL_EVAL_STRATEGIES
+    raise ValueError(f"unsupported strategy set: {strategy_set}")
 
 
 def _comparisons(aggregates: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
@@ -650,6 +768,55 @@ def _write_json(path: Path, data: Mapping[str, Any]) -> None:
 
 def _split_csv(value: str) -> Tuple[str, ...]:
     return tuple(part.strip() for part in str(value).split(",") if part.strip())
+
+
+def _parse_profile_eval_overrides(raw: str) -> Dict[str, Dict[str, Any]]:
+    text = str(raw or "").strip()
+    if not text:
+        return {}
+    data = json.loads(text)
+    if not isinstance(data, Mapping):
+        raise ValueError("--profile-eval-overrides must be a JSON object")
+    parsed: Dict[str, Dict[str, Any]] = {}
+    for profile, row in data.items():
+        if not isinstance(row, Mapping):
+            raise ValueError("profile override rows must be JSON objects")
+        normalized = dict(row)
+        if "planning_delay_ms" in normalized:
+            normalized["planning_delay_s"] = (
+                float(normalized.pop("planning_delay_ms")) / 1000.0
+            )
+        if "abort_retry_delay_ms" in normalized:
+            normalized["abort_retry_delay_s"] = (
+                float(normalized.pop("abort_retry_delay_ms")) / 1000.0
+            )
+        parsed[str(profile)] = normalized
+    return parsed
+
+
+def _load_profile_eval_overrides_file(path: str) -> Dict[str, Dict[str, Any]]:
+    text = str(path or "").strip()
+    if not text:
+        return {}
+    return _parse_profile_eval_overrides(Path(text).read_text(encoding="utf-8"))
+
+
+def _merge_profile_eval_overrides(
+    *sources: Mapping[str, Mapping[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    merged: Dict[str, Dict[str, Any]] = {}
+    for source in sources:
+        for profile, row in dict(source or {}).items():
+            target = dict(merged.get(str(profile), {}) or {})
+            for key, value in dict(row or {}).items():
+                if key == "workload_config":
+                    workload_config = dict(target.get("workload_config", {}) or {})
+                    workload_config.update(dict(value or {}))
+                    target[key] = workload_config
+                else:
+                    target[key] = value
+            merged[str(profile)] = target
+    return merged
 
 
 if __name__ == "__main__":

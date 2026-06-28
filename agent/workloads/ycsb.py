@@ -9,6 +9,7 @@ from typing import Iterable, Sequence, Tuple
 from .base import (
     AgentCandidate,
     AgentOperation,
+    AgentStage,
     AgentTask,
     AgentWorkload,
     ObjectSpec,
@@ -25,6 +26,8 @@ class YCSBConfig:
     read_weight: float = 0.5
     update_weight: float = 0.5
     zipf_theta: float = 0.6
+    hotspot_fraction: float = 0.0
+    hotspot_access_probability: float = 0.0
     initial_value: str = "0"
 
     def __post_init__(self) -> None:
@@ -41,6 +44,10 @@ class YCSBConfig:
             raise ValueError("YCSB needs at least one operation type")
         if self.zipf_theta < 0:
             raise ValueError("zipf_theta must be non-negative")
+        if not 0.0 <= self.hotspot_fraction <= 1.0:
+            raise ValueError("hotspot_fraction must be in [0, 1]")
+        if not 0.0 <= self.hotspot_access_probability <= 1.0:
+            raise ValueError("hotspot_access_probability must be in [0, 1]")
         if self.requests_per_task > self.record_count * self.field_count:
             raise ValueError(
                 "requests_per_task cannot exceed the number of YCSB fields"
@@ -101,10 +108,24 @@ class YCSBAgentWorkload(AgentWorkload):
                     metadata={"record": record, "field": field},
                 )
 
-    def _sample_target(self, rng: random.Random) -> Tuple[int, int]:
-        record = rng.choices(
+    def _hot_record_count(self) -> int:
+        if self.config.hotspot_fraction <= 0.0:
+            return 0
+        return max(1, int(self.config.record_count * self.config.hotspot_fraction))
+
+    def _sample_record(self, rng: random.Random) -> int:
+        hot_count = self._hot_record_count()
+        if hot_count and self.config.hotspot_access_probability > 0.0:
+            if rng.random() < self.config.hotspot_access_probability:
+                return rng.randrange(hot_count)
+            if hot_count < self.config.record_count:
+                return rng.randrange(hot_count, self.config.record_count)
+        return rng.choices(
             range(self.config.record_count), weights=self._record_weights, k=1
         )[0]
+
+    def _sample_target(self, rng: random.Random) -> Tuple[int, int]:
+        record = self._sample_record(rng)
         return record, rng.randrange(self.config.field_count)
 
     def generate_tasks(self, count: int, *, seed: int = 0) -> Sequence[AgentTask]:
@@ -144,6 +165,7 @@ class YCSBAgentWorkload(AgentWorkload):
                         metadata={"source": "DBx1000/YCSB"},
                     )
                 )
+            stages = _agent_stages_for_candidates(candidates)
             tasks.append(
                 AgentTask(
                     task_id=f"ycsb-{task_index}",
@@ -153,16 +175,49 @@ class YCSBAgentWorkload(AgentWorkload):
                     candidates=tuple(candidates),
                     context={
                         "zipf_theta": self.config.zipf_theta,
+                        "hotspot_fraction": self.config.hotspot_fraction,
+                        "hotspot_access_probability": (
+                            self.config.hotspot_access_probability
+                        ),
+                        "hot_record_count": self._hot_record_count(),
+                        "record_count": self.config.record_count,
                         "requests_per_task": self.config.requests_per_task,
                         "agent_phase_sequence": _agent_phase_sequence(
                             has_read=has_read,
                             has_write=has_write,
                             operation_count=self.config.requests_per_task,
                         ),
+                        "agent_stages": [stage.to_dict() for stage in stages],
                     },
                 )
             )
         return tasks
+
+
+def _agent_stages_for_candidates(
+    candidates: Sequence[AgentCandidate],
+) -> Tuple[AgentStage, ...]:
+    reads = [
+        operation
+        for candidate in candidates
+        for operation in candidate.operations
+        if operation.kind == "read"
+    ]
+    writes = [
+        operation
+        for candidate in candidates
+        for operation in candidate.operations
+        if operation.kind != "read"
+    ]
+    explore_count = max(1, int(len(reads) * 0.6)) if reads else 0
+    explore = tuple(reads[:explore_count])
+    refine = tuple(reads[explore_count:])
+    commit = tuple(writes)
+    return (
+        AgentStage("explore", explore, delay_weight=1.0),
+        AgentStage("refine", refine, delay_weight=1.0),
+        AgentStage("commit", commit, delay_weight=1.0),
+    )
 
 
 def _agent_phase_sequence(

@@ -65,6 +65,23 @@ PYBIND11_MODULE(cast_core, m) {
       .def("get_version", &storage::VersionedKVStore::GetVersion)
       .def("put", &storage::VersionedKVStore::Put)
       .def("put_if_version", &storage::VersionedKVStore::PutIfVersion)
+      .def(
+          "batch_put_if_version",
+          [](storage::VersionedKVStore& store,
+             const std::vector<std::pair<std::string, std::uint64_t>>& checks,
+             const std::vector<std::pair<std::string, std::string>>& writes) {
+            std::vector<storage::VersionCheck> version_checks;
+            version_checks.reserve(checks.size());
+            for (const auto& check : checks) {
+              version_checks.push_back({check.first, check.second});
+            }
+            std::vector<storage::WriteOp> write_ops;
+            write_ops.reserve(writes.size());
+            for (const auto& write : writes) {
+              write_ops.push_back({write.first, write.second});
+            }
+            return store.BatchPutIfVersion(version_checks, write_ops);
+          })
       .def("delete_if_version", &storage::VersionedKVStore::DeleteIfVersion)
       .def_property_readonly("backend_name", [](const storage::VersionedKVStore& store) {
         return std::string(store.BackendName());

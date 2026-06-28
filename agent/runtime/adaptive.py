@@ -229,6 +229,7 @@ class OperationPolicyProfile:
     retry_count: int = 0
     agent_interval_s: float = 0.0
     agent_phase: str = ""
+    hotspot_record_count: int = 0
 
     @property
     def is_semantic_write(self) -> bool:
@@ -1862,6 +1863,10 @@ def profile_agent_operations(
 
     metadata = dict(metadata or {})
     retry_count, agent_interval_s, agent_phase = _agent_runtime_metadata(metadata)
+    context = metadata.get("context", {})
+    if not isinstance(context, Mapping):
+        context = {}
+    hotspot_record_count = int(context.get("hot_record_count", 0) or 0)
     write_counts: Counter[str] = Counter()
     write_intents: Dict[str, str] = {}
     read_ids = set()
@@ -1890,6 +1895,7 @@ def profile_agent_operations(
                 retry_count=retry_count,
                 agent_interval_s=agent_interval_s,
                 agent_phase=agent_phase,
+                hotspot_record_count=hotspot_record_count,
             )
         )
     for object_id, count in sorted(write_counts.items()):
@@ -1906,6 +1912,7 @@ def profile_agent_operations(
                 retry_count=retry_count,
                 agent_interval_s=agent_interval_s,
                 agent_phase=agent_phase,
+                hotspot_record_count=hotspot_record_count,
             )
         )
     return tuple(profiles)

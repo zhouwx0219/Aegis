@@ -9,6 +9,7 @@ from typing import Dict, Iterable, Sequence, Tuple
 from .base import (
     AgentCandidate,
     AgentOperation,
+    AgentStage,
     AgentTask,
     AgentWorkload,
     ObjectSpec,
@@ -325,6 +326,7 @@ class TPCCAgentWorkload(AgentWorkload):
                     district,
                     customer,
                 )
+            stages = _agent_stages_for_candidates(task_type, candidates)
             tasks.append(
                 AgentTask(
                     task_id=f"tpcc-{task_index}",
@@ -338,6 +340,7 @@ class TPCCAgentWorkload(AgentWorkload):
                         "customer": customer,
                         "source": "DBx1000/TPCC",
                         "agent_phase_sequence": _agent_phase_sequence(task_type),
+                        "agent_stages": [stage.to_dict() for stage in stages],
                     },
                 )
             )
@@ -354,6 +357,41 @@ def _agent_phase_sequence(task_type: str) -> Tuple[str, ...]:
     if task_type == "delivery":
         return ("commit",)
     return ("commit",)
+
+
+def _agent_stages_for_candidates(
+    task_type: str,
+    candidates: Sequence[AgentCandidate],
+) -> Tuple[AgentStage, ...]:
+    operations = tuple(
+        operation for candidate in candidates for operation in candidate.operations
+    )
+    if task_type == "new_order":
+        stock_reads = tuple(
+            AgentOperation.read(operation.object_id)
+            for operation in operations
+            if ":stock:" in operation.object_id and operation.object_id.endswith(":quantity")
+        )
+        midpoint = max(1, len(stock_reads) // 2) if stock_reads else 0
+        return (
+            AgentStage("explore", stock_reads[:midpoint], delay_weight=1.0),
+            AgentStage("refine", stock_reads[midpoint:], delay_weight=1.0),
+            AgentStage("commit", operations, delay_weight=1.0),
+        )
+    reads = tuple(operation for operation in operations if operation.kind == "read")
+    writes = tuple(operation for operation in operations if operation.kind != "read")
+    sequence = _agent_phase_sequence(task_type)
+    if sequence == ("refine", "commit"):
+        return (
+            AgentStage("refine", reads, delay_weight=1.0),
+            AgentStage("commit", writes, delay_weight=1.0),
+        )
+    if sequence == ("explore", "refine"):
+        return (
+            AgentStage("explore", reads, delay_weight=1.0),
+            AgentStage("refine", (), delay_weight=1.0),
+        )
+    return (AgentStage("commit", operations, delay_weight=1.0),)
 
 
 class TPCCFaithfulAgentWorkload(TPCCAgentWorkload):
