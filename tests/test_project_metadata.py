@@ -40,6 +40,10 @@ class ProjectMetadataTests(unittest.TestCase):
             "agent.evaluation.atcc_reward_cost_search:main",
         )
         self.assertEqual(
+            data["project"]["scripts"]["astra-atcc-ablation"],
+            "agent.evaluation.atcc_ablation_experiment:main",
+        )
+        self.assertEqual(
             data["tool"]["setuptools"]["packages"]["find"]["include"],
             ["agent*"],
         )

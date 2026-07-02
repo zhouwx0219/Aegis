@@ -1605,6 +1605,7 @@ def _run_one_retry(
     policy_artifact: Optional[Mapping[str, Any]] = None,
     policy_epsilon: Optional[float] = None,
     operation_policy: Optional[OperationPolicyTable] = None,
+    transaction_atcc_policy: Optional[TransactionAwareATCCModule] = None,
     background_workers: int = 0,
     background_interval_s: float = 0.0,
     background_strategy: str = "occ",
@@ -1624,7 +1625,9 @@ def _run_one_retry(
     )
     manager = AgentTransactionManager(
         operation_policy=policy,
-        transaction_atcc_policy=_transaction_atcc_policy(workload_kind),
+        transaction_atcc_policy=(
+            transaction_atcc_policy or _transaction_atcc_policy(workload_kind)
+        ),
         object_lock_queue_policy=object_lock_scheduler,
         object_lock_priority_burst=object_lock_priority_burst,
         prelock_wait_budget_s=prelock_wait_budget_s,

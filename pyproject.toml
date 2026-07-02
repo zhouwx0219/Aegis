@@ -29,6 +29,7 @@ astra-atcc-retry = "agent.evaluation.atcc_retry_experiment:main"
 astra-atcc-train = "agent.evaluation.atcc_policy_training:main"
 astra-atcc-profiles = "agent.evaluation.atcc_profile_runner:main"
 astra-atcc-cost-search = "agent.evaluation.atcc_reward_cost_search:main"
+astra-atcc-ablation = "agent.evaluation.atcc_ablation_experiment:main"
 
 [tool.setuptools.packages.find]
 include = ["agent*"]

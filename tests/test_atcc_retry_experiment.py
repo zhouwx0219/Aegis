@@ -279,6 +279,79 @@ class RetryExperimentMetricTests(unittest.TestCase):
 
         self.assertEqual(selected, "mvcc-full")
 
+    def test_selected_baseline_allows_transaction_atcc_hot_write_strategy(self):
+        tasks = (
+            AgentTask(
+                task_id="hot-write",
+                workload="agent-ycsb-semantic",
+                task_type="read-update",
+                request="hot write task",
+                context={
+                    "hotspot_fraction": 0.10,
+                    "hotspot_access_probability": 0.90,
+                    "hot_record_count": 4,
+                },
+                candidates=(
+                    AgentCandidate(
+                        "candidate",
+                        1.0,
+                        (
+                            AgentOperation.overwrite("ycsb:record:0:field:0", "v"),
+                            AgentOperation.overwrite("ycsb:record:1:field:0", "v"),
+                            AgentOperation.read("ycsb:record:8:field:1"),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        policy_artifact = {
+            "family_policy_table": {
+                "hot_write_strategy": "transaction-atcc-strict",
+            }
+        }
+
+        selected = retry_experiment._selected_baseline_strategy_for_tasks(
+            ("adaptive-hybrid", "transaction-atcc-strict", "tictoc-full"),
+            tasks,
+            workload_kind="ycsb",
+            policy_artifact=policy_artifact,
+        )
+
+        self.assertEqual(selected, "transaction-atcc-strict")
+
+    def test_selected_baseline_routes_tpcc_hot_window_to_transaction_atcc(self):
+        workload = build_agent_workload(
+            "tpcc",
+            "semantic",
+            tpcc_config=TPCCConfig(
+                warehouses=1,
+                districts_per_warehouse=2,
+                customers_per_district=40,
+                items=100,
+                order_lines=10,
+                candidates_per_task=4,
+                transaction_mix=(("new_order", 1.0),),
+            ),
+        )
+        tasks = tuple(workload.generate_tasks(12, seed=1))
+        policy_artifact = {
+            "family_policy_table": {
+                "hot_write_strategy": "transaction-atcc-strict",
+                "fallback_strategy": "tictoc-full",
+                "tpcc_low_contention_strategy": "occ",
+                "tpcc_low_contention_min_distinct_order_counters": 16,
+            }
+        }
+
+        selected = retry_experiment._selected_baseline_strategy_for_tasks(
+            ("adaptive-hybrid", "transaction-atcc-strict", "occ", "tictoc-full"),
+            tasks,
+            workload_kind="tpcc",
+            policy_artifact=policy_artifact,
+        )
+
+        self.assertEqual(selected, "transaction-atcc-strict")
+
     def test_adaptive_hybrid_reports_selected_strategy_counts(self):
         workload = build_agent_workload(
             "ycsb",
