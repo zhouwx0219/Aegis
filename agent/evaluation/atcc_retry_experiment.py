@@ -20,6 +20,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, TextIO, Tuple
 
+from agent.evaluation.aggregation import mean as shared_mean
+from agent.evaluation.aggregation import percentile as shared_percentile
 from agent.evaluation.atcc_schema import atcc_artifact_schema_status
 from agent.runtime import (
     AgentTransactionManager,
@@ -3237,23 +3239,11 @@ def _sample_latency_s(
 
 
 def _mean(values: Sequence[float]) -> float:
-    return sum(values) / len(values) if values else 0.0
+    return shared_mean(values)
 
 
 def _percentile(values: Sequence[float], percentile: float) -> float:
-    if not values:
-        return 0.0
-    ordered = sorted(float(value) for value in values)
-    if len(ordered) == 1:
-        return ordered[0]
-    rank = max(0.0, min(100.0, float(percentile))) / 100.0
-    position = rank * (len(ordered) - 1)
-    lower = int(math.floor(position))
-    upper = int(math.ceil(position))
-    if lower == upper:
-        return ordered[lower]
-    fraction = position - lower
-    return ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
+    return shared_percentile(values, percentile)
 
 
 def _task_operation_count(task: AgentTask) -> int:

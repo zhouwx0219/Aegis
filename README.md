@@ -1,155 +1,78 @@
-# Data Agent System
+# CAST-DAS
 
-这是一个面向 Data Agent System 的事务处理研究原型。当前代码的核心目标是：底层提供版本化 KV 存储，agent runtime 负责事务语义、候选计划、并发控制策略选择、提交协议和失败重试。
+CAST-DAS is a minimal research prototype for a Data Agent System transaction
+runtime.  The storage backend exposes versioned KV primitives, while the
+agent-side runtime owns transaction semantics, candidate plans, concurrency
+control selection, commit orchestration, and retry behavior.
 
-当前重点是 ATCC 在 agent-style TPCC/YCSB workload 上的实现和实验，包括操作级 ATCC、事务级 ATCC、传统 CC baseline 和 adaptive-hybrid family selector。
+## Quick Start
 
-## 交接入口
+Build the native extension in WSL or Linux:
 
-建议先读：
-
-1. [代码结构](docs/代码结构.md)
-2. [事务级 ATCC](docs/ATCC事务级项目-2026.06.28.13/事务级ATCC汇报.md) 
-3. [TPCC 订单事务类 Agent 负载流程](docs/ATCC事务级项目-2026.06.28.13/TPCC订单事务类Agent负载流程.md)
-4. [两种 ATCC 差异说明](docs/ATCC事务级项目-2026.06.28.13/两种ATCC差异说明.md)
-
-## 核心目录
-
-```text
-agent/runtime/       Agent 事务 runtime、CC registry、ATCC、commit protocol
-agent/workloads/     Agent-style YCSB / TPCC workload
-agent/evaluation/    实验 runner、policy training、profile/manifest runner
-core/                C++/pybind 版本化 KV 和底层并发控制内核
-docs/                论文、汇报、文档
-results/             保留的正式实验结果
-scripts/             实验复现和结果汇总脚本
-tests/               单元测试和实验入口回归测试
+```bash
+python3 -m pip install -e .
+bash build.sh
 ```
 
-## 当前关键策略
-
-传统 CC：
-
-```text
-occ
-2pl-nowait
-2pl-wait-die
-mvcc
-silo
-tictoc
-```
-
-ATCC / adaptive 策略：
-
-```text
-adaptive-op-strict        操作级 ATCC
-transaction-atcc-strict   事务级 ATCC
-adaptive-hybrid           策略族选择器
-```
-
-## 两种 ATCC
-
-操作级 ATCC：
-
-- 策略名：`adaptive-op-strict`
-- 决策粒度：单个 read/write operation
-- 输出：每个对象 optimistic 或 pessimistic
-- 优点：锁粒度细，在 YCSB high 和 TPCC medium 上表现稳定
-
-事务级 ATCC：
-
-- 策略名：`transaction-atcc-strict`
-- 决策粒度：整个 agent transaction
-- 输入：事务阶段、read/write set、hot/cold set、retry、全局 abort/lock wait
-- 输出：`occ`、`lock-hot-writes`、`lock-hot-read-write`、`lock-write-set`、`lock-read-write-set`
-- 优点：更接近原论文 ATCC，TPCC-high下平均吞吐约为操作级 ATCC 的 `1.94x`
-
-## Workload
-
-YCSB key：
-
-```text
-ycsb:record:{record}:field:{field}
-```
-
-TPCC NewOrder key：
-
-```text
-tpcc:district:{w}:{d}:next_order_id
-tpcc:district:{w}:{d}:orders
-tpcc:stock:{w}:{item}:quantity
-tpcc:stock:{w}:{item}:ytd
-```
-
-Agent workflow：
-
-```text
-explore -> refine -> commit
-```
-
-这和传统短事务不同：agent task 会有多候选计划、阶段化读取、planning delay、失败重试和 token/latency 成本。
-
-## 保留结果
-
-- `transaction_atcc_full_20260628_13`：事务级 ATCC 的 YCSB/TPCC low/medium/high 完整矩阵。
-
-关键结果文件：
-
-```text
-results/transaction_atcc_full_20260628_13/transaction_atcc_metrics.csv
-results/transaction_atcc_full_20260628_13/transaction_atcc_ratios.csv
-```
-
-## 关键实验结论
-
-TPCC-high：
-
-
-| 策略       | 平均吞吐   | 平均提交率  |
-| -------- | ------ | ------ |
-| OCC      | 0.000  | 0.0%   |
-| MVCC     | 0.000  | 0.0%   |
-| TicToc   | 0.021  | 0.3%   |
-| 操作级 ATCC | 21.813 | 100.0% |
-| 事务级 ATCC | 42.246 | 100.0% |
-
-
-稳定结论：
-
-- 传统 CC 在 TPCC-high agent workload 下基本失效。
-- 事务级 ATCC 相对唯一非零传统 baseline TicToc 约 `1984x`。
-- 事务级 ATCC 相对操作级 ATCC 平均吞吐约 `1.94x`。
-
-## 实验命令
-
-### 汇总已有结果
+Run the delivery smoke check:
 
 ```powershell
-python .\scripts\summarize_retry_results.py --input-dir .\results\transaction_atcc_full_20260628_13
-python .\scripts\summarize_retry_results.py --input-dir .\results\transaction_atcc_tpcc_high_multiseed_20260628_13
+powershell -ExecutionPolicy Bypass -File .\scripts\smoke.ps1
 ```
 
-### 跑 YCSB 对比
+Run a small YCSB/TPC-C benchmark:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\run_ycsb_compare.ps1 `
-  -Profile all `
-  -StrategySet full `
-  -TaskCount 60 `
-  -Workers 24 `
-  -OutputDir results/ycsb_reproduce
+powershell -ExecutionPolicy Bypass -File .\scripts\run_benchmark.ps1 `
+  -Workload all `
+  -Profile low `
+  -Strategies quick `
+  -TaskCount 10
 ```
 
-### 跑 TPCC 对比
+The scripts use WSL because the checked native extension is built for Linux.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\run_tpcc_compare.ps1 `
-  -Profile all `
-  -StrategySet full `
-  -TaskCount 60 `
-  -Workers 24 `
-  -OutputDir results/tpcc_reproduce
+## Delivered Structure
+
+```text
+agent/cli/          Delivery command entry points: smoke and benchmark.
+agent/runtime/      Agent-side transaction lifecycle, locks, CC registry, commit protocol.
+agent/policies/     Public policy-layer exports for ATCC/adaptive/hybrid policies.
+agent/workloads/    Agent-style YCSB/TPC-C workload models.
+agent/experiments/  Compatibility wrappers for research experiments.
+agent/evaluation/   Research runners, training, ablation, and reporting internals.
+core/               C++ native KV, commit kernel, concurrency-control primitives, pybind.
+scripts/            Delivery scripts. Historical research scripts live in scripts/research/.
+tests/              Delivery acceptance tests only.
+tests_dev/          Development and research regression tests retained for maintainers.
+docs/               Architecture, quickstart, file map, and work records.
+third_party/        Vendored DBx1000 reference code.
 ```
 
+## Core Capabilities
 
+- Versioned KV backend with atomic conditional writes.
+- Agent-side transaction manager with snapshots, read sets, candidate plans, traces, and retries.
+- Pluggable concurrency control: OCC, 2PL, MVCC, Silo, TicToc, operation-level ATCC, transaction-level ATCC, and adaptive-hybrid.
+- Agent-style YCSB/TPC-C tasks with candidate plans and explore/refine/commit stages.
+- Delivery benchmark CLI that runs the same runtime path as the research experiments.
 
+## Main Commands
+
+```bash
+python3 -m agent.cli.smoke --json
+python3 -m agent.cli.benchmark --workload ycsb --profile low --strategies quick --task-count 10
+python3 -m unittest tests.test_smoke_runtime tests.test_benchmark_cli -v
+```
+
+Research and paper reproduction commands are intentionally kept out of the main
+path.  See `agent/experiments/`, `agent/evaluation/`, and `scripts/research/`
+when you need ablation, training, native DBx1000 baselines, or historical
+comparison scripts.
+
+## Documentation
+
+- `docs/quickstart.md`: build and run instructions.
+- `docs/architecture.md`: responsibility boundaries and system flow.
+- `docs/file_map.md`: current file responsibilities and post-delivery structure.
+- `docs/代码结构.md`: Chinese handoff document for the project structure.

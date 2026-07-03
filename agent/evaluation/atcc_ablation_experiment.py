@@ -6,18 +6,46 @@ import argparse
 import csv
 import dataclasses
 import json
-import math
 import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from agent.evaluation.aggregation import sample_stddev
 from agent.evaluation.atcc_retry_experiment import (
     RetryRunSummary,
     _operation_policy,
     _run_one_retry,
     _transaction_atcc_policy,
     aggregate_retry_runs,
+)
+from agent.evaluation.reporting import render_atcc_ablation_markdown
+from agent.evaluation.strategy_matrix import (
+    ABLATION_VARIANTS,
+    DEFAULT_ABLATION_BASELINES,
+    STATIC_OPERATION_THRESHOLD32_WIDE_OVERWRITE_THRESHOLD,
+    STATIC_OPERATION_WIDE_OVERWRITE_THRESHOLD,
+    STATIC_PRESETS,
+    STATIC_TRANSACTION_CONSERVATIVE_WIDE_WRITE_THRESHOLD,
+    STATIC_TRANSACTION_WIDE_WRITE_THRESHOLD,
+    AblationVariantSpec,
+    ablation_variant_metadata,
+    ablation_variant_spec,
+    bucket_count,
+    bucket_latency_s,
+    coarse_interval_s,
+    normalize_static_preset,
+    priority_cap_arg,
+    profile_name_from_workload,
+    select_ablation_variants,
+    select_named_values,
+    split_csv,
+    static_operation_wide_overwrite_threshold,
+    static_transaction_wide_write_threshold,
+    workload_kind_from_name,
+)
+from agent.evaluation.workload_factory import (
+    build_profile_workload as shared_build_profile_workload,
 )
 from agent.runtime import (
     ATCCPolicyQLearner,
@@ -30,66 +58,22 @@ from agent.runtime import (
     TransactionAwareATCCModule,
 )
 from agent.runtime.adaptive import operation_object_class, profile_agent_operations
-from agent.workloads import (
-    AgentWorkload,
-    TPCCConfig,
-    YCSBConfig,
-    build_agent_workload,
-)
+from agent.workloads import AgentWorkload
 
 
-ABLATION_VARIANTS: Tuple[str, ...] = (
-    "op-static",
-    "op-static-priority",
-    "op-dynamic",
-    "op-dynamic-priority",
-    "tx-static",
-    "tx-static-priority",
-    "tx-dynamic",
-    "tx-dynamic-priority",
-)
-
-DEFAULT_BASELINES: Tuple[str, ...] = ("occ", "mvcc-full", "tictoc-full")
-STATIC_PRESETS: Tuple[str, ...] = ("conservative", "threshold32")
-STATIC_OPERATION_WIDE_OVERWRITE_THRESHOLD = 32
-STATIC_OPERATION_THRESHOLD32_WIDE_OVERWRITE_THRESHOLD = 12
-STATIC_TRANSACTION_CONSERVATIVE_WIDE_WRITE_THRESHOLD = 64
-STATIC_TRANSACTION_WIDE_WRITE_THRESHOLD = 32
+DEFAULT_BASELINES: Tuple[str, ...] = DEFAULT_ABLATION_BASELINES
 
 
 def _normalize_static_preset(value: str) -> str:
-    preset = str(value or "conservative").strip().lower()
-    if preset not in STATIC_PRESETS:
-        raise ValueError(f"unsupported static preset: {value}")
-    return preset
+    return normalize_static_preset(value)
 
 
 def _static_operation_wide_overwrite_threshold(static_preset: str) -> int:
-    if _normalize_static_preset(static_preset) == "threshold32":
-        return STATIC_OPERATION_THRESHOLD32_WIDE_OVERWRITE_THRESHOLD
-    return STATIC_OPERATION_WIDE_OVERWRITE_THRESHOLD
+    return static_operation_wide_overwrite_threshold(static_preset)
 
 
 def _static_transaction_wide_write_threshold(static_preset: str) -> int:
-    if _normalize_static_preset(static_preset) == "threshold32":
-        return STATIC_TRANSACTION_WIDE_WRITE_THRESHOLD
-    return STATIC_TRANSACTION_CONSERVATIVE_WIDE_WRITE_THRESHOLD
-
-
-@dataclasses.dataclass(frozen=True)
-class AblationVariantSpec:
-    name: str
-    scope: str
-    dynamic: bool
-    priority: bool
-
-    @property
-    def strategy(self) -> str:
-        return "adaptive-op-strict" if self.scope == "op" else "transaction-atcc-strict"
-
-    @property
-    def mechanism(self) -> str:
-        return "dynamic" if self.dynamic else "static"
+    return static_transaction_wide_write_threshold(static_preset)
 
 
 class FrozenATCCPolicyQLearner:
@@ -988,78 +972,7 @@ def _set_training_epsilon(
 
 
 def build_profile_workload(workload_kind: str, profile_name: str) -> AgentWorkload:
-    workload = str(workload_kind).strip().lower()
-    profile = str(profile_name).strip().lower()
-    if workload == "ycsb":
-        configs = {
-            "low": YCSBConfig(
-                record_count=512,
-                field_count=10,
-                requests_per_task=10,
-                candidates_per_task=3,
-                read_weight=0.95,
-                update_weight=0.05,
-                zipf_theta=0.0,
-                hotspot_fraction=0.0,
-                hotspot_access_probability=0.0,
-            ),
-            "medium": YCSBConfig(
-                record_count=128,
-                field_count=10,
-                requests_per_task=10,
-                candidates_per_task=3,
-                read_weight=0.90,
-                update_weight=0.10,
-                zipf_theta=0.7,
-                hotspot_fraction=0.10,
-                hotspot_access_probability=0.50,
-            ),
-            "high": YCSBConfig(
-                record_count=64,
-                field_count=10,
-                requests_per_task=10,
-                candidates_per_task=3,
-                read_weight=0.50,
-                update_weight=0.50,
-                zipf_theta=0.99,
-                hotspot_fraction=0.10,
-                hotspot_access_probability=0.75,
-            ),
-        }
-        if profile not in configs:
-            raise ValueError(f"unsupported YCSB profile: {profile_name}")
-        return build_agent_workload("ycsb", "semantic", ycsb_config=configs[profile])
-    if workload == "tpcc":
-        configs = {
-            "low": TPCCConfig(
-                warehouses=8,
-                districts_per_warehouse=5,
-                customers_per_district=100,
-                items=500,
-                order_lines=5,
-                transaction_mix=(("new_order", 1.0),),
-            ),
-            "medium": TPCCConfig(
-                warehouses=2,
-                districts_per_warehouse=3,
-                customers_per_district=60,
-                items=200,
-                order_lines=8,
-                transaction_mix=(("new_order", 1.0),),
-            ),
-            "high": TPCCConfig(
-                warehouses=1,
-                districts_per_warehouse=2,
-                customers_per_district=40,
-                items=100,
-                order_lines=10,
-                transaction_mix=(("new_order", 1.0),),
-            ),
-        }
-        if profile not in configs:
-            raise ValueError(f"unsupported TPCC profile: {profile_name}")
-        return build_agent_workload("tpcc", "semantic", tpcc_config=configs[profile])
-    raise ValueError(f"unsupported workload kind: {workload_kind}")
+    return shared_build_profile_workload(workload_kind, profile_name)
 
 
 def _with_profile(run: RetryRunSummary, profile_name: str) -> RetryRunSummary:
@@ -1084,55 +997,7 @@ def write_ablation_outputs(report: Mapping[str, Any], output_dir: Path) -> None:
 
 
 def render_markdown_report(report: Mapping[str, Any]) -> str:
-    lines = [
-        "# ATCC Ablation Report",
-        "",
-        "## Configuration",
-        "",
-        f"- workloads: {', '.join(report.get('workloads', []))}",
-        f"- profiles: {', '.join(report.get('profiles', []))}",
-        f"- variants: {', '.join(report.get('variants', []))}",
-        f"- seeds: {', '.join(str(seed) for seed in report.get('seeds', []))}",
-        f"- task_count: {report.get('task_count')}",
-        f"- train_seeds: {', '.join(str(seed) for seed in report.get('train_seeds', []))}",
-        f"- train_rounds: {report.get('train_rounds')}",
-        f"- train_task_count: {report.get('train_task_count')}",
-        f"- train_policy_epsilon: {report.get('train_policy_epsilon')}",
-        f"- priority_cap: {report.get('priority_cap')}",
-        f"- freeze_dynamic_policy: {report.get('freeze_dynamic_policy')}",
-        f"- static_preset: {report.get('static_preset')}",
-        f"- static_operation_wide_overwrite_threshold: {report.get('static_operation_wide_overwrite_threshold')}",
-        f"- static_transaction_wide_write_threshold: {report.get('static_transaction_wide_write_threshold')}",
-        "",
-        "## Metrics",
-        "",
-        "| workload | profile | variant | throughput | commit rate | attempts/task | p95 latency | p99 latency | conflict aborts | prelock wait/task |",
-        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
-    ]
-    for row in report.get("metrics", []):
-        lines.append(
-            "| {workload_kind} | {profile} | {variant} | {committed_throughput:.3f} | "
-            "{commit_rate:.1%} | {attempts_per_task:.3f} | "
-            "{agent_latency_p95_s:.3f} | {agent_latency_p99_s:.3f} | "
-            "{conflict_aborts} | {prelock_wait_per_task_s:.6f} |".format(**row)
-        )
-    lines.extend(
-        [
-            "",
-            "## Ratios",
-            "",
-            "| workload | profile | comparison | ratio | note |",
-            "| --- | --- | --- | ---: | --- |",
-        ]
-    )
-    for row in report.get("ratios", []):
-        ratio = row.get("throughput_ratio")
-        ratio_text = "" if ratio in (None, "") else f"{float(ratio):.3f}x"
-        lines.append(
-            f"| {row['workload_kind']} | {row['profile']} | "
-            f"{row['comparison']} | {ratio_text} | {row.get('note', '')} |"
-        )
-    return "\n".join(lines) + "\n"
+    return render_atcc_ablation_markdown(report)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1600,32 +1465,11 @@ def _ratio_row(
 
 
 def _variant_spec(name: str) -> AblationVariantSpec:
-    normalized = str(name).strip().lower()
-    if normalized not in ABLATION_VARIANTS:
-        raise ValueError(f"unsupported ablation variant: {name}")
-    scope, mechanism, *rest = normalized.split("-")
-    return AblationVariantSpec(
-        name=normalized,
-        scope=scope,
-        dynamic=mechanism == "dynamic",
-        priority=bool(rest and rest[0] == "priority"),
-    )
+    return ablation_variant_spec(name)
 
 
 def _variant_metadata(variant: str, strategy: str) -> Dict[str, Any]:
-    if str(variant) == "baseline":
-        return {
-            "ablation_scope": "baseline",
-            "ablation_mechanism": "baseline",
-            "ablation_priority": False,
-            "policy_variant": "baseline:" + str(strategy),
-        }
-    spec = _variant_spec(str(variant))
-    return {
-        "ablation_scope": spec.scope,
-        "ablation_mechanism": spec.mechanism,
-        "ablation_priority": spec.priority,
-    }
+    return ablation_variant_metadata(variant, strategy)
 
 
 def _write_json(path: Path, data: Mapping[str, Any]) -> None:
@@ -1642,22 +1486,15 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
 
 
 def _select(value: str, all_values: Sequence[str]) -> Tuple[str, ...]:
-    normalized = str(value).strip().lower()
-    if normalized == "all":
-        return tuple(all_values)
-    return (normalized,)
+    return select_named_values(value, all_values)
 
 
 def _select_variants(value: str) -> Tuple[str, ...]:
-    selected = ABLATION_VARIANTS if str(value).strip().lower() == "all" else tuple(_split_csv(value))
-    for name in selected:
-        _variant_spec(name)
-    return tuple(str(name).strip().lower() for name in selected)
+    return select_ablation_variants(value)
 
 
 def _priority_cap_arg(value: int) -> Optional[int]:
-    cap = int(value)
-    return None if cap < 0 else cap
+    return priority_cap_arg(value)
 
 
 def _load_pretrained_artifacts(
@@ -1679,7 +1516,7 @@ def _load_pretrained_artifacts(
 
 
 def _split_csv(value: str) -> Tuple[str, ...]:
-    return tuple(item.strip() for item in str(value).split(",") if item.strip())
+    return split_csv(value)
 
 
 def _lease_mode(workload_kind: str, ycsb_mode: str, tpcc_mode: str) -> str:
@@ -1687,65 +1524,27 @@ def _lease_mode(workload_kind: str, ycsb_mode: str, tpcc_mode: str) -> str:
 
 
 def _workload_kind(workload_name: str) -> str:
-    text = str(workload_name).lower()
-    if "ycsb" in text:
-        return "ycsb"
-    if "tpcc" in text:
-        return "tpcc"
-    return text
+    return workload_kind_from_name(workload_name)
 
 
 def _profile_name(workload_name: str) -> str:
-    text = str(workload_name).lower()
-    for profile in ("low", "medium", "high"):
-        if profile in text:
-            return profile
-    return ""
+    return profile_name_from_workload(workload_name)
 
 
 def _bucket_count(value: int) -> str:
-    number = max(0, int(value))
-    if number == 0:
-        return "0"
-    if number == 1:
-        return "1"
-    if number <= 3:
-        return "2-3"
-    if number <= 7:
-        return "4-7"
-    if number <= 15:
-        return "8-15"
-    return "16+"
+    return bucket_count(value)
 
 
 def _bucket_latency_s(value: float) -> str:
-    ms = max(0.0, float(value)) * 1000.0
-    if ms <= 0.0:
-        return "0ms"
-    if ms <= 10.0:
-        return "<=10ms"
-    if ms <= 50.0:
-        return "<=50ms"
-    if ms <= 100.0:
-        return "<=100ms"
-    return ">100ms"
+    return bucket_latency_s(value)
 
 
 def _coarse_interval_s(value: float) -> str:
-    ms = max(0.0, float(value)) * 1000.0
-    if ms <= 0.0:
-        return "0ms"
-    if ms <= 50.0:
-        return "<=50ms"
-    return ">50ms"
+    return coarse_interval_s(value)
 
 
 def _stddev(values: Sequence[float]) -> float:
-    rows = [float(value) for value in values]
-    if len(rows) <= 1:
-        return 0.0
-    mean = sum(rows) / len(rows)
-    return math.sqrt(sum((value - mean) ** 2 for value in rows) / (len(rows) - 1))
+    return sample_stddev(values)
 
 
 if __name__ == "__main__":
