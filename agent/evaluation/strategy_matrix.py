@@ -42,11 +42,13 @@ ABLATION_VARIANTS: Tuple[str, ...] = (
 
 DEFAULT_ABLATION_BASELINES: Tuple[str, ...] = ("occ", "mvcc-full", "tictoc-full")
 
-STATIC_PRESETS: Tuple[str, ...] = ("conservative", "threshold32")
+STATIC_PRESETS: Tuple[str, ...] = ("conservative", "threshold32", "naive")
 STATIC_OPERATION_WIDE_OVERWRITE_THRESHOLD = 32
 STATIC_OPERATION_THRESHOLD32_WIDE_OVERWRITE_THRESHOLD = 12
 STATIC_TRANSACTION_CONSERVATIVE_WIDE_WRITE_THRESHOLD = 64
 STATIC_TRANSACTION_WIDE_WRITE_THRESHOLD = 32
+STATIC_OPERATION_NAIVE_WIDE_WRITE_THRESHOLD = 16
+STATIC_TRANSACTION_NAIVE_WIDE_WRITE_THRESHOLD = 16
 
 
 @dataclasses.dataclass(frozen=True)
@@ -73,13 +75,19 @@ def normalize_static_preset(value: str) -> str:
 
 
 def static_operation_wide_overwrite_threshold(static_preset: str) -> int:
-    if normalize_static_preset(static_preset) == "threshold32":
+    preset = normalize_static_preset(static_preset)
+    if preset == "naive":
+        return STATIC_OPERATION_NAIVE_WIDE_WRITE_THRESHOLD
+    if preset == "threshold32":
         return STATIC_OPERATION_THRESHOLD32_WIDE_OVERWRITE_THRESHOLD
     return STATIC_OPERATION_WIDE_OVERWRITE_THRESHOLD
 
 
 def static_transaction_wide_write_threshold(static_preset: str) -> int:
-    if normalize_static_preset(static_preset) == "threshold32":
+    preset = normalize_static_preset(static_preset)
+    if preset == "naive":
+        return STATIC_TRANSACTION_NAIVE_WIDE_WRITE_THRESHOLD
+    if preset == "threshold32":
         return STATIC_TRANSACTION_WIDE_WRITE_THRESHOLD
     return STATIC_TRANSACTION_CONSERVATIVE_WIDE_WRITE_THRESHOLD
 

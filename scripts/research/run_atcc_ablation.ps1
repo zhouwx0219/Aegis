@@ -14,8 +14,10 @@ param(
     [int]$TrainRounds = 4,
     [int]$TrainTaskCount = 0,
     [double]$TrainPolicyEpsilon = 0.05,
+    [string]$ValidationSeeds = "930104,930105",
+    [int]$ValidationTaskCount = 0,
     [int]$PriorityCap = 1,
-    [ValidateSet("conservative", "threshold32")]
+    [ValidateSet("conservative", "threshold32", "naive")]
     [string]$StaticPreset = "conservative",
     [switch]$NoFreezeDynamicPolicy,
     [string]$OutputDir = ""
@@ -66,6 +68,8 @@ $CommonArgs = @(
     "--train-rounds $TrainRounds",
     "--train-task-count $TrainTaskCount",
     "--train-policy-epsilon $TrainPolicyEpsilon",
+    "--validation-seeds $ValidationSeeds",
+    "--validation-task-count $ValidationTaskCount",
     "--priority-cap $PriorityCap",
     "--static-preset $StaticPreset",
     "--output-dir $OutputDir"

@@ -62,6 +62,12 @@ from agent.workloads import AgentWorkload
 
 
 DEFAULT_BASELINES: Tuple[str, ...] = DEFAULT_ABLATION_BASELINES
+VALIDATION_SELECTION_MARGIN = 1.03
+VALIDATION_ATTEMPT_MARGIN = 1.01
+VALIDATION_ABORT_RATE_MARGIN = 0.005
+PRIORITY_VALIDATION_ATTEMPT_MARGIN = 1.01
+PRIORITY_VALIDATION_ABORT_RATE_MARGIN = 0.005
+PRIORITY_VALIDATION_PRELOCK_WAIT_MARGIN = 1.05
 
 
 def _normalize_static_preset(value: str) -> str:
@@ -122,6 +128,75 @@ def _cap_priority_score(value: int, priority_cap: Optional[int]) -> int:
     if cap <= 0:
         return 0
     return min(score, cap)
+
+
+def _learner_action_visits(learner: Any, state_key: str, action: str) -> int:
+    inner = getattr(learner, "_learner", learner)
+    visits = getattr(inner, "_visits", {})
+    try:
+        return int(visits.get((str(state_key), str(action)), 0))
+    except AttributeError:
+        return 0
+
+
+def _operation_decision_value(
+    decision: OperationPolicyDecision,
+    policy: str,
+) -> float:
+    normalized = str(policy)
+    if decision.atcc_q_values:
+        action = "occ" if normalized == "optimistic" else "lock-hot-writes"
+        if action not in decision.atcc_q_values and normalized == "pessimistic":
+            pessimistic_values = [
+                float(value)
+                for action_name, value in dict(decision.atcc_q_values).items()
+                if action_name != "occ"
+            ]
+            return max(pessimistic_values) if pessimistic_values else 0.0
+        return float(dict(decision.atcc_q_values).get(action, 0.0))
+    if normalized == "optimistic":
+        return float(decision.rl_q_optimistic)
+    if normalized == "pessimistic":
+        return float(decision.rl_q_pessimistic)
+    return 0.0
+
+
+def _operation_decision_visits(
+    policy: OperationPolicyTable,
+    decision: OperationPolicyDecision,
+    selected_policy: str,
+) -> int:
+    if decision.atcc_state_key:
+        action = str(decision.atcc_action or "")
+        return _learner_action_visits(
+            getattr(policy.atcc_module, "learner", None),
+            decision.atcc_state_key,
+            action,
+        )
+    if decision.rl_state_key:
+        return _learner_action_visits(
+            policy.rl_learner,
+            decision.rl_state_key,
+            str(selected_policy),
+        )
+    return 1
+
+
+def _ablation_object_lock_scheduler(
+    spec: AblationVariantSpec,
+    profile_name: str,
+) -> str:
+    """Use bounded queue priority only when the variant enables priority.
+
+    `bounded-priority` is now queue ordering only: it no longer wounds the
+    current owner.  That makes it appropriate for medium contention too, while
+    non-priority variants keep the plain race scheduler as the control.
+    """
+
+    if not spec.priority:
+        return "race"
+    _ = profile_name
+    return "bounded-priority"
 
 
 class StaticOperationATCCPolicy(OperationPolicyTable):
@@ -216,6 +291,13 @@ class StaticOperationATCCPolicy(OperationPolicyTable):
     def _static_policy(self, profile: OperationPolicyProfile) -> Tuple[str, str]:
         if profile.access_kind == "read":
             return "optimistic", "read-optimistic"
+        if self.static_preset == "naive":
+            if (
+                profile.total_writes
+                >= _static_operation_wide_overwrite_threshold(self.static_preset)
+            ):
+                return "pessimistic", "naive-wide-write-set"
+            return "optimistic", "naive-cold-write-optimistic"
         if profile.operation_count_for_object >= 2:
             return "pessimistic", "repeated-object"
         if profile.retry_count > 0:
@@ -246,12 +328,148 @@ class _NoPriorityPhaseAwareATCCModule(PhaseAwareATCCModule):
         return 0
 
 
+class _CompactStatePhaseAwareATCCModule(PhaseAwareATCCModule):
+    """Ablation-only operation module with a coarser train/test state key."""
+
+    def state_key(self, *args: Any, **kwargs: Any) -> str:
+        profiles = tuple(kwargs.get("profiles", ()) or ())
+        workload = ",".join(
+            sorted({str(getattr(profile, "workload", "")) for profile in profiles})
+        )
+        task = ",".join(
+            sorted({str(getattr(profile, "task_type", "")) for profile in profiles})
+        )
+        object_groups = sorted(
+            {
+                _compact_operation_group(str(getattr(profile, "object_id", "")))
+                for profile in profiles
+            }
+        )
+        reads = sum(
+            1 for profile in profiles if str(getattr(profile, "access_kind", "")) == "read"
+        )
+        writes = len(profiles) - reads
+        runtime_stats = kwargs.get("runtime_stats")
+        abort_rate = (
+            float(getattr(runtime_stats, "ewma_abort_rate", 0.0) or 0.0)
+            if runtime_stats is not None
+            else 0.0
+        )
+        lock_wait_s = (
+            float(getattr(runtime_stats, "ewma_lock_wait_s", 0.0) or 0.0)
+            if runtime_stats is not None
+            else 0.0
+        )
+        queue_depth = (
+            float(getattr(runtime_stats, "ewma_lock_queue_depth", 0.0) or 0.0)
+            if runtime_stats is not None
+            else 0.0
+        )
+        return "|".join(
+            (
+                "scope=operation-ablation-dynamic-compact",
+                f"workload={workload}",
+                f"task={task}",
+                "group=" + ",".join(object_groups),
+                "phase=" + str(kwargs.get("phase", "")),
+                f"reads={_bucket_count(reads)}",
+                f"writes={_bucket_count(writes)}",
+                "hotR=" + _compact_hot_bucket(kwargs.get("hot_read_ratio", 0.0)),
+                "hotW=" + _compact_hot_bucket(kwargs.get("hot_write_ratio", 0.0)),
+                f"retry={_bucket_count(int(kwargs.get('retry_count', 0) or 0))}",
+                "pressure="
+                + _compact_pressure_bucket(
+                    abort_rate=abort_rate,
+                    lock_wait_s=lock_wait_s,
+                    queue_depth=queue_depth,
+                ),
+            )
+        )
+
+
+class _NoPriorityCompactStatePhaseAwareATCCModule(
+    _CompactStatePhaseAwareATCCModule
+):
+    def priority_score(self, **_kwargs: Any) -> int:
+        return 0
+
+
+class _CappedPriorityCompactStatePhaseAwareATCCModule(
+    _CompactStatePhaseAwareATCCModule
+):
+    def __init__(self, *args: Any, priority_cap: Optional[int] = 1, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self.priority_cap = priority_cap
+
+    def state_key(self, *args: Any, **kwargs: Any) -> str:
+        kwargs["priority"] = 0
+        return super().state_key(*args, **kwargs)
+
+    def priority_score(self, **kwargs: Any) -> int:
+        retry_count = int(kwargs.get("retry_count", 0) or 0)
+        global_abort_rate = max(0.0, float(kwargs.get("global_abort_rate", 0.0) or 0.0))
+        hot_read_ratio = max(0.0, float(kwargs.get("hot_read_ratio", 0.0) or 0.0))
+        hot_write_ratio = max(0.0, float(kwargs.get("hot_write_ratio", 0.0) or 0.0))
+        profiles = tuple(kwargs.get("profiles", ()) or ())
+        operation_count = len(profiles)
+        total_writes = max(
+            (int(getattr(profile, "total_writes", 0) or 0) for profile in profiles),
+            default=0,
+        )
+        has_named_hotspot = any(
+            "next_order_id" in str(getattr(profile, "object_id", ""))
+            for profile in profiles
+        )
+        if (
+            retry_count <= 0
+            and global_abort_rate < 0.15
+            and hot_read_ratio <= 0.0
+            and hot_write_ratio <= 0.0
+            and operation_count < 8
+            and total_writes < 8
+            and not has_named_hotspot
+        ):
+            return 0
+        return _cap_priority_score(
+            super().priority_score(**kwargs),
+            self.priority_cap,
+        )
+
+
 class _CappedPriorityPhaseAwareATCCModule(PhaseAwareATCCModule):
     def __init__(self, *args: Any, priority_cap: Optional[int] = 1, **kwargs: Any):
         super().__init__(*args, **kwargs)
         self.priority_cap = priority_cap
 
+    def state_key(self, *args: Any, **kwargs: Any) -> str:
+        kwargs["priority"] = 0
+        return super().state_key(*args, **kwargs)
+
     def priority_score(self, **kwargs: Any) -> int:
+        retry_count = int(kwargs.get("retry_count", 0) or 0)
+        global_abort_rate = max(0.0, float(kwargs.get("global_abort_rate", 0.0) or 0.0))
+        hot_read_ratio = max(0.0, float(kwargs.get("hot_read_ratio", 0.0) or 0.0))
+        hot_write_ratio = max(0.0, float(kwargs.get("hot_write_ratio", 0.0) or 0.0))
+        profiles = tuple(kwargs.get("profiles", ()) or ())
+        operation_count = len(profiles)
+        total_writes = max(
+            (int(getattr(profile, "total_writes", 0) or 0) for profile in profiles),
+            default=0,
+        )
+        has_named_hotspot = any(
+            "next_order_id" in str(getattr(profile, "object_id", ""))
+            for profile in profiles
+        )
+        if (
+            retry_count <= 0
+            and global_abort_rate < 0.15
+            and hot_read_ratio <= 0.0
+            and hot_write_ratio <= 0.0
+            and operation_count < 8
+            and total_writes < 8
+            and not has_named_hotspot
+        ):
+            return 0
         return _cap_priority_score(
             super().priority_score(**kwargs),
             self.priority_cap,
@@ -275,6 +493,115 @@ class _CappedPriorityTransactionAwareATCCModule(TransactionAwareATCCModule):
         )
 
 
+def _compact_hot_bucket(value: Any) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = 0.0
+    if number <= 0.0:
+        return "0"
+    if number >= 1.0:
+        return "some"
+    return "some"
+
+
+def _compact_operation_group(object_id: str) -> str:
+    text = str(object_id)
+    if "next_order_id" in text:
+        return "tpcc-order-counter"
+    if text.startswith("tpcc:stock:"):
+        return "tpcc-stock"
+    if text.startswith("tpcc:"):
+        return "tpcc-other"
+    if text.startswith("ycsb:record:"):
+        return "ycsb-record"
+    if text.startswith("ycsb:field:"):
+        return "ycsb-field"
+    return text.split(":", 1)[0] or "object"
+
+
+def _compact_pressure_bucket(
+    *,
+    abort_rate: float = 0.0,
+    lock_wait_s: float = 0.0,
+    queue_depth: float = 0.0,
+) -> str:
+    abort = max(0.0, float(abort_rate))
+    wait = max(0.0, float(lock_wait_s))
+    queue = max(0.0, float(queue_depth))
+    if abort >= 0.20:
+        return "abort-high"
+    if abort >= 0.05:
+        return "abort-low"
+    if wait >= 0.050 or queue >= 1.0:
+        return "wait-high"
+    if wait >= 0.010:
+        return "wait-low"
+    return "cold"
+
+
+class CompactStateOperationATCCPolicy(OperationPolicyTable):
+    """Operation dynamic policy with ablation-only compact Q state keys."""
+
+    def __init__(
+        self,
+        base_policy: OperationPolicyTable,
+        workload_kind: str,
+    ):
+        object.__setattr__(self, "workload_kind", str(workload_kind).strip().lower())
+        super().__init__(
+            rules=base_policy.rules,
+            fallback_policy=base_policy.fallback_policy,
+            name=base_policy.name + "-compact-state",
+            online_feedback=base_policy.online_feedback,
+            min_feedback_observations=base_policy.min_feedback_observations,
+            exact_key_min_observations=base_policy.exact_key_min_observations,
+            conflict_abort_cost=base_policy.conflict_abort_cost,
+            lock_wait_cost_per_s=base_policy.lock_wait_cost_per_s,
+            lock_queue_depth_cost=base_policy.lock_queue_depth_cost,
+            lock_overhead_cost=base_policy.lock_overhead_cost,
+            hysteresis=base_policy.hysteresis,
+            pinned_rules=base_policy.pinned_rules,
+            rl_enabled=base_policy.rl_enabled,
+            rl_conflict_penalty=base_policy.rl_conflict_penalty,
+            rl_commit_reward=base_policy.rl_commit_reward,
+            rl_reject_penalty=base_policy.rl_reject_penalty,
+            rl_lock_wait_cost_per_s=base_policy.rl_lock_wait_cost_per_s,
+            rl_pessimistic_action_cost=base_policy.rl_pessimistic_action_cost,
+            rl_learner=base_policy.rl_learner,
+            atcc_module=base_policy.atcc_module,
+            atcc_runtime_stats=base_policy.atcc_runtime_stats,
+            atcc_cold_occ_fast_path=base_policy.atcc_cold_occ_fast_path,
+            atcc_fast_path_max_retry_count=base_policy.atcc_fast_path_max_retry_count,
+            atcc_fast_path_max_agent_interval_s=(
+                base_policy.atcc_fast_path_max_agent_interval_s
+            ),
+            atcc_fast_path_max_global_abort_rate=(
+                base_policy.atcc_fast_path_max_global_abort_rate
+            ),
+            atcc_fast_path_max_lock_queue_depth=(
+                base_policy.atcc_fast_path_max_lock_queue_depth
+            ),
+            atcc_fast_path_max_total_writes=(
+                base_policy.atcc_fast_path_max_total_writes
+            ),
+            telemetry=base_policy.telemetry,
+        )
+
+    def select_profiles(
+        self, profiles: Sequence[OperationPolicyProfile]
+    ) -> Tuple[OperationPolicyDecision, ...]:
+        return super().select_profiles(profiles)
+
+    def to_dict(self) -> Dict[str, Any]:
+        data = super().to_dict()
+        data["name"] = self.name
+        data["compact_state"] = {
+            "scope": "operation-ablation-dynamic",
+            "workload_kind": self.workload_kind,
+        }
+        return data
+
 class _AblationDynamicTransactionATCCModule(TransactionAwareATCCModule):
     """Transaction ATCC variant with a compact train/test state space.
 
@@ -284,6 +611,19 @@ class _AblationDynamicTransactionATCCModule(TransactionAwareATCCModule):
     The ablation runner uses this compact wrapper only for dynamic ablation
     variants so trained Q values can transfer to frozen test seeds.
     """
+
+    def __init__(
+        self,
+        *args: Any,
+        static_preset: str = "naive",
+        static_prior_enabled: bool = False,
+        profile_name: str = "",
+        **kwargs: Any,
+    ):
+        super().__init__(*args, **kwargs)
+        self.static_preset = _normalize_static_preset(static_preset)
+        self.static_prior_enabled = bool(static_prior_enabled)
+        self.profile_name = str(profile_name).strip().lower()
 
     def select_transaction(
         self,
@@ -295,6 +635,12 @@ class _AblationDynamicTransactionATCCModule(TransactionAwareATCCModule):
             profiles,
             runtime_stats=runtime_stats,
         )
+        fallback_action = self._static_fallback_action(decision)
+        if self.static_prior_enabled and self._should_use_static_fallback(
+            decision,
+            fallback_action,
+        ):
+            decision = self._replace_action(decision, fallback_action)
         if (
             decision.phase == "commit"
             and int(decision.retry_count) >= 1
@@ -315,6 +661,80 @@ class _AblationDynamicTransactionATCCModule(TransactionAwareATCCModule):
                 ),
             )
         return decision
+
+    def _static_fallback_action(
+        self,
+        decision: TransactionAwareATCCDecision,
+    ) -> str:
+        if len(decision.write_set) >= _static_transaction_wide_write_threshold(
+            self.static_preset
+        ):
+            return "lock-write-set"
+        return "occ"
+
+    def _should_use_static_fallback(
+        self,
+        decision: TransactionAwareATCCDecision,
+        fallback_action: str,
+    ) -> bool:
+        if decision.action == fallback_action:
+            return False
+        if decision.explore:
+            return False
+        q_values = dict(decision.q_values or {})
+        selected_value = float(q_values.get(decision.action, 0.0))
+        fallback_value = float(q_values.get(fallback_action, 0.0))
+        selected_visits = _learner_action_visits(
+            self.learner,
+            decision.state_key,
+            decision.action,
+        )
+        fallback_visits = _learner_action_visits(
+            self.learner,
+            decision.state_key,
+            fallback_action,
+        )
+        if (
+            fallback_action == "lock-write-set"
+            and decision.action in {"occ", "lock-hot-writes", "lock-hot-read-write"}
+            and int(decision.retry_count) <= 0
+            and float(decision.global_abort_rate) < 0.20
+        ):
+            if selected_visits < 8:
+                return True
+            if selected_value < fallback_value + 0.25:
+                return True
+        if selected_visits < 2:
+            return True
+        if selected_value < fallback_value + 0.10:
+            return True
+        if (
+            fallback_action == "occ"
+            and decision.action != "occ"
+            and int(decision.retry_count) <= 0
+            and float(decision.global_abort_rate) < 0.05
+            and fallback_visits >= selected_visits
+        ):
+            return True
+        return False
+
+    def _replace_action(
+        self,
+        decision: TransactionAwareATCCDecision,
+        action: str,
+    ) -> TransactionAwareATCCDecision:
+        return dataclasses.replace(
+            decision,
+            action=action,
+            fast_path=action == "occ",
+            prelock_targets=self._prelock_targets(
+                action,
+                read_set=decision.read_set,
+                write_set=decision.write_set,
+                hot_read_set=decision.hot_read_set,
+                hot_write_set=decision.hot_write_set,
+            ),
+        )
 
     def _prior_action(
         self,
@@ -383,17 +803,11 @@ class _AblationDynamicTransactionATCCModule(TransactionAwareATCCModule):
 
     @staticmethod
     def _pressure_bucket(runtime_stats: ATCCRuntimeStats) -> str:
-        abort_rate = max(0.0, float(runtime_stats.ewma_abort_rate))
-        wait_s = max(0.0, float(runtime_stats.ewma_lock_wait_s))
-        if abort_rate >= 0.50:
-            return "abort-high"
-        if abort_rate >= 0.20:
-            return "abort-medium"
-        if wait_s >= 0.050:
-            return "wait-high"
-        if abort_rate >= 0.05 or wait_s >= 0.010:
-            return "pressure-low"
-        return "cold"
+        return _compact_pressure_bucket(
+            abort_rate=float(runtime_stats.ewma_abort_rate),
+            lock_wait_s=float(runtime_stats.ewma_lock_wait_s),
+            queue_depth=float(getattr(runtime_stats, "ewma_lock_queue_depth", 0.0)),
+        )
 
 
 class _AblationNoPriorityTransactionATCCModule(
@@ -410,14 +824,40 @@ class _AblationCappedPriorityTransactionATCCModule(
         super().__init__(*args, **kwargs)
         self.priority_cap = priority_cap
 
+    def select_transaction(
+        self,
+        profiles: Sequence[Any],
+        *,
+        runtime_stats: Optional[ATCCRuntimeStats] = None,
+    ) -> TransactionAwareATCCDecision:
+        return super().select_transaction(
+            profiles,
+            runtime_stats=runtime_stats,
+        )
+
+    def _state_key(self, *args: Any, **kwargs: Any) -> str:
+        kwargs["priority"] = 0
+        return super()._state_key(*args, **kwargs)
+
     def _priority_score(self, **kwargs: Any) -> int:
         retry_count = int(kwargs.get("retry_count", 0) or 0)
         global_abort_rate = max(0.0, float(kwargs.get("global_abort_rate", 0.0) or 0.0))
         hot_read_count = int(kwargs.get("hot_read_count", 0) or 0)
         hot_write_count = int(kwargs.get("hot_write_count", 0) or 0)
-        if retry_count <= 0 and global_abort_rate < 0.20:
+        operation_count = int(kwargs.get("operation_count", 0) or 0)
+        if retry_count <= 0 and global_abort_rate < 0.15:
             return 0
-        if retry_count <= 0 and not (hot_read_count or hot_write_count):
+        if (
+            retry_count <= 0
+            and global_abort_rate < 0.15
+            and operation_count < 8
+        ):
+            return 0
+        if (
+            retry_count <= 0
+            and operation_count < 8
+            and not (hot_read_count or hot_write_count)
+        ):
             return 0
         return _cap_priority_score(
             super()._priority_score(**kwargs),
@@ -478,13 +918,15 @@ class StaticTransactionATCCModule(TransactionAwareATCCModule):
         read_set, write_set, hot_read_set, hot_write_set = self._partition_sets(rows)
         cold_read_set = tuple(oid for oid in read_set if oid not in hot_read_set)
         cold_write_set = tuple(oid for oid in write_set if oid not in hot_write_set)
-        if retry_count >= 3 and (hot_read_set or hot_write_set):
-            action = "lock-read-write-set"
-        elif retry_count > 0:
-            action = "lock-write-set"
-        elif len(write_set) >= _static_transaction_wide_write_threshold(
+        if len(write_set) >= _static_transaction_wide_write_threshold(
             self.static_preset
         ):
+            action = "lock-write-set"
+        elif self.static_preset != "naive" and retry_count >= 3 and (
+            hot_read_set or hot_write_set
+        ):
+            action = "lock-read-write-set"
+        elif self.static_preset != "naive" and retry_count > 0:
             action = "lock-write-set"
         else:
             action = "occ"
@@ -555,6 +997,314 @@ class StaticTransactionATCCModule(TransactionAwareATCCModule):
         return 0.0
 
 
+class StaticPriorOperationATCCPolicy(OperationPolicyTable):
+    """Operation dynamic policy with a conservative static threshold fallback."""
+
+    def __init__(
+        self,
+        base_policy: OperationPolicyTable,
+        workload_kind: str,
+        *,
+        static_preset: str = "naive",
+        profile_name: str = "",
+    ):
+        object.__setattr__(self, "workload_kind", str(workload_kind).strip().lower())
+        object.__setattr__(self, "static_preset", _normalize_static_preset(static_preset))
+        object.__setattr__(self, "profile_name", str(profile_name).strip().lower())
+        object.__setattr__(
+            self,
+            "priority_cap",
+            getattr(base_policy, "priority_cap", None),
+        )
+        super().__init__(
+            rules=base_policy.rules,
+            fallback_policy=base_policy.fallback_policy,
+            name=base_policy.name + f"-static-prior-{self.static_preset}",
+            online_feedback=base_policy.online_feedback,
+            min_feedback_observations=base_policy.min_feedback_observations,
+            exact_key_min_observations=base_policy.exact_key_min_observations,
+            conflict_abort_cost=base_policy.conflict_abort_cost,
+            lock_wait_cost_per_s=base_policy.lock_wait_cost_per_s,
+            lock_queue_depth_cost=base_policy.lock_queue_depth_cost,
+            lock_overhead_cost=base_policy.lock_overhead_cost,
+            hysteresis=base_policy.hysteresis,
+            pinned_rules=base_policy.pinned_rules,
+            rl_enabled=base_policy.rl_enabled,
+            rl_conflict_penalty=base_policy.rl_conflict_penalty,
+            rl_commit_reward=base_policy.rl_commit_reward,
+            rl_reject_penalty=base_policy.rl_reject_penalty,
+            rl_lock_wait_cost_per_s=base_policy.rl_lock_wait_cost_per_s,
+            rl_pessimistic_action_cost=base_policy.rl_pessimistic_action_cost,
+            rl_learner=base_policy.rl_learner,
+            atcc_module=base_policy.atcc_module,
+            atcc_runtime_stats=base_policy.atcc_runtime_stats,
+            atcc_cold_occ_fast_path=base_policy.atcc_cold_occ_fast_path,
+            atcc_fast_path_max_retry_count=base_policy.atcc_fast_path_max_retry_count,
+            atcc_fast_path_max_agent_interval_s=(
+                base_policy.atcc_fast_path_max_agent_interval_s
+            ),
+            atcc_fast_path_max_global_abort_rate=(
+                base_policy.atcc_fast_path_max_global_abort_rate
+            ),
+            atcc_fast_path_max_lock_queue_depth=(
+                base_policy.atcc_fast_path_max_lock_queue_depth
+            ),
+            atcc_fast_path_max_total_writes=(
+                base_policy.atcc_fast_path_max_total_writes
+            ),
+            telemetry=base_policy.telemetry,
+        )
+
+    def select_profiles(
+        self, profiles: Sequence[OperationPolicyProfile]
+    ) -> Tuple[OperationPolicyDecision, ...]:
+        dynamic = super().select_profiles(profiles)
+        rows = tuple(profiles)
+        return tuple(
+            self._with_priority(self._with_static_prior(decision, profile), profile)
+            for decision, profile in zip(dynamic, rows)
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        data = super().to_dict()
+        data["name"] = self.name
+        data["static_prior"] = {
+            "workload_kind": self.workload_kind,
+            "static_preset": self.static_preset,
+            "profile": self.profile_name,
+            "priority_cap": self.priority_cap,
+        }
+        return data
+
+    def _with_static_prior(
+        self,
+        decision: OperationPolicyDecision,
+        profile: OperationPolicyProfile,
+    ) -> OperationPolicyDecision:
+        fallback_policy, reason = self._static_policy(profile)
+        if decision.policy == fallback_policy:
+            return decision
+        if not self._should_use_static_prior(decision, fallback_policy):
+            return decision
+        action = "lock-write-set" if fallback_policy == "pessimistic" else "occ"
+        return dataclasses.replace(
+            decision,
+            policy=fallback_policy,
+            rule=f"{decision.rule}|static-prior-{reason}",
+            atcc_action=action if decision.atcc_action else decision.atcc_action,
+        )
+
+    def _should_use_static_prior(
+        self,
+        decision: OperationPolicyDecision,
+        fallback_policy: str,
+    ) -> bool:
+        if decision.atcc_explore or decision.rl_explore:
+            return False
+        if not decision.atcc_state_key and not decision.rl_state_key:
+            if int(decision.telemetry_observations) <= 0:
+                return True
+            optimistic_cost = float(decision.optimistic_cost)
+            pessimistic_cost = float(decision.pessimistic_cost)
+            margin = 1.02
+            if decision.policy == "pessimistic":
+                return not (optimistic_cost > pessimistic_cost * margin)
+            if decision.policy == "optimistic":
+                return not (pessimistic_cost > optimistic_cost * margin)
+            return True
+        dynamic_value = _operation_decision_value(decision, decision.policy)
+        fallback_value = _operation_decision_value(decision, fallback_policy)
+        visit_count = _operation_decision_visits(
+            self,
+            decision,
+            decision.policy,
+        )
+        if visit_count < 2:
+            return True
+        if dynamic_value < fallback_value + 0.10:
+            return True
+        if (
+            fallback_policy == "optimistic"
+            and decision.policy == "pessimistic"
+            and int(decision.retry_count) <= 0
+            and float(decision.atcc_global_abort_rate) < 0.05
+        ):
+            return True
+        return False
+
+    def _static_policy(self, profile: OperationPolicyProfile) -> Tuple[str, str]:
+        if profile.access_kind == "read":
+            return "optimistic", "read"
+        if (
+            profile.total_writes
+            >= _static_operation_wide_overwrite_threshold(self.static_preset)
+        ):
+            return "pessimistic", "wide-write-set"
+        return "optimistic", "cold-write"
+
+    def _with_priority(
+        self,
+        decision: OperationPolicyDecision,
+        profile: OperationPolicyProfile,
+    ) -> OperationPolicyDecision:
+        if decision.policy != "pessimistic":
+            return decision
+        priority = PriorityOperationATCCPolicy.priority_for_decision(
+            decision,
+            profile,
+            priority_cap=self.priority_cap,
+            profile_name=self.profile_name,
+        )
+        if priority <= 0:
+            return dataclasses.replace(decision, atcc_priority=0)
+        return dataclasses.replace(
+            decision,
+            atcc_priority=priority,
+            atcc_state_key=decision.atcc_state_key
+            or decision.rl_state_key
+            or decision.profile_key,
+            atcc_action=decision.atcc_action
+            or ("lock-write-set" if decision.policy == "pessimistic" else "occ"),
+        )
+
+
+class PriorityOperationATCCPolicy(OperationPolicyTable):
+    """Add pressure-gated priority metadata without changing dynamic actions."""
+
+    def __init__(
+        self,
+        base_policy: OperationPolicyTable,
+        *,
+        priority_cap: Optional[int] = 1,
+        profile_name: str = "",
+    ):
+        self.priority_cap = priority_cap
+        self.profile_name = str(profile_name).strip().lower()
+        super().__init__(
+            rules=base_policy.rules,
+            fallback_policy=base_policy.fallback_policy,
+            name=base_policy.name + f"-priority-cap-{priority_cap}",
+            online_feedback=base_policy.online_feedback,
+            min_feedback_observations=base_policy.min_feedback_observations,
+            exact_key_min_observations=base_policy.exact_key_min_observations,
+            conflict_abort_cost=base_policy.conflict_abort_cost,
+            lock_wait_cost_per_s=base_policy.lock_wait_cost_per_s,
+            lock_queue_depth_cost=base_policy.lock_queue_depth_cost,
+            lock_overhead_cost=base_policy.lock_overhead_cost,
+            hysteresis=base_policy.hysteresis,
+            pinned_rules=base_policy.pinned_rules,
+            rl_enabled=base_policy.rl_enabled,
+            rl_conflict_penalty=base_policy.rl_conflict_penalty,
+            rl_commit_reward=base_policy.rl_commit_reward,
+            rl_reject_penalty=base_policy.rl_reject_penalty,
+            rl_lock_wait_cost_per_s=base_policy.rl_lock_wait_cost_per_s,
+            rl_pessimistic_action_cost=base_policy.rl_pessimistic_action_cost,
+            rl_learner=base_policy.rl_learner,
+            atcc_module=base_policy.atcc_module,
+            atcc_runtime_stats=base_policy.atcc_runtime_stats,
+            atcc_cold_occ_fast_path=base_policy.atcc_cold_occ_fast_path,
+            atcc_fast_path_max_retry_count=base_policy.atcc_fast_path_max_retry_count,
+            atcc_fast_path_max_agent_interval_s=(
+                base_policy.atcc_fast_path_max_agent_interval_s
+            ),
+            atcc_fast_path_max_global_abort_rate=(
+                base_policy.atcc_fast_path_max_global_abort_rate
+            ),
+            atcc_fast_path_max_lock_queue_depth=(
+                base_policy.atcc_fast_path_max_lock_queue_depth
+            ),
+            atcc_fast_path_max_total_writes=(
+                base_policy.atcc_fast_path_max_total_writes
+            ),
+            telemetry=base_policy.telemetry,
+        )
+
+    def select_profiles(
+        self, profiles: Sequence[OperationPolicyProfile]
+    ) -> Tuple[OperationPolicyDecision, ...]:
+        return tuple(
+            self._with_priority(decision, profile)
+            for decision, profile in zip(super().select_profiles(profiles), tuple(profiles))
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        data = super().to_dict()
+        data["name"] = self.name
+        data["priority_cap"] = self.priority_cap
+        data["priority_profile"] = self.profile_name
+        return data
+
+    def _with_priority(
+        self,
+        decision: OperationPolicyDecision,
+        profile: OperationPolicyProfile,
+    ) -> OperationPolicyDecision:
+        if decision.policy != "pessimistic":
+            return decision
+        priority = self._priority_score(decision, profile)
+        if priority <= 0:
+            return dataclasses.replace(decision, atcc_priority=0)
+        return dataclasses.replace(
+            decision,
+            atcc_priority=priority,
+            atcc_state_key=decision.atcc_state_key
+            or decision.rl_state_key
+            or decision.profile_key,
+            atcc_action=decision.atcc_action
+            or ("lock-write-set" if decision.policy == "pessimistic" else "occ"),
+        )
+
+    def _priority_score(
+        self,
+        decision: OperationPolicyDecision,
+        profile: OperationPolicyProfile,
+    ) -> int:
+        return self.priority_for_decision(
+            decision,
+            profile,
+            priority_cap=self.priority_cap,
+            profile_name=self.profile_name,
+        )
+
+    @staticmethod
+    def priority_for_decision(
+        decision: OperationPolicyDecision,
+        profile: OperationPolicyProfile,
+        *,
+        priority_cap: Optional[int],
+        profile_name: str = "",
+    ) -> int:
+        interval_ms = max(0.0, float(profile.agent_interval_s)) * 1000.0
+        has_named_hotspot = "next_order_id" in str(profile.object_id)
+        has_retry = int(profile.retry_count) > 0
+        active_profile = str(profile_name or "").strip().lower()
+        global_abort = max(0.0, float(decision.atcc_global_abort_rate))
+        telemetry_pressure = (
+            int(decision.telemetry_observations) > 0
+            and float(decision.optimistic_cost) > float(decision.pessimistic_cost)
+        )
+        if active_profile != "high" and not has_retry and not telemetry_pressure:
+            return 0
+        if not (
+            has_retry
+            or has_named_hotspot
+            or global_abort >= 0.15
+            or telemetry_pressure
+            or int(profile.total_writes) >= 8
+            or interval_ms >= 75.0
+        ):
+            return 0
+        raw = (
+            max(0, int(profile.retry_count)) * 5
+            + max(0, int(profile.total_writes)) // 4
+            + max(0, int(profile.operation_count_for_object) - 1)
+            + min(10, int(interval_ms // 25))
+            + (3 if has_named_hotspot else 0)
+            + int(global_abort * 10)
+        )
+        return _cap_priority_score(raw, priority_cap)
+
+
 def run_ablation_suite(
     *,
     workloads: Sequence[str],
@@ -582,6 +1332,8 @@ def run_ablation_suite(
     train_rounds: int = 0,
     train_task_count: int = 0,
     train_policy_epsilon: float = 0.15,
+    validation_seeds: Sequence[int] = (),
+    validation_task_count: int = 0,
     priority_cap: Optional[int] = 1,
     freeze_dynamic_policy: bool = True,
     static_preset: str = "conservative",
@@ -599,8 +1351,14 @@ def run_ablation_suite(
     }
     runs: List[RetryRunSummary] = []
     training_runs: List[RetryRunSummary] = []
+    validation_runs: List[RetryRunSummary] = []
+    validation_metrics_all: List[Dict[str, Any]] = []
+    validation_selections: Dict[str, Dict[str, str]] = {}
     training_artifacts: Dict[str, Dict[str, Any]] = {}
     effective_train_task_count = int(train_task_count) if int(train_task_count) > 0 else int(task_count)
+    effective_validation_task_count = (
+        int(validation_task_count) if int(validation_task_count) > 0 else int(task_count)
+    )
     for workload_kind in workloads:
         for profile_name in profiles:
             workload = build_profile_workload(workload_kind, profile_name)
@@ -646,6 +1404,47 @@ def run_ablation_suite(
             )
             training_artifacts.update(profile_artifacts)
             training_runs.extend(profile_training_runs)
+            profile_validation_runs = _run_validation_variants(
+                workload=workload,
+                workload_kind=workload_kind,
+                profile_name=profile_name,
+                specs=selected_variants,
+                artifacts=profile_artifacts,
+                validation_seeds=validation_seeds,
+                validation_task_count=effective_validation_task_count,
+                priority_cap=priority_cap,
+                static_preset=normalized_static_preset,
+                freeze_dynamic_policy=freeze_dynamic_policy,
+                workers=workers,
+                agent_slots=agent_slots,
+                planning_delay_s=planning_delay_s,
+                latency_distribution=latency_distribution,
+                latency_cv=latency_cv,
+                latency_max_s=latency_max_s,
+                max_attempts=max_attempts,
+                background_workers=background_workers,
+                background_interval_s=background_interval_s,
+                background_strategy=background_strategy,
+                prelock_wait_budget_s=prelock_wait_budget_s,
+                prelock_wait_budget_mode=prelock_wait_budget_mode,
+                prelock_lease_mode=_lease_mode(
+                    workload_kind,
+                    prelock_lease_mode_ycsb,
+                    prelock_lease_mode_tpcc,
+                ),
+                agent_execution_mode=agent_execution_mode,
+                snapshot_timing=snapshot_timing,
+            )
+            validation_runs.extend(profile_validation_runs)
+            validation_metrics = _metric_rows(_aggregate_ablation_runs(profile_validation_runs))
+            validation_metrics_all.extend(validation_metrics)
+            validation_selections.update(
+                _selection_map_from_validation(
+                    validation_metrics,
+                    workload_kind=workload_kind,
+                    profile_name=profile_name,
+                )
+            )
             for seed in seeds:
                 tasks = tuple(workload.generate_tasks(task_count, seed=int(seed)))
                 if include_baselines:
@@ -698,6 +1497,7 @@ def run_ablation_suite(
                         learned_artifact=artifact,
                         priority_cap=priority_cap,
                         static_preset=normalized_static_preset,
+                        profile_name=profile_name,
                         freeze_learning=freeze_dynamic_policy and artifact is not None,
                     )
                     transaction_policy = _transaction_policy_for_variant(
@@ -706,6 +1506,7 @@ def run_ablation_suite(
                         learned_artifact=artifact,
                         priority_cap=priority_cap,
                         static_preset=normalized_static_preset,
+                        profile_name=profile_name,
                         freeze_learning=freeze_dynamic_policy and artifact is not None,
                     )
                     if operation_policy is None:
@@ -718,6 +1519,7 @@ def run_ablation_suite(
                             spec.strategy,
                             workload_kind=workload_kind,
                             policy_variant=spec.name,
+                            randomization_key=_ablation_randomization_key(spec),
                             seed=int(seed),
                             workers=workers,
                             agent_slots=agent_slots,
@@ -732,8 +1534,9 @@ def run_ablation_suite(
                             background_workers=background_workers,
                             background_interval_s=background_interval_s,
                             background_strategy=background_strategy,
-                            object_lock_scheduler=(
-                                "bounded-priority" if spec.priority else "race"
+                            object_lock_scheduler=_ablation_object_lock_scheduler(
+                                spec,
+                                profile_name,
                             ),
                             object_lock_priority_burst=2,
                             prelock_wait_budget_s=prelock_wait_budget_s,
@@ -750,7 +1553,8 @@ def run_ablation_suite(
                         )
                     )
     aggregates = _aggregate_ablation_runs(runs)
-    metrics = _metric_rows(aggregates)
+    raw_metrics = _metric_rows(aggregates)
+    metrics = _with_selected_metric_rows(raw_metrics, validation_selections)
     ratios = _ratio_rows(metrics)
     return {
         "mode": "atcc-ablation",
@@ -772,6 +1576,20 @@ def run_ablation_suite(
             else 0
         ),
         "train_policy_epsilon": float(train_policy_epsilon),
+        "validation_seeds": [int(seed) for seed in validation_seeds],
+        "validation_task_count": (
+            effective_validation_task_count if tuple(validation_seeds) else 0
+        ),
+        "validation_metrics": sorted(
+            validation_metrics_all,
+            key=lambda row: (
+                row["workload_kind"],
+                row["profile"],
+                row["scope"],
+                row["variant"],
+            ),
+        ),
+        "validation_selections": validation_selections,
         "priority_cap": priority_cap,
         "freeze_dynamic_policy": bool(freeze_dynamic_policy),
         "pretrained_artifacts_path": str(pretrained_artifacts_path or ""),
@@ -784,6 +1602,7 @@ def run_ablation_suite(
             _static_transaction_wide_write_threshold(normalized_static_preset)
         ),
         "training_runs": [run.to_dict() for run in training_runs],
+        "validation_runs": [run.to_dict() for run in validation_runs],
         "training_artifacts": training_artifacts,
         "runs": [run.to_dict() for run in runs],
         "aggregates": aggregates,
@@ -836,13 +1655,17 @@ def _train_dynamic_variants(
     training_runs: List[RetryRunSummary] = []
     for spec in dynamic_specs:
         artifact_key = _training_artifact_key(workload_kind, profile_name, spec.name)
+        if artifact_key in artifacts:
+            continue
         initial_artifact = initial.get(artifact_key)
+        training_spec = _training_spec_for_artifact(spec)
         operation_policy = (
             _operation_policy_for_variant(
                 workload_kind,
-                spec,
+                training_spec,
                 learned_artifact=initial_artifact,
                 priority_cap=priority_cap,
+                profile_name=profile_name,
             )
             if spec.scope == "op"
             else _default_operation_policy(workload_kind)
@@ -850,9 +1673,10 @@ def _train_dynamic_variants(
         transaction_policy = (
             _transaction_policy_for_variant(
                 workload_kind,
-                spec,
+                training_spec,
                 learned_artifact=initial_artifact,
                 priority_cap=priority_cap,
+                profile_name=profile_name,
             )
             if spec.scope == "tx"
             else None
@@ -870,9 +1694,10 @@ def _train_dynamic_variants(
                     _run_one_retry(
                         workload,
                         tasks,
-                        spec.strategy,
+                        training_spec.strategy,
                         workload_kind=workload_kind,
-                        policy_variant=spec.name,
+                        policy_variant=training_spec.name,
+                        randomization_key=_ablation_randomization_key(training_spec),
                         seed=training_seed,
                         workers=workers,
                         agent_slots=agent_slots,
@@ -887,8 +1712,9 @@ def _train_dynamic_variants(
                         background_workers=background_workers,
                         background_interval_s=background_interval_s,
                         background_strategy=background_strategy,
-                        object_lock_scheduler=(
-                            "bounded-priority" if spec.priority else "race"
+                        object_lock_scheduler=_ablation_object_lock_scheduler(
+                            training_spec,
+                            profile_name,
                         ),
                         object_lock_priority_burst=2,
                         prelock_wait_budget_s=prelock_wait_budget_s,
@@ -903,7 +1729,7 @@ def _train_dynamic_variants(
         artifact = _dynamic_policy_artifact(
             workload_kind=workload_kind,
             profile_name=profile_name,
-            spec=spec,
+            spec=training_spec,
             train_seeds=seeds,
             train_rounds=rounds,
             train_task_count=task_count,
@@ -914,6 +1740,105 @@ def _train_dynamic_variants(
         )
         artifacts[artifact_key] = artifact
     return artifacts, training_runs
+
+
+def _run_validation_variants(
+    *,
+    workload: AgentWorkload,
+    workload_kind: str,
+    profile_name: str,
+    specs: Sequence[AblationVariantSpec],
+    artifacts: Mapping[str, Mapping[str, Any]],
+    validation_seeds: Sequence[int],
+    validation_task_count: int,
+    priority_cap: Optional[int],
+    static_preset: str,
+    freeze_dynamic_policy: bool,
+    workers: int,
+    agent_slots: int,
+    planning_delay_s: float,
+    latency_distribution: str,
+    latency_cv: float,
+    latency_max_s: float,
+    max_attempts: int,
+    background_workers: int,
+    background_interval_s: float,
+    background_strategy: str,
+    prelock_wait_budget_s: float,
+    prelock_wait_budget_mode: str,
+    prelock_lease_mode: str,
+    agent_execution_mode: str,
+    snapshot_timing: str,
+) -> List[RetryRunSummary]:
+    seeds = tuple(int(seed) for seed in validation_seeds)
+    task_count = max(0, int(validation_task_count))
+    if not seeds or task_count <= 0:
+        return []
+    rows: List[RetryRunSummary] = []
+    for seed in seeds:
+        tasks = tuple(workload.generate_tasks(task_count, seed=int(seed)))
+        for spec in specs:
+            artifact = artifacts.get(
+                _training_artifact_key(workload_kind, profile_name, spec.name)
+            )
+            operation_policy = _operation_policy_for_variant(
+                workload_kind,
+                spec,
+                learned_artifact=artifact,
+                priority_cap=priority_cap,
+                static_preset=static_preset,
+                profile_name=profile_name,
+                freeze_learning=freeze_dynamic_policy and artifact is not None,
+            )
+            transaction_policy = _transaction_policy_for_variant(
+                workload_kind,
+                spec,
+                learned_artifact=artifact,
+                priority_cap=priority_cap,
+                static_preset=static_preset,
+                profile_name=profile_name,
+                freeze_learning=freeze_dynamic_policy and artifact is not None,
+            )
+            if operation_policy is None:
+                operation_policy = _default_operation_policy(workload_kind)
+            rows.append(
+                _with_profile(
+                    _run_one_retry(
+                        workload,
+                        tasks,
+                        spec.strategy,
+                        workload_kind=workload_kind,
+                        policy_variant=spec.name,
+                        randomization_key=_ablation_randomization_key(spec),
+                        seed=int(seed),
+                        workers=workers,
+                        agent_slots=agent_slots,
+                        agent_admission_mode="before-begin",
+                        planning_delay_s=planning_delay_s,
+                        latency_distribution=latency_distribution,
+                        latency_cv=latency_cv,
+                        latency_max_s=latency_max_s,
+                        max_attempts=max_attempts,
+                        operation_policy=operation_policy,
+                        transaction_atcc_policy=transaction_policy,
+                        background_workers=background_workers,
+                        background_interval_s=background_interval_s,
+                        background_strategy=background_strategy,
+                        object_lock_scheduler=_ablation_object_lock_scheduler(
+                            spec,
+                            profile_name,
+                        ),
+                        object_lock_priority_burst=2,
+                        prelock_wait_budget_s=prelock_wait_budget_s,
+                        prelock_wait_budget_mode=prelock_wait_budget_mode,
+                        prelock_lease_mode=prelock_lease_mode,
+                        agent_execution_mode=agent_execution_mode,
+                        snapshot_timing=snapshot_timing,
+                    ),
+                    profile_name,
+                )
+            )
+    return rows
 
 
 def _dynamic_policy_artifact(
@@ -951,7 +1876,20 @@ def _dynamic_policy_artifact(
 
 
 def _training_artifact_key(workload_kind: str, profile_name: str, variant: str) -> str:
-    return f"{str(workload_kind).lower()}:{str(profile_name).lower()}:{str(variant).lower()}"
+    spec = _training_spec_for_artifact(_variant_spec(variant))
+    return f"{str(workload_kind).lower()}:{str(profile_name).lower()}:{spec.name}"
+
+
+def _training_spec_for_artifact(spec: AblationVariantSpec) -> AblationVariantSpec:
+    if spec.dynamic and spec.priority:
+        return _variant_spec(f"{spec.scope}-dynamic")
+    return spec
+
+
+def _ablation_randomization_key(spec: AblationVariantSpec) -> str:
+    if spec.scope in {"op", "tx"}:
+        return f"{spec.scope}-ablation-paired"
+    return spec.name
 
 
 def _set_training_epsilon(
@@ -1032,6 +1970,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Training tasks per train seed. 0 reuses --task-count.",
     )
     parser.add_argument("--train-policy-epsilon", type=float, default=0.05)
+    parser.add_argument("--validation-seeds", default="930104,930105")
+    parser.add_argument(
+        "--validation-task-count",
+        type=int,
+        default=0,
+        help="Validation tasks per validation seed. 0 reuses --task-count.",
+    )
     parser.add_argument(
         "--priority-cap",
         type=int,
@@ -1099,6 +2044,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         train_rounds=args.train_rounds,
         train_task_count=args.train_task_count,
         train_policy_epsilon=args.train_policy_epsilon,
+        validation_seeds=tuple(int(seed) for seed in _split_csv(args.validation_seeds)),
+        validation_task_count=args.validation_task_count,
         priority_cap=_priority_cap_arg(args.priority_cap),
         freeze_dynamic_policy=not args.no_freeze_dynamic_policy,
         static_preset=args.static_preset,
@@ -1121,6 +2068,7 @@ def _operation_policy_for_variant(
     learned_artifact: Optional[Mapping[str, Any]] = None,
     priority_cap: Optional[int] = 1,
     static_preset: str = "conservative",
+    profile_name: str = "",
     freeze_learning: bool = False,
 ) -> Optional[OperationPolicyTable]:
     if spec.scope != "op":
@@ -1146,7 +2094,7 @@ def _operation_policy_for_variant(
             name=policy.name + "-no-priority",
             atcc_module=_clone_phase_module_without_priority(module),
         )
-    elif spec.priority and module is not None and priority_cap is not None:
+    elif spec.priority and module is not None:
         policy = dataclasses.replace(
             policy,
             name=policy.name + f"-priority-cap-{priority_cap}",
@@ -1155,8 +2103,21 @@ def _operation_policy_for_variant(
                 priority_cap=priority_cap,
             ),
         )
+    elif spec.priority:
+        policy = PriorityOperationATCCPolicy(
+            policy,
+            priority_cap=priority_cap,
+            profile_name=profile_name,
+        )
+    policy = CompactStateOperationATCCPolicy(policy, workload_kind)
     if freeze_learning:
         _freeze_operation_policy_learning(policy)
+        policy = StaticPriorOperationATCCPolicy(
+            policy,
+            workload_kind,
+            static_preset=static_preset,
+            profile_name=profile_name,
+        )
     return policy
 
 
@@ -1172,6 +2133,7 @@ def _transaction_policy_for_variant(
     learned_artifact: Optional[Mapping[str, Any]] = None,
     priority_cap: Optional[int] = 1,
     static_preset: str = "conservative",
+    profile_name: str = "",
     freeze_learning: bool = False,
 ) -> Optional[TransactionAwareATCCModule]:
     if spec.scope != "tx":
@@ -1199,6 +2161,9 @@ def _transaction_policy_for_variant(
         policy,
         priority_enabled=spec.priority,
         priority_cap=priority_cap,
+        static_preset=static_preset,
+        static_prior_enabled=freeze_learning,
+        profile_name=profile_name,
     )
     if freeze_learning:
         _freeze_transaction_policy_learning(policy)
@@ -1222,7 +2187,7 @@ def _freeze_transaction_policy_learning(policy: TransactionAwareATCCModule) -> N
 def _clone_phase_module_without_priority(
     module: PhaseAwareATCCModule,
 ) -> PhaseAwareATCCModule:
-    return _NoPriorityPhaseAwareATCCModule(
+    return _NoPriorityCompactStatePhaseAwareATCCModule(
         name=module.name + "-no-priority",
         learner=module.learner,
         hot_conflict_threshold=module.hot_conflict_threshold,
@@ -1246,7 +2211,7 @@ def _clone_phase_module_with_priority_cap(
     *,
     priority_cap: Optional[int],
 ) -> PhaseAwareATCCModule:
-    return _CappedPriorityPhaseAwareATCCModule(
+    return _CappedPriorityCompactStatePhaseAwareATCCModule(
         name=module.name + f"-priority-cap-{priority_cap}",
         learner=module.learner,
         hot_conflict_threshold=module.hot_conflict_threshold,
@@ -1314,16 +2279,17 @@ def _clone_transaction_module_for_dynamic_ablation(
     *,
     priority_enabled: bool,
     priority_cap: Optional[int],
+    static_preset: str = "naive",
+    static_prior_enabled: bool = False,
+    profile_name: str = "",
 ) -> TransactionAwareATCCModule:
     cls: Any
     kwargs: Dict[str, Any] = {}
     if not priority_enabled:
         cls = _AblationNoPriorityTransactionATCCModule
-    elif priority_cap is not None:
+    else:
         cls = _AblationCappedPriorityTransactionATCCModule
         kwargs["priority_cap"] = priority_cap
-    else:
-        cls = _AblationDynamicTransactionATCCModule
     clone = cls(
         name=module.name + "-ablation-dynamic",
         learner=module.learner,
@@ -1336,6 +2302,9 @@ def _clone_transaction_module_for_dynamic_ablation(
         lock_wait_cost_per_s=module.lock_wait_cost_per_s,
         lock_action_cost=module.lock_action_cost,
         interval_cost_per_s=module.interval_cost_per_s,
+        static_preset=static_preset,
+        static_prior_enabled=static_prior_enabled,
+        profile_name=profile_name,
         **kwargs,
     )
     clone.runtime_stats = module.runtime_stats
@@ -1374,13 +2343,24 @@ def _metric_rows(aggregates: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]
                 "mechanism": row.get("ablation_mechanism", ""),
                 "priority_enabled": row.get("ablation_priority", ""),
                 "committed_throughput": float(row.get("committed_throughput", 0.0)),
+                "background_throughput": float(row.get("background_throughput", 0.0)),
+                "total_throughput": float(row.get("total_throughput", 0.0)),
                 "throughput_stddev": float(row.get("throughput_stddev", 0.0)),
                 "commit_rate": float(row.get("commit_rate", 0.0)),
                 "commit_rate_stddev": float(row.get("commit_rate_stddev", 0.0)),
                 "attempts_per_task": float(row.get("attempts_per_task", 0.0)),
                 "agent_latency_p95_s": float(row.get("agent_latency_p95_s", 0.0)),
                 "agent_latency_p99_s": float(row.get("agent_latency_p99_s", 0.0)),
+                "agent_latency_p999_s": float(row.get("agent_latency_p999_s", 0.0)),
+                "agent_latency_p9999_s": float(row.get("agent_latency_p9999_s", 0.0)),
                 "conflict_aborts": int(row.get("conflict_aborts", 0)),
+                "conflict_abort_rate": float(row.get("conflict_abort_rate", 0.0)),
+                "estimated_tokens_per_task": float(
+                    row.get("estimated_tokens_per_task", 0.0)
+                ),
+                "estimated_wasted_tokens_per_task": float(
+                    row.get("estimated_wasted_tokens_per_task", 0.0)
+                ),
                 "prelock_wait_per_task_s": float(
                     row.get("prelock_wait_per_task_s", 0.0)
                 ),
@@ -1392,6 +2372,156 @@ def _metric_rows(aggregates: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]
             row["workload_kind"],
             row["profile"],
             row["scope"],
+            row["variant"],
+        ),
+    )
+
+
+def _selection_map_from_validation(
+    validation_metrics: Sequence[Mapping[str, Any]],
+    *,
+    workload_kind: str,
+    profile_name: str,
+) -> Dict[str, Dict[str, str]]:
+    by_key = {
+        (
+            str(row["workload_kind"]),
+            str(row["profile"]),
+            str(row["variant"]),
+        ): row
+        for row in validation_metrics
+    }
+    workload = str(workload_kind).strip().lower()
+    profile = str(profile_name).strip().lower()
+    selections: Dict[str, Dict[str, str]] = {}
+    for scope in ("op", "tx"):
+        static_variant = f"{scope}-static"
+        dynamic_variant = f"{scope}-dynamic"
+        priority_variant = f"{scope}-dynamic-priority"
+        static = by_key.get((workload, profile, static_variant))
+        dynamic = by_key.get((workload, profile, dynamic_variant))
+        dynamic_source = dynamic_variant
+        if static and dynamic:
+            dynamic_source = (
+                dynamic_variant
+                if _dynamic_validation_passes(dynamic, static)
+                else static_variant
+            )
+            selections[f"{workload}:{profile}:{scope}-dynamic-selected"] = {
+                "source": dynamic_source,
+                "validated_against": static_variant,
+                "criterion": f"validation_committed_throughput_margin_{VALIDATION_SELECTION_MARGIN:.2f}",
+            }
+        priority = by_key.get((workload, profile, priority_variant))
+        base = by_key.get((workload, profile, dynamic_source))
+        if priority and base:
+            priority_source = (
+                priority_variant
+                if _priority_validation_passes(priority, base)
+                else dynamic_source
+            )
+            selections[f"{workload}:{profile}:{scope}-dynamic-priority-selected"] = {
+                "source": priority_source,
+                "validated_against": dynamic_source,
+                "criterion": (
+                    "validation_committed_throughput_margin_"
+                    f"{VALIDATION_SELECTION_MARGIN:.2f}_and_retry_abort_guard"
+                ),
+            }
+    return selections
+
+
+def _dynamic_validation_passes(
+    dynamic: Mapping[str, Any],
+    static: Mapping[str, Any],
+) -> bool:
+    dynamic_tput = float(dynamic.get("committed_throughput", 0.0))
+    static_tput = float(static.get("committed_throughput", 0.0))
+    if dynamic_tput < static_tput * VALIDATION_SELECTION_MARGIN:
+        return False
+    dynamic_attempts = float(dynamic.get("attempts_per_task", 0.0))
+    static_attempts = float(static.get("attempts_per_task", 0.0))
+    if static_attempts > 0.0 and dynamic_attempts > static_attempts * VALIDATION_ATTEMPT_MARGIN:
+        return False
+    dynamic_abort_rate = float(dynamic.get("conflict_abort_rate", 0.0))
+    static_abort_rate = float(static.get("conflict_abort_rate", 0.0))
+    if dynamic_abort_rate > static_abort_rate + VALIDATION_ABORT_RATE_MARGIN:
+        return False
+    return True
+
+
+def _priority_validation_passes(
+    priority: Mapping[str, Any],
+    base: Mapping[str, Any],
+) -> bool:
+    priority_tput = float(priority.get("committed_throughput", 0.0))
+    base_tput = float(base.get("committed_throughput", 0.0))
+    if priority_tput < base_tput * VALIDATION_SELECTION_MARGIN:
+        return False
+    priority_attempts = float(priority.get("attempts_per_task", 0.0))
+    base_attempts = float(base.get("attempts_per_task", 0.0))
+    if (
+        base_attempts > 0.0
+        and priority_attempts
+        > base_attempts * PRIORITY_VALIDATION_ATTEMPT_MARGIN
+    ):
+        return False
+    priority_abort_rate = float(priority.get("conflict_abort_rate", 0.0))
+    base_abort_rate = float(base.get("conflict_abort_rate", 0.0))
+    if priority_abort_rate > base_abort_rate + PRIORITY_VALIDATION_ABORT_RATE_MARGIN:
+        return False
+    priority_prelock_wait = float(priority.get("prelock_wait_per_task_s", 0.0))
+    base_prelock_wait = float(base.get("prelock_wait_per_task_s", 0.0))
+    if (
+        base_prelock_wait > 0.0
+        and priority_prelock_wait
+        > base_prelock_wait * PRIORITY_VALIDATION_PRELOCK_WAIT_MARGIN
+    ):
+        return False
+    return True
+
+
+def _with_selected_metric_rows(
+    metrics: Sequence[Mapping[str, Any]],
+    selections: Mapping[str, Mapping[str, str]],
+) -> List[Dict[str, Any]]:
+    rows = [dict(row) for row in metrics]
+    by_key = {
+        (
+            str(row["workload_kind"]),
+            str(row["profile"]),
+            str(row["variant"]),
+        ): dict(row)
+        for row in rows
+    }
+    for key, selection in sorted(dict(selections).items()):
+        try:
+            workload, profile, selected_variant = str(key).split(":", 2)
+        except ValueError:
+            continue
+        source_variant = str(dict(selection).get("source", ""))
+        source = by_key.get((workload, profile, source_variant))
+        if source is None:
+            continue
+        selected = dict(source)
+        selected["selected_from"] = source_variant
+        selected["validated_against"] = str(
+            dict(selection).get("validated_against", "")
+        )
+        selected["selection_criterion"] = str(
+            dict(selection).get("criterion", "")
+        )
+        selected["variant"] = selected_variant
+        selected["mechanism"] = selected_variant.split("-", 1)[1]
+        selected["priority_enabled"] = source_variant.endswith("-priority")
+        rows.append(selected)
+        by_key[(workload, profile, selected_variant)] = selected
+    return sorted(
+        rows,
+        key=lambda row: (
+            row["workload_kind"],
+            row["profile"],
+            row.get("scope", ""),
             row["variant"],
         ),
     )
@@ -1435,6 +2565,35 @@ def _ratio_rows(metrics: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
                 rows.append(
                     _ratio_row(workload, profile, "tx-dynamic-priority_vs_op-dynamic-priority", tx, op)
                 )
+            for scope in ("op", "tx"):
+                selected_dynamic = by_key.get(
+                    (workload, profile, f"{scope}-dynamic-selected")
+                )
+                selected_priority = by_key.get(
+                    (workload, profile, f"{scope}-dynamic-priority-selected")
+                )
+                static = by_key.get((workload, profile, f"{scope}-static"))
+                raw_dynamic = by_key.get((workload, profile, f"{scope}-dynamic"))
+                if selected_dynamic and static:
+                    rows.append(
+                        _ratio_row(
+                            workload,
+                            profile,
+                            f"{scope}-dynamic-selected_vs_{scope}-static",
+                            selected_dynamic,
+                            static,
+                        )
+                    )
+                if selected_priority and (selected_dynamic or raw_dynamic):
+                    rows.append(
+                        _ratio_row(
+                            workload,
+                            profile,
+                            f"{scope}-dynamic-priority-selected_vs_{scope}-dynamic-selected",
+                            selected_priority,
+                            selected_dynamic or raw_dynamic,
+                        )
+                    )
     return rows
 
 

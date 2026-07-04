@@ -38,14 +38,14 @@ class ATCCFamilyPolicyTable:
     hot_write_ratio_threshold: float = 0.30
     hotspot_probability_threshold: float = 0.70
     read_heavy_strategy: str = "tictoc-full"
-    cold_read_heavy_strategy: str = "tictoc-full"
+    cold_read_heavy_strategy: str = "occ"
     adaptive_cold_mvcc_write_ratio_threshold: float = 0.05
     adaptive_hotspot_mvcc_write_ratio_threshold: float = 0.11
     cold_hotspot_probability_threshold: float = 0.01
     hot_write_strategy: str = "adaptive-op-strict"
-    fallback_strategy: str = "tictoc-full"
-    tpcc_low_contention_strategy: str = ""
-    tpcc_low_contention_min_distinct_order_counters: int = 0
+    fallback_strategy: str = "transaction-atcc-strict"
+    tpcc_low_contention_strategy: str = "occ"
+    tpcc_low_contention_min_distinct_order_counters: int = 16
     tpcc_window_distinct_order_counters: int = 0
     requested_strategy: str = "adaptive-hybrid"
 
@@ -231,7 +231,7 @@ class ATCCFamilyPolicyTable:
             ):
                 return ATCCFamilyDecision(
                     requested_strategy=self.requested_strategy,
-                    selected_strategy=self.fallback_strategy,
+                    selected_strategy=self.tpcc_low_contention_strategy,
                     rule="tpcc-low-contention-fast-through",
                     signals=signals,
                     reason=(

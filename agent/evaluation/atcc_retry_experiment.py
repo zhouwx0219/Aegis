@@ -25,7 +25,9 @@ from agent.evaluation.aggregation import percentile as shared_percentile
 from agent.evaluation.atcc_schema import atcc_artifact_schema_status
 from agent.runtime import (
     AgentTransactionManager,
+    ATCCRuntimeStats,
     OperationPolicyTable,
+    PhaseAwareATCCModule,
     TransactionAwareATCCModule,
     TransactionState,
 )
@@ -122,6 +124,20 @@ class RetryRunSummary:
         return self.committed_tasks / self.elapsed_s if self.elapsed_s > 0 else 0.0
 
     @property
+    def background_throughput(self) -> float:
+        return self.background_commits / self.elapsed_s if self.elapsed_s > 0 else 0.0
+
+    @property
+    def total_throughput(self) -> float:
+        if self.elapsed_s <= 0:
+            return 0.0
+        return (self.committed_tasks + self.background_commits) / self.elapsed_s
+
+    @property
+    def conflict_abort_rate(self) -> float:
+        return self.conflict_aborts / self.total_attempts if self.total_attempts else 0.0
+
+    @property
     def attempts_per_task(self) -> float:
         return self.total_attempts / self.task_count if self.task_count else 0.0
 
@@ -158,6 +174,14 @@ class RetryRunSummary:
         return _percentile(self.task_latencies_s, 99.0)
 
     @property
+    def agent_latency_p999_s(self) -> float:
+        return _percentile(self.task_latencies_s, 99.9)
+
+    @property
+    def agent_latency_p9999_s(self) -> float:
+        return _percentile(self.task_latencies_s, 99.99)
+
+    @property
     def agent_latency_max_s(self) -> float:
         return max(self.task_latencies_s) if self.task_latencies_s else 0.0
 
@@ -165,6 +189,9 @@ class RetryRunSummary:
         row = dataclasses.asdict(self)
         row["commit_rate"] = self.commit_rate
         row["committed_throughput"] = self.committed_throughput
+        row["background_throughput"] = self.background_throughput
+        row["total_throughput"] = self.total_throughput
+        row["conflict_abort_rate"] = self.conflict_abort_rate
         row["attempts_per_task"] = self.attempts_per_task
         row["attempts_per_commit"] = self.attempts_per_commit
         row["wasted_attempts_per_task"] = self.wasted_attempts_per_task
@@ -174,6 +201,8 @@ class RetryRunSummary:
         row["agent_latency_p50_s"] = self.agent_latency_p50_s
         row["agent_latency_p95_s"] = self.agent_latency_p95_s
         row["agent_latency_p99_s"] = self.agent_latency_p99_s
+        row["agent_latency_p999_s"] = self.agent_latency_p999_s
+        row["agent_latency_p9999_s"] = self.agent_latency_p9999_s
         row["agent_latency_max_s"] = self.agent_latency_max_s
         row["prelock_wait_per_task_s"] = (
             self.prelock_wait_s / self.task_count if self.task_count else 0.0
@@ -1371,6 +1400,7 @@ def aggregate_retry_runs(runs: Sequence[RetryRunSummary]) -> List[Dict[str, Any]
         )
         estimated_tokens = estimated_base_tokens + refresh_tokens
         estimated_wasted_tokens = estimated_base_wasted_tokens + refresh_tokens
+        conflict_abort_count = sum(run.conflict_aborts for run in group)
         rows.append(
             {
                 "strategy": strategy,
@@ -1394,7 +1424,10 @@ def aggregate_retry_runs(runs: Sequence[RetryRunSummary]) -> List[Dict[str, Any]
                 "wasted_attempts_per_task": wasted_attempts / task_count
                 if task_count
                 else 0.0,
-                "conflict_aborts": sum(run.conflict_aborts for run in group),
+                "conflict_aborts": conflict_abort_count,
+                "conflict_abort_rate": (
+                    conflict_abort_count / attempts if attempts else 0.0
+                ),
                 "conflict_object_counts": dict(
                     sorted(conflict_object_counts.items())
                 ),
@@ -1440,6 +1473,9 @@ def aggregate_retry_runs(runs: Sequence[RetryRunSummary]) -> List[Dict[str, Any]
                 "background_throughput": background_commits / elapsed
                 if elapsed > 0
                 else 0.0,
+                "total_throughput": (committed + background_commits) / elapsed
+                if elapsed > 0
+                else 0.0,
                 "prelock_wait_s": prelock_wait_s,
                 "prelock_wait_per_task_s": prelock_wait_s / task_count
                 if task_count
@@ -1463,6 +1499,8 @@ def aggregate_retry_runs(runs: Sequence[RetryRunSummary]) -> List[Dict[str, Any]
                 "agent_latency_p50_s": _percentile(task_latencies_s, 50.0),
                 "agent_latency_p95_s": _percentile(task_latencies_s, 95.0),
                 "agent_latency_p99_s": _percentile(task_latencies_s, 99.0),
+                "agent_latency_p999_s": _percentile(task_latencies_s, 99.9),
+                "agent_latency_p9999_s": _percentile(task_latencies_s, 99.99),
                 "agent_latency_max_s": max(task_latencies_s)
                 if task_latencies_s
                 else 0.0,
@@ -1593,6 +1631,7 @@ def _run_one_retry(
     *,
     workload_kind: str,
     policy_variant: str,
+    randomization_key: str = "",
     seed: int,
     workers: int,
     agent_slots: int,
@@ -1700,7 +1739,8 @@ def _run_one_retry(
             else str(strategy)
         )
         seed_strategy = execution_strategy if family_decision is not None else strategy
-        rng = random.Random(f"{seed}:{seed_strategy}:{policy_variant}:{task.task_id}")
+        seed_variant = str(randomization_key or policy_variant)
+        rng = random.Random(f"{seed}:{seed_strategy}:{seed_variant}:{task.task_id}")
         admit_before_begin = (
             str(agent_admission_mode) == "before-begin"
             and interaction_gate is not None
@@ -2289,23 +2329,27 @@ def _operation_policy(
     if policy is None:
         raise ValueError(f"unsupported policy variant: {variant}")
     if policy_artifact is not None:
-        return policy.with_learned_state(
-            policy_artifact,
-            policy_epsilon=0.0 if policy_epsilon is None else policy_epsilon,
+        return _wrap_retry_operation_policy(
+            policy.with_learned_state(
+                policy_artifact,
+                policy_epsilon=0.0 if policy_epsilon is None else policy_epsilon,
+            )
         )
     if policy_epsilon is not None:
         policy = policy.with_learned_state(
             policy.to_dict(),
             policy_epsilon=policy_epsilon,
         )
-    return policy
+    return _wrap_retry_operation_policy(policy)
 
 
 def _transaction_atcc_policy(workload_kind: str) -> TransactionAwareATCCModule:
     workload = str(workload_kind or "").strip().lower()
     if workload == "tpcc" or "tpcc" in workload:
-        return TransactionAwareATCCModule.tpcc()
-    return TransactionAwareATCCModule.ycsb()
+        base = TransactionAwareATCCModule.tpcc()
+    else:
+        base = TransactionAwareATCCModule.ycsb()
+    return _RetryCompactTransactionAwareATCCModule.from_dict(base.to_dict())
 
 
 def _run_background_worker(
@@ -2352,6 +2396,258 @@ def _run_background_worker(
         attempt += 1
         if interval_s > 0:
             stop_event.wait(float(interval_s))
+
+
+def _retry_bucket_count(value: Any) -> str:
+    count = int(value or 0)
+    if count <= 0:
+        return "0"
+    if count <= 1:
+        return "1"
+    if count <= 2:
+        return "2"
+    if count <= 4:
+        return "3-4"
+    if count <= 8:
+        return "5-8"
+    if count <= 16:
+        return "9-16"
+    return "17+"
+
+
+def _retry_hot_bucket(value: Any) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = 0.0
+    return "some" if number > 0.0 else "0"
+
+
+def _retry_compact_operation_group(object_id: str) -> str:
+    text = str(object_id)
+    if "next_order_id" in text:
+        return "tpcc-order-counter"
+    if text.startswith("tpcc:stock:"):
+        return "tpcc-stock"
+    if text.startswith("tpcc:customer:"):
+        return "tpcc-customer"
+    if text.startswith("tpcc:"):
+        return "tpcc-other"
+    if text.startswith("ycsb:record:"):
+        return "ycsb-record"
+    if text.startswith("ycsb:field:"):
+        return "ycsb-field"
+    return text.split(":", 1)[0] or "object"
+
+
+def _retry_compact_pressure_bucket(
+    *,
+    abort_rate: float = 0.0,
+    lock_wait_s: float = 0.0,
+    queue_depth: float = 0.0,
+) -> str:
+    abort = max(0.0, float(abort_rate))
+    wait = max(0.0, float(lock_wait_s))
+    queue = max(0.0, float(queue_depth))
+    if abort >= 0.20:
+        return "abort-high"
+    if abort >= 0.05:
+        return "abort-low"
+    if wait >= 0.050 or queue >= 1.0:
+        return "wait-high"
+    if wait >= 0.010:
+        return "wait-low"
+    return "cold"
+
+
+def _retry_cap_priority(value: int, cap: Optional[int]) -> int:
+    score = max(0, int(value or 0))
+    if cap is None:
+        return score
+    return min(score, max(0, int(cap)))
+
+
+class _RetryCompactPhaseAwareATCCModule(PhaseAwareATCCModule):
+    """Evaluation-only phase-aware ATCC with compact train/test states."""
+
+    def __init__(
+        self,
+        *args: Any,
+        priority_cap: Optional[int] = 1,
+        **kwargs: Any,
+    ):
+        super().__init__(*args, **kwargs)
+        self.priority_cap = priority_cap
+
+    def state_key(self, *args: Any, **kwargs: Any) -> str:
+        profiles = tuple(kwargs.get("profiles", ()) or ())
+        workload = ",".join(
+            sorted({str(getattr(profile, "workload", "")) for profile in profiles})
+        )
+        task = ",".join(
+            sorted({str(getattr(profile, "task_type", "")) for profile in profiles})
+        )
+        object_groups = sorted(
+            {
+                _retry_compact_operation_group(
+                    str(getattr(profile, "object_id", ""))
+                )
+                for profile in profiles
+            }
+        )
+        reads = sum(
+            1
+            for profile in profiles
+            if str(getattr(profile, "access_kind", "")) == "read"
+        )
+        writes = len(profiles) - reads
+        runtime_stats = kwargs.get("runtime_stats")
+        abort_rate = (
+            float(getattr(runtime_stats, "ewma_abort_rate", 0.0) or 0.0)
+            if runtime_stats is not None
+            else 0.0
+        )
+        lock_wait_s = (
+            float(getattr(runtime_stats, "ewma_lock_wait_s", 0.0) or 0.0)
+            if runtime_stats is not None
+            else 0.0
+        )
+        queue_depth = (
+            float(getattr(runtime_stats, "ewma_lock_queue_depth", 0.0) or 0.0)
+            if runtime_stats is not None
+            else 0.0
+        )
+        return "|".join(
+            (
+                "scope=operation-retry-dynamic-compact",
+                f"workload={workload}",
+                f"task={task}",
+                "group=" + ",".join(object_groups),
+                "phase=" + str(kwargs.get("phase", "")),
+                f"reads={_retry_bucket_count(reads)}",
+                f"writes={_retry_bucket_count(writes)}",
+                "hotR=" + _retry_hot_bucket(kwargs.get("hot_read_ratio", 0.0)),
+                "hotW=" + _retry_hot_bucket(kwargs.get("hot_write_ratio", 0.0)),
+                f"retry={_retry_bucket_count(kwargs.get('retry_count', 0))}",
+                "pressure="
+                + _retry_compact_pressure_bucket(
+                    abort_rate=abort_rate,
+                    lock_wait_s=lock_wait_s,
+                    queue_depth=queue_depth,
+                ),
+            )
+        )
+
+    def priority_score(self, **kwargs: Any) -> int:
+        retry_count = int(kwargs.get("retry_count", 0) or 0)
+        global_abort_rate = max(0.0, float(kwargs.get("global_abort_rate", 0.0) or 0.0))
+        hot_read_ratio = max(0.0, float(kwargs.get("hot_read_ratio", 0.0) or 0.0))
+        hot_write_ratio = max(0.0, float(kwargs.get("hot_write_ratio", 0.0) or 0.0))
+        profiles = tuple(kwargs.get("profiles", ()) or ())
+        has_named_hotspot = any(
+            "next_order_id" in str(getattr(profile, "object_id", ""))
+            for profile in profiles
+        )
+        has_hot_access = hot_read_ratio > 0.0 or hot_write_ratio > 0.0
+        if retry_count <= 0:
+            if global_abort_rate < 0.05:
+                return 0
+            if not (has_hot_access or has_named_hotspot):
+                return 0
+        return _retry_cap_priority(
+            super().priority_score(**kwargs),
+            self.priority_cap,
+        )
+
+
+class _RetryCompactTransactionAwareATCCModule(TransactionAwareATCCModule):
+    """Evaluation-only transaction ATCC with compact dynamic state buckets."""
+
+    def __init__(
+        self,
+        *args: Any,
+        priority_cap: Optional[int] = 1,
+        **kwargs: Any,
+    ):
+        super().__init__(*args, **kwargs)
+        self.priority_cap = priority_cap
+
+    def _state_key(
+        self,
+        profiles: Sequence[Any],
+        *,
+        phase: str,
+        retry_count: int,
+        agent_interval_s: float,
+        priority: int,
+        read_count: int,
+        write_count: int,
+        hot_read_count: int,
+        hot_write_count: int,
+        runtime_stats: ATCCRuntimeStats,
+    ) -> str:
+        del priority
+        workloads = sorted(
+            {str(getattr(profile, "workload", "")) for profile in profiles}
+        )
+        task_types = sorted(
+            {str(getattr(profile, "task_type", "")) for profile in profiles}
+        )
+        return "|".join(
+            (
+                "scope=transaction-retry-dynamic-compact",
+                "workload=" + ",".join(workloads),
+                "task=" + ",".join(task_types),
+                "phase=" + str(phase),
+                "reads=" + _retry_bucket_count(read_count),
+                "writes=" + _retry_bucket_count(write_count),
+                "hotR=" + _retry_bucket_count(hot_read_count),
+                "hotW=" + _retry_bucket_count(hot_write_count),
+                "retry=" + _retry_bucket_count(retry_count),
+                "pressure="
+                + _retry_compact_pressure_bucket(
+                    abort_rate=float(runtime_stats.ewma_abort_rate),
+                    lock_wait_s=float(runtime_stats.ewma_lock_wait_s),
+                    queue_depth=float(
+                        getattr(runtime_stats, "ewma_lock_queue_depth", 0.0)
+                    ),
+                ),
+            )
+        )
+
+    def _priority_score(self, **kwargs: Any) -> int:
+        retry_count = int(kwargs.get("retry_count", 0) or 0)
+        global_abort_rate = max(0.0, float(kwargs.get("global_abort_rate", 0.0) or 0.0))
+        hot_read_count = int(kwargs.get("hot_read_count", 0) or 0)
+        hot_write_count = int(kwargs.get("hot_write_count", 0) or 0)
+        if retry_count <= 0:
+            if global_abort_rate < 0.05:
+                return 0
+            if hot_read_count <= 0 and hot_write_count <= 0:
+                return 0
+        return _retry_cap_priority(
+            super()._priority_score(**kwargs),
+            self.priority_cap,
+        )
+
+
+def _wrap_retry_phase_atcc_module(
+    module: Optional[PhaseAwareATCCModule],
+) -> Optional[PhaseAwareATCCModule]:
+    if module is None:
+        return None
+    if isinstance(module, _RetryCompactPhaseAwareATCCModule):
+        return module
+    return _RetryCompactPhaseAwareATCCModule.from_dict(module.to_dict())
+
+
+def _wrap_retry_operation_policy(policy: OperationPolicyTable) -> OperationPolicyTable:
+    module = _wrap_retry_phase_atcc_module(policy.atcc_module)
+    if module is None:
+        return policy
+    suffix = "-compact-state"
+    name = policy.name if policy.name.endswith(suffix) else policy.name + suffix
+    return dataclasses.replace(policy, name=name, atcc_module=module)
 
 
 def _background_targets(workload: AgentWorkload, workload_kind: str) -> Tuple[str, ...]:
