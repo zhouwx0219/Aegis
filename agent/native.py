@@ -1,4 +1,4 @@
-"""Helpers for loading ASTRA native extensions with actionable errors."""
+"""Helpers for loading CAST-DAS native extensions with actionable errors."""
 
 from __future__ import annotations
 

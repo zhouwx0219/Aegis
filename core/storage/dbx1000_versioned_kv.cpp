@@ -23,7 +23,7 @@ constexpr int kKeySizeColumn = 2;
 constexpr int kValueSizeColumn = 3;
 constexpr int kKeyColumn = 4;
 constexpr int kValueColumn = 5;
-constexpr char kTableName[] = "ASTRA_VERSIONED_KV";
+constexpr char kTableName[] = "CAST_DAS_VERSIONED_KV";
 
 std::uint64_t HashKey(const std::string& key) {
   std::uint64_t hash = 14695981039346656037ULL;

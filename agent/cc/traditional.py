@@ -1,0 +1,92 @@
+"""Traditional CC strategies owned by the agent runtime."""
+
+from __future__ import annotations
+
+from typing import Any, Iterable
+
+from agent.cc.base import CCPlan, ConcurrencyControl, ValidationResult, unique_targets
+from agent.cc.locks import LockConflict
+
+
+class OccConcurrencyControl(ConcurrencyControl):
+    name = "occ"
+    family = "optimistic"
+    description = "Strict OCC validation over read and write versions."
+
+
+class TwoPhaseLockingConcurrencyControl(ConcurrencyControl):
+    family = "pessimistic"
+
+    def __init__(self, name: str, policy: str):
+        self.name = str(name)
+        self.policy = str(policy)
+        self.description = f"Strict 2PL with {self.policy} deadlock handling."
+
+    def plan(self, txn: Any) -> CCPlan:
+        targets = unique_targets(
+            list(getattr(txn, "read_set", {}).keys())
+            + list(getattr(txn, "write_set", {}).keys())
+        )
+        return CCPlan(
+            strategy=self.name,
+            family=self.family,
+            lock_targets=targets,
+            validate_reads=True,
+            validate_writes=True,
+            metadata={"lock_table": "2pl", "policy": self.policy},
+        )
+
+
+class MvccConcurrencyControl(ConcurrencyControl):
+    name = "mvcc"
+    family = "mvcc"
+    description = "Snapshot-style validation that rejects write-write conflicts."
+
+    def plan(self, txn: Any) -> CCPlan:
+        return CCPlan(
+            strategy=self.name,
+            family=self.family,
+            validate_reads=False,
+            validate_writes=True,
+        )
+
+
+class SiloConcurrencyControl(ConcurrencyControl):
+    name = "silo"
+    family = "silo"
+    description = "Silo-style commit with write-set locking and full validation."
+
+    def plan(self, txn: Any) -> CCPlan:
+        return CCPlan(
+            strategy=self.name,
+            family=self.family,
+            lock_targets=unique_targets(getattr(txn, "write_set", {}).keys()),
+            validate_reads=True,
+            validate_writes=True,
+            metadata={"lock_table": "exclusive", "wait": True},
+        )
+
+
+class TicTocConcurrencyControl(ConcurrencyControl):
+    name = "tictoc"
+    family = "tictoc"
+    description = "TicToc-style write locking with write-version validation."
+
+    def plan(self, txn: Any) -> CCPlan:
+        return CCPlan(
+            strategy=self.name,
+            family=self.family,
+            lock_targets=unique_targets(getattr(txn, "write_set", {}).keys()),
+            validate_reads=False,
+            validate_writes=True,
+            metadata={"lock_table": "exclusive", "wait": True},
+        )
+
+
+def lock_conflict_result(exc: LockConflict) -> ValidationResult:
+    return ValidationResult(False, exc.reason, exc.targets)
+
+
+def read_write_targets(txn: Any) -> Iterable[str]:
+    yield from getattr(txn, "read_set", {}).keys()
+    yield from getattr(txn, "write_set", {}).keys()

@@ -1,135 +1,49 @@
-"""Agent-side transaction lifecycle over pluggable runtime modules.
-
-The manager keeps the task boundary and catalog. Multi-branch semantics,
-concurrency-control selection, adaptive policy tables, and commit protocols are
-separate modules so the agent layer can evolve without changing the versioned KV
-backend.
-"""
+"""Single-plan agent transaction runtime over a versioned KV store."""
 
 from __future__ import annotations
 
 import dataclasses
 import threading
 import time
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, Optional
 
+from agent.cc import ConcurrencyControlRegistry, ExclusiveLockTable, LockConflict, ReservationTable, TwoPhaseLockTable
+from agent.cc.traditional import lock_conflict_result
 from agent.native import load_cast_core
-from agent.runtime.adaptive import AdaptivePolicyTable, OperationPolicyTable
-from agent.runtime.atcc import TransactionAwareATCCModule
-from agent.runtime.branching import (
-    BranchSemantics,
-    CandidateDraft,
-    QualityRankedBranchSemantics,
-)
-from agent.runtime.cc_registry import ConcurrencyControlRegistry
-from agent.runtime.commit_protocol import (
-    CostAwareCommitProtocol,
-    ObjectLockTable,
-    ObjectLockTimeout,
-)
 from agent.runtime.types import (
+    ReadRecord,
     SnapshotValue,
     TransactionEvent,
     TransactionResult,
     TransactionState,
+    WriteRecord,
 )
 
 cc = load_cast_core()
 
 
 class AgentTransaction:
+    """One logical agent task transaction with one concrete plan."""
+
     def __init__(
         self,
         manager: "AgentTransactionManager",
         task_id: str,
         snapshot: Dict[str, SnapshotValue],
         metadata: Optional[Dict[str, Any]] = None,
-        *,
-        prelock_lease: Optional[Any] = None,
-        precomputed_operation_policy_decisions: Iterable[Any] = (),
     ):
         self.manager = manager
         self.task_id = str(task_id)
         self.snapshot = snapshot
         self.metadata = dict(metadata or {})
         self.state = TransactionState.ACTIVE
-        self._lifecycle_lock = threading.RLock()
         self.started_at = time.perf_counter()
-        self.events: List[TransactionEvent] = []
-        self.read_set: Dict[str, SnapshotValue] = {}
-        self.candidates: List[CandidateDraft] = []
-        self.model_latency_s = 0.0
-        self.total_tokens = 0
+        self.events: list[TransactionEvent] = []
+        self.read_set: Dict[str, ReadRecord] = {}
+        self.write_set: Dict[str, WriteRecord] = {}
         self.result: Optional[TransactionResult] = None
-        self._prelock_lease = prelock_lease
-        self._yielded_prelock_targets: tuple[str, ...] = ()
-        self._yielded_prelock_priority = 0
-        self._yielded_prelock_reason = "pre-snapshot-atcc"
-        self.prelocked_targets = tuple(
-            getattr(prelock_lease, "targets", ()) if prelock_lease is not None else ()
-        )
-        self.prelock_wait_s = float(
-            getattr(prelock_lease, "wait_s", 0.0) if prelock_lease is not None else 0.0
-        )
-        self.prelock_target_wait_s = {
-            str(object_id): float(wait_s)
-            for object_id, wait_s in dict(
-                getattr(prelock_lease, "target_wait_s", {})
-                if prelock_lease is not None
-                else {}
-            ).items()
-        }
-        self.prelock_target_queue_depth = {
-            str(object_id): int(depth)
-            for object_id, depth in dict(
-                getattr(prelock_lease, "target_queue_depth", {})
-                if prelock_lease is not None
-                else {}
-            ).items()
-        }
-        self.prelock_target_owner_priority = {
-            str(object_id): int(priority)
-            for object_id, priority in dict(
-                getattr(prelock_lease, "target_owner_priority", {})
-                if prelock_lease is not None
-                else {}
-            ).items()
-        }
-        self.prelock_target_handoff_count = {
-            str(object_id): int(count)
-            for object_id, count in dict(
-                getattr(prelock_lease, "target_handoff_count", {})
-                if prelock_lease is not None
-                else {}
-            ).items()
-        }
-        self.prelock_committing_enters = 0
-        self.prelock_committing_exits = 0
-        self.prelock_committing_target_count = 0
-        self.precomputed_operation_policy_decisions = tuple(
-            precomputed_operation_policy_decisions
-        )
-        self._event(
-            "begin",
-            {
-                "snapshot_objects": len(snapshot),
-                "prelocked_targets": list(self.prelocked_targets),
-                "prelock_wait_s": self.prelock_wait_s,
-                "prelock_target_wait_s": dict(self.prelock_target_wait_s),
-                "prelock_target_queue_depth": dict(self.prelock_target_queue_depth),
-                "prelock_target_owner_priority": dict(
-                    self.prelock_target_owner_priority
-                ),
-                "prelock_target_handoff_count": dict(
-                    self.prelock_target_handoff_count
-                ),
-                "prelock_priority": int(
-                    getattr(prelock_lease, "priority", 0)
-                    if prelock_lease is not None
-                    else 0
-                ),
-            },
-        )
+        self._lifecycle_lock = threading.RLock()
+        self._event("begin", {"snapshot_objects": len(snapshot)})
 
     def _ensure_active(self) -> None:
         if self.state != TransactionState.ACTIVE:
@@ -143,885 +57,327 @@ class AgentTransaction:
     def read(self, object_id: str) -> SnapshotValue:
         with self._lifecycle_lock:
             self._ensure_active()
-            value = self.snapshot[object_id]
-            self.read_set.setdefault(object_id, value)
-            self._event("read", {"object_id": object_id, "version": value.version})
-            return value
+            key = str(object_id)
+            if key not in self.snapshot:
+                raise KeyError(f"object is not registered: {key}")
+            snapshot = self.snapshot[key]
+            self.read_set.setdefault(key, ReadRecord(key, snapshot.version))
+            self._event("read", {"object_id": key, "version": snapshot.version})
+            return snapshot
 
-    def record_model_call(
+    def write(
         self,
+        object_id: str,
+        value: Any,
         *,
-        model: str,
-        latency_s: float,
-        usage: Optional[Dict[str, Any]] = None,
-        candidates: int = 0,
-    ) -> None:
-        with self._lifecycle_lock:
-            self._ensure_active()
-            usage = dict(usage or {})
-            self.model_latency_s += float(latency_s)
-            self.total_tokens += int(usage.get("total_tokens", 0) or 0)
-            self._event(
-                "model_call",
-                {
-                    "model": model,
-                    "latency_s": float(latency_s),
-                    "total_tokens": int(usage.get("total_tokens", 0) or 0),
-                    "candidates": int(candidates),
-                },
-            )
-
-    def record_tool_call(
-        self,
-        name: str,
-        *,
-        args: Optional[Dict[str, Any]] = None,
-        outcome: str = "ok",
-    ) -> None:
-        with self._lifecycle_lock:
-            self._ensure_active()
-            self._event(
-                "tool_call",
-                {"name": name, "args": dict(args or {}), "outcome": outcome},
-            )
-
-    def add_candidate(
-        self,
-        branch_id: str,
-        *,
-        quality: float,
-        gen_cost: float,
         metadata: Optional[Dict[str, Any]] = None,
-    ) -> CandidateDraft:
+    ) -> "AgentTransaction":
         with self._lifecycle_lock:
             self._ensure_active()
-            candidate = CandidateDraft(self, branch_id, quality, gen_cost, metadata)
-            self.candidates.append(candidate)
-            self._event("candidate", {"branch_id": branch_id, "quality": float(quality)})
-            return candidate
-
-    def commit(
-        self,
-        strategy: str = "cast",
-        *,
-        regenerator: Optional[Callable[["AgentTransaction"], None]] = None,
-        max_regenerations: int = 1,
-    ) -> TransactionResult:
-        with self._lifecycle_lock:
-            if self.state != TransactionState.ACTIVE:
-                if (
-                    self.result is not None
-                    and self.state == TransactionState.ABORTED
-                    and self.result.reason == "priority_wound"
-                ):
-                    return self.result
-                self._ensure_active()
-            return self.manager.commit(
-                self,
-                strategy=strategy,
-                regenerator=regenerator,
-                max_regenerations=max_regenerations,
+            key = str(object_id)
+            if key not in self.snapshot:
+                raise KeyError(f"object is not registered: {key}")
+            if key in self.write_set:
+                raise ValueError(f"transaction already writes object: {key}")
+            snapshot = self.snapshot[key]
+            self.write_set[key] = WriteRecord(
+                object_id=key,
+                base_value=snapshot.value,
+                base_version=snapshot.version,
+                value=str(value),
+                metadata=dict(metadata or {}),
             )
-
-    def abort(self, reason: str) -> TransactionResult:
-        with self._lifecycle_lock:
-            self._ensure_active()
-            try:
-                self.state = TransactionState.ABORTED
-                self._event("abort", {"reason": reason})
-                self.result = TransactionResult(
-                    task_id=self.task_id,
-                    state=self.state,
-                    committed=False,
-                    rejected=False,
-                    action="abort",
-                    winner_branch_id="",
-                    reason=reason,
-                    elapsed_s=time.perf_counter() - self.started_at,
-                    model_latency_s=self.model_latency_s,
-                    total_tokens=self.total_tokens,
-                    candidates=len(self.candidates),
-                    n_merge=0,
-                    n_reselect=0,
-                    n_regen=0,
-                )
-                self.manager._record(self)
-                return self.result
-            finally:
-                self._release_prelocks()
-
-    def _release_prelocks(self) -> None:
-        lease = self._prelock_lease
-        if lease is None:
-            return
-        self._prelock_lease = None
-        self.prelocked_targets = ()
-        lease.release()
-
-    def _enter_prelock_committing(self) -> None:
-        lease = self._prelock_lease
-        if lease is None:
-            return
-        targets = tuple(getattr(lease, "targets", ()) or ())
-        self.prelock_committing_enters += 1
-        self.prelock_committing_target_count += len(targets)
-        lease.enter_committing()
-        self._event(
-            "prelock_committing_enter",
-            {"targets": list(targets)},
-        )
-
-    def _exit_prelock_committing(self) -> None:
-        lease = self._prelock_lease
-        if lease is None:
-            return
-        self.prelock_committing_exits += 1
-        lease.exit_committing()
-        self._event(
-            "prelock_committing_exit",
-            {"targets": list(getattr(lease, "targets", ()) or ())},
-        )
-
-    def yield_prelocks_for_planning(self, reason: str = "planning-yield") -> None:
-        with self._lifecycle_lock:
-            self._ensure_active()
-            lease = self._prelock_lease
-            if lease is None:
-                return
-            self._yielded_prelock_targets = tuple(getattr(lease, "targets", ()) or ())
-            self._yielded_prelock_priority = int(getattr(lease, "priority", 0) or 0)
-            self._yielded_prelock_reason = str(getattr(lease, "reason", "pre-snapshot-atcc"))
-            self._release_prelocks()
             self._event(
-                "prelock_yield",
+                "write",
                 {
-                    "reason": str(reason),
-                    "targets": list(self._yielded_prelock_targets),
-                    "priority": self._yielded_prelock_priority,
+                    "object_id": key,
+                    "base_version": snapshot.version,
                 },
             )
+            return self
 
-    def reacquire_yielded_prelocks(self) -> None:
+    def commit(self, strategy: str = "occ") -> TransactionResult:
         with self._lifecycle_lock:
             self._ensure_active()
-            if self._prelock_lease is not None or not self._yielded_prelock_targets:
-                return
-            lease = self.manager.object_locks.acquire_lease(
-                self._yielded_prelock_targets,
-                priority=self._yielded_prelock_priority,
-                reason=self._yielded_prelock_reason + "-reacquire",
-            )
-            lease.bind_owner(self)
-            self._prelock_lease = lease
-            self.prelocked_targets = tuple(getattr(lease, "targets", ()) or ())
-            self.prelock_wait_s += float(getattr(lease, "wait_s", 0.0) or 0.0)
-            for object_id, wait_s in dict(getattr(lease, "target_wait_s", {}) or {}).items():
-                key = str(object_id)
-                self.prelock_target_wait_s[key] = (
-                    self.prelock_target_wait_s.get(key, 0.0) + float(wait_s)
-                )
-            for object_id, depth in dict(
-                getattr(lease, "target_queue_depth", {}) or {}
-            ).items():
-                self.prelock_target_queue_depth[str(object_id)] = int(depth)
-            for object_id, priority in dict(
-                getattr(lease, "target_owner_priority", {}) or {}
-            ).items():
-                self.prelock_target_owner_priority[str(object_id)] = int(priority)
-            for object_id, count in dict(
-                getattr(lease, "target_handoff_count", {}) or {}
-            ).items():
-                key = str(object_id)
-                self.prelock_target_handoff_count[key] = (
-                    self.prelock_target_handoff_count.get(key, 0) + int(count)
-                )
-            self._event(
-                "prelock_reacquire",
-                {
-                    "targets": list(self.prelocked_targets),
-                    "wait_s": float(getattr(lease, "wait_s", 0.0) or 0.0),
-                    "target_wait_s": dict(getattr(lease, "target_wait_s", {}) or {}),
-                    "target_queue_depth": dict(
-                        getattr(lease, "target_queue_depth", {}) or {}
-                    ),
-                    "target_owner_priority": dict(
-                        getattr(lease, "target_owner_priority", {}) or {}
-                    ),
-                    "target_handoff_count": dict(
-                        getattr(lease, "target_handoff_count", {}) or {}
-                    ),
-                    "priority": self._yielded_prelock_priority,
-                },
-            )
-            self._yielded_prelock_targets = ()
+            return self.manager.commit(self, strategy=strategy)
 
-    def replace_prelocks_for_stage(
-        self,
-        targets: Iterable[str],
-        operation_policy_decisions: Iterable[Any],
-        *,
-        reason: str = "stage-local-atcc",
-    ) -> tuple[Any, ...]:
-        """Replace the active ATCC lease with a stage-local lock plan."""
-
+    def abort(self, reason: str, *, strategy: str = "") -> TransactionResult:
         with self._lifecycle_lock:
             self._ensure_active()
-            self._release_prelocks()
-            self._yielded_prelock_targets = ()
-            self._yielded_prelock_priority = 0
-            effective_decisions = tuple(operation_policy_decisions)
-            normalized_targets = tuple(sorted(set(str(target) for target in targets)))
-            lease = None
-            if normalized_targets:
-                budget_s = (
-                    self.manager.prelock_wait_budget_s
-                    if self.manager._should_budget_prelock(effective_decisions)
-                    else 0.0
-                )
-                if budget_s > 0.0 and self.manager.prelock_wait_budget_mode == "object":
-                    lease, skipped_targets = self.manager.object_locks.acquire_budgeted_lease(
-                        normalized_targets,
-                        priority=self.manager._prelock_priority(
-                            self.metadata,
-                            effective_decisions,
-                        ),
-                        reason=str(reason),
-                        wait_timeout_s=budget_s,
-                    )
-                    if skipped_targets:
-                        effective_decisions = self.manager._fallback_prelock_decisions(
-                            effective_decisions,
-                            object_ids=skipped_targets,
-                        )
-                        self.manager._record_prelock_fallback(
-                            self.metadata,
-                            reason="stage_prelock_object_wait_budget_exceeded",
-                            targets=skipped_targets,
-                            budget_s=budget_s,
-                            detail="per-object stage prelock wait budget exhausted",
-                        )
-                else:
-                    try:
-                        lease = self.manager.object_locks.acquire_lease(
-                            normalized_targets,
-                            priority=self.manager._prelock_priority(
-                                self.metadata,
-                                effective_decisions,
-                            ),
-                            reason=str(reason),
-                            wait_timeout_s=(budget_s if budget_s > 0.0 else None),
-                        )
-                    except ObjectLockTimeout as exc:
-                        effective_decisions = self.manager._fallback_prelock_decisions(
-                            effective_decisions
-                        )
-                        self.manager._record_prelock_fallback(
-                            self.metadata,
-                            reason="stage_prelock_wait_budget_exceeded",
-                            targets=normalized_targets,
-                            budget_s=budget_s,
-                            detail=str(exc),
-                        )
-            if lease is not None:
-                lease.bind_owner(self)
-                self._prelock_lease = lease
-                self.prelocked_targets = tuple(getattr(lease, "targets", ()) or ())
-                self.prelock_wait_s += float(getattr(lease, "wait_s", 0.0) or 0.0)
-                for object_id, wait_s in dict(
-                    getattr(lease, "target_wait_s", {}) or {}
-                ).items():
-                    key = str(object_id)
-                    self.prelock_target_wait_s[key] = (
-                        self.prelock_target_wait_s.get(key, 0.0) + float(wait_s)
-                    )
-                for object_id, depth in dict(
-                    getattr(lease, "target_queue_depth", {}) or {}
-                ).items():
-                    self.prelock_target_queue_depth[str(object_id)] = int(depth)
-                for object_id, priority in dict(
-                    getattr(lease, "target_owner_priority", {}) or {}
-                ).items():
-                    self.prelock_target_owner_priority[str(object_id)] = int(priority)
-                for object_id, count in dict(
-                    getattr(lease, "target_handoff_count", {}) or {}
-                ).items():
-                    key = str(object_id)
-                    self.prelock_target_handoff_count[key] = (
-                        self.prelock_target_handoff_count.get(key, 0) + int(count)
-                    )
-            else:
-                self._prelock_lease = None
-                self.prelocked_targets = ()
-            self.precomputed_operation_policy_decisions = tuple(effective_decisions)
-            self._event(
-                "stage_prelock",
-                {
-                    "reason": str(reason),
-                    "targets": list(self.prelocked_targets),
-                    "operation_policy_decisions": [
-                        decision.to_dict()
-                        if hasattr(decision, "to_dict")
-                        else dict(decision)
-                        for decision in effective_decisions
-                    ],
-                },
-            )
-            return tuple(effective_decisions)
-
-    def refresh_snapshot_for_regeneration(
-        self,
-        reason: str = "lease-refresh-regenerate",
-    ) -> None:
-        with self._lifecycle_lock:
-            self._ensure_active()
-            self.snapshot = self.manager._snapshot_threadsafe()
-            self.read_set.clear()
-            self.candidates.clear()
-            self._event(
-                "refresh_regenerate",
-                {
-                    "reason": str(reason),
-                    "snapshot_versions": {
-                        key: value.version for key, value in self.snapshot.items()
-                    },
-                    "prelocked_targets": list(self.prelocked_targets),
-                },
-            )
-
-    def refresh_candidate_write_bases(
-        self,
-        targets: Iterable[str],
-        *,
-        reason: str = "lease-refresh-rebase",
-        clear_read_set: bool = False,
-        candidate_scope: str = "all",
-    ) -> int:
-        """Refresh selected candidate write bases without dropping candidates."""
-
-        target_set = {str(target) for target in targets}
-        scope = str(candidate_scope or "all").strip().lower()
-        if scope not in {"all", "best"}:
-            raise ValueError(f"unsupported candidate refresh scope: {candidate_scope}")
-        with self._lifecycle_lock:
-            self._ensure_active()
-            if not target_set:
-                return 0
-            latest_snapshot = self.manager._snapshot_entries_threadsafe(target_set)
-            self.snapshot.update(latest_snapshot)
-            if clear_read_set:
-                cleared_reads = len(self.read_set)
-                self.read_set.clear()
-                refreshed_reads = 0
-            else:
-                cleared_reads = 0
-                refreshed_reads = 0
-                for object_id in tuple(self.read_set):
-                    if object_id in target_set and object_id in latest_snapshot:
-                        self.read_set[object_id] = latest_snapshot[object_id]
-                        refreshed_reads += 1
-            refreshed_writes = 0
-            candidates = tuple(self.candidates)
-            if scope == "best" and candidates:
-                candidates = (
-                    max(
-                        candidates,
-                        key=lambda candidate: float(
-                            getattr(candidate, "quality", 0.0) or 0.0
-                        ),
-                    ),
-                )
-            for candidate in candidates:
-                for write in getattr(candidate, "_writes", ()):
-                    object_id = str(getattr(write, "object_id", ""))
-                    if object_id not in target_set or object_id not in latest_snapshot:
-                        continue
-                    snapshot = latest_snapshot[object_id]
-                    write.base_value = snapshot.value
-                    write.base_version = snapshot.version
-                    refreshed_writes += 1
-            self._event(
-                "refresh_rebase",
-                {
-                    "reason": str(reason),
-                    "targets": sorted(target_set),
-                    "refreshed_writes": int(refreshed_writes),
-                    "refreshed_reads": int(refreshed_reads),
-                    "cleared_reads": int(cleared_reads),
-                    "candidate_scope": scope,
-                    "refreshed_candidates": [
-                        str(getattr(candidate, "branch_id", ""))
-                        for candidate in candidates
-                    ],
-                    "snapshot_versions": {
-                        key: value.version
-                        for key, value in latest_snapshot.items()
-                    },
-                    "prelocked_targets": list(self.prelocked_targets),
-                },
-            )
-            return refreshed_writes
-
-    def record_refresh_replay(
-        self,
-        *,
-        operation_count: int,
-        phases: Iterable[str] = (),
-    ) -> None:
-        with self._lifecycle_lock:
-            self._event(
-                "refresh_replay",
-                {
-                    "operation_count": max(0, int(operation_count)),
-                    "phases": [str(phase) for phase in phases],
-                },
-            )
-
-    def _wound_prelock(self, reason: str) -> None:
-        with self._lifecycle_lock:
-            if self.state != TransactionState.ACTIVE:
-                self._release_prelocks()
-                return
             self.state = TransactionState.ABORTED
-            self._event("wound", {"reason": str(reason)})
-            self.result = TransactionResult(
-                task_id=self.task_id,
-                state=self.state,
+            self._event("abort", {"reason": str(reason), "strategy": str(strategy)})
+            self.result = self._result(
+                strategy=strategy,
                 committed=False,
-                rejected=False,
                 action="abort",
-                winner_branch_id="",
-                reason="priority_wound",
-                elapsed_s=time.perf_counter() - self.started_at,
-                model_latency_s=self.model_latency_s,
-                total_tokens=self.total_tokens,
-                candidates=len(self.candidates),
-                n_merge=0,
-                n_reselect=0,
-                n_regen=0,
+                reason=str(reason),
             )
-            self._release_prelocks()
             self.manager._record(self)
+            return self.result
 
-    def _read_set_for_core(self) -> List[Any]:
-        reads = []
-        for object_id, snapshot in sorted(self.read_set.items()):
-            read = cc.BranchRead()
-            read.object_id = object_id
-            read.version = snapshot.version
-            reads.append(read)
-        return reads
+    def _result(
+        self,
+        *,
+        strategy: str,
+        committed: bool,
+        action: str,
+        reason: str = "",
+        conflict_object_ids: Iterable[str] = (),
+        lock_wait_s: float = 0.0,
+    ) -> TransactionResult:
+        return TransactionResult(
+            task_id=self.task_id,
+            state=self.state,
+            strategy=str(strategy),
+            committed=bool(committed),
+            action=str(action),
+            reason=str(reason),
+            elapsed_s=time.perf_counter() - self.started_at,
+            read_count=len(self.read_set),
+            write_count=len(self.write_set),
+            conflict_object_ids=tuple(str(value) for value in conflict_object_ids),
+            lock_wait_s=float(lock_wait_s),
+        )
 
     def to_trace(self) -> Dict[str, Any]:
         return {
             "task_id": self.task_id,
-            "metadata": self.metadata,
+            "metadata": dict(self.metadata),
             "state": self.state.value,
-            "snapshot_versions": {k: v.version for k, v in self.snapshot.items()},
-            "read_set_versions": {k: v.version for k, v in self.read_set.items()},
-            "prelocked_targets": list(self.prelocked_targets),
-            "prelock_wait_s": self.prelock_wait_s,
-            "prelock_target_wait_s": dict(self.prelock_target_wait_s),
-            "prelock_target_queue_depth": dict(self.prelock_target_queue_depth),
-            "prelock_target_owner_priority": dict(
-                self.prelock_target_owner_priority
-            ),
-            "prelock_target_handoff_count": dict(
-                self.prelock_target_handoff_count
-            ),
-            "prelock_committing_enters": int(self.prelock_committing_enters),
-            "prelock_committing_exits": int(self.prelock_committing_exits),
-            "prelock_committing_target_count": int(
-                self.prelock_committing_target_count
-            ),
+            "snapshot_versions": {key: value.version for key, value in self.snapshot.items()},
+            "read_set": {key: dataclasses.asdict(value) for key, value in self.read_set.items()},
+            "write_set": {key: dataclasses.asdict(value) for key, value in self.write_set.items()},
             "events": [dataclasses.asdict(event) for event in self.events],
-            "candidates": [candidate.to_trace() for candidate in self.candidates],
             "result": self.result.to_dict() if self.result else None,
         }
 
 
 class AgentTransactionManager:
-    """Thread-safe upper transaction manager backed by a versioned KV store."""
+    """Thread-safe transaction manager backed by versioned KV primitives."""
 
     _KIND_MAP = {
         "generic": cc.ObjectType.kGeneric,
         "row": cc.ObjectType.kRow,
         "text": cc.ObjectType.kText,
         "counter": cc.ObjectType.kCounter,
-        "candidate": cc.ObjectType.kCandidateResult,
     }
 
     def __init__(
         self,
-        c_gen: float = 1.0,
-        c_merge: float = 0.01,
         *,
         store: Optional[Any] = None,
-        adaptive_policy: Optional[AdaptivePolicyTable] = None,
-        operation_policy: Optional[OperationPolicyTable] = None,
-        transaction_atcc_policy: Optional[TransactionAwareATCCModule] = None,
-        branch_semantics: Optional[BranchSemantics] = None,
         cc_registry: Optional[ConcurrencyControlRegistry] = None,
-        commit_protocol: Optional[Any] = None,
-        object_lock_queue_policy: str = "race",
-        object_lock_priority_burst: int = 2,
-        prelock_wait_budget_s: float = 0.0,
-        prelock_wait_budget_mode: str = "transaction",
+        atcc_policy: Optional[Any] = None,
     ):
         self.store = store if store is not None else cc.Dbx1000VersionedKVStore()
-        self.model = cc.CostModel(float(c_gen), float(c_merge))
+        self.cc_registry = cc_registry or ConcurrencyControlRegistry(atcc_policy=atcc_policy)
+        self.exclusive_locks = ExclusiveLockTable()
+        self.two_phase_locks = TwoPhaseLockTable()
+        self.reservations = ReservationTable()
         self._lock = threading.RLock()
         self._catalog: Dict[str, Any] = {}
-        self._traces: List[Dict[str, Any]] = []
-
-        self.cc_registry = cc_registry or ConcurrencyControlRegistry(
-            adaptive_policy=adaptive_policy,
-            operation_policy=operation_policy,
-            transaction_atcc_policy=transaction_atcc_policy,
-        )
-        if cc_registry is not None:
-            if adaptive_policy is not None:
-                self.cc_registry.set_adaptive_policy(adaptive_policy)
-            if operation_policy is not None:
-                self.cc_registry.set_operation_policy(operation_policy)
-            if transaction_atcc_policy is not None:
-                self.cc_registry.set_transaction_atcc_policy(transaction_atcc_policy)
-
-        self.branch_semantics = branch_semantics or QualityRankedBranchSemantics()
-        self.object_locks = ObjectLockTable(
-            queue_policy=object_lock_queue_policy,
-            priority_burst=object_lock_priority_burst,
-        )
-        self.prelock_wait_budget_s = max(0.0, float(prelock_wait_budget_s))
-        mode = str(prelock_wait_budget_mode or "transaction").strip().lower()
-        if mode not in {"transaction", "object"}:
-            raise ValueError(f"unsupported prelock wait budget mode: {mode}")
-        self.prelock_wait_budget_mode = mode
-        self.commit_protocol = commit_protocol or CostAwareCommitProtocol(
-            self.store,
-            self.model,
-            registry=self.cc_registry,
-            branch_semantics=self.branch_semantics,
-            lock_table=self.object_locks,
-        )
-        self.kernel = getattr(self.commit_protocol, "kernel", None)
-        if self.kernel is None:
-            self.kernel = cc.CostAsymmetricCommit(self.store, self.model)
+        self._traces: list[Dict[str, Any]] = []
 
     @property
     def backend_name(self) -> str:
         return str(self.store.backend_name)
 
-    @staticmethod
-    def _normalize_cc_name(name: str) -> str:
-        return ConcurrencyControlRegistry.normalize_name(name)
-
-    def register_cc(
-        self,
-        name: str,
-        module: Any,
-        *,
-        aliases: tuple[str, ...] = (),
-        source: str = "custom",
-    ) -> None:
-        self.cc_registry.register_cc(name, module, aliases=aliases, source=source)
-
-    def cc_strategies(self) -> Dict[str, Dict[str, Any]]:
-        return self.cc_registry.strategies()
-
-    def cc_strategy(self, name: str) -> Dict[str, Any]:
-        return self.cc_registry.strategy(name)
-
-    def adaptive_policy(self) -> Dict[str, Any]:
-        return self.cc_registry.adaptive_policy()
-
-    def operation_policy(self) -> Dict[str, Any]:
-        return self.cc_registry.operation_policy()
-
-    def set_adaptive_policy(self, policy: AdaptivePolicyTable) -> None:
-        self.cc_registry.set_adaptive_policy(policy)
-
-    def set_operation_policy(self, policy: OperationPolicyTable) -> None:
-        self.cc_registry.set_operation_policy(policy)
-
-    def module_catalog(self) -> Dict[str, Any]:
-        return {
-            "branch_semantics": self.branch_semantics.to_dict(),
-            "commit_protocol": self.commit_protocol.to_dict()
-            if hasattr(self.commit_protocol, "to_dict")
-            else {"name": type(self.commit_protocol).__name__},
-            "cc_strategies": self.cc_strategies(),
-        }
-
     def register_object(self, object_id: str, initial_value: Any, *, kind: str = "generic") -> None:
         if kind not in self._KIND_MAP:
             raise ValueError(f"unsupported object kind: {kind}")
+        key = str(object_id)
         with self._lock:
-            if object_id in self._catalog:
-                raise ValueError(f"object already registered: {object_id}")
-            self.store.put(object_id, str(initial_value))
-            self._catalog[object_id] = self._KIND_MAP[kind]
-            self.object_locks.ensure(object_id)
+            if key in self._catalog:
+                raise ValueError(f"object already registered: {key}")
+            self.store.put(key, str(initial_value))
+            self._catalog[key] = self._KIND_MAP[kind]
 
-    def kind_of(self, object_id: str) -> Any:
-        return self._catalog.get(object_id, cc.ObjectType.kGeneric)
+    def begin(self, task_id: Any, metadata: Optional[Dict[str, Any]] = None) -> AgentTransaction:
+        with self._lock:
+            snapshot = self._snapshot_locked()
+        return AgentTransaction(self, str(task_id), snapshot, metadata)
 
-    def begin(
-        self,
-        task_id: Any,
-        metadata: Optional[Dict[str, Any]] = None,
-        *,
-        prelock_targets: Iterable[str] = (),
-        operation_policy_decisions: Iterable[Any] = (),
-    ) -> AgentTransaction:
-        lease = None
-        try:
-            targets = tuple(sorted(set(prelock_targets)))
-            effective_metadata = dict(metadata or {})
-            effective_decisions = tuple(operation_policy_decisions)
-            if targets:
-                budget_s = (
-                    self.prelock_wait_budget_s
-                    if self._should_budget_prelock(effective_decisions)
-                    else 0.0
-                )
-                if budget_s > 0.0 and self.prelock_wait_budget_mode == "object":
-                    lease, skipped_targets = self.object_locks.acquire_budgeted_lease(
-                        targets,
-                        priority=self._prelock_priority(metadata, effective_decisions),
-                        reason="pre-snapshot-atcc",
-                        wait_timeout_s=budget_s,
-                    )
-                    if skipped_targets:
-                        effective_decisions = self._fallback_prelock_decisions(
-                            effective_decisions,
-                            object_ids=skipped_targets,
-                        )
-                        self._record_prelock_fallback(
-                            effective_metadata,
-                            reason="prelock_object_wait_budget_exceeded",
-                            targets=skipped_targets,
-                            budget_s=budget_s,
-                            detail="per-object prelock wait budget exhausted",
-                        )
-                else:
-                    try:
-                        lease = self.object_locks.acquire_lease(
-                            targets,
-                            priority=self._prelock_priority(
-                                metadata,
-                                effective_decisions,
-                            ),
-                            reason="pre-snapshot-atcc",
-                            wait_timeout_s=(
-                                budget_s
-                                if budget_s > 0.0
-                                else None
-                            ),
-                        )
-                    except ObjectLockTimeout as exc:
-                        effective_decisions = self._fallback_prelock_decisions(
-                            effective_decisions
-                        )
-                        self._record_prelock_fallback(
-                            effective_metadata,
-                            reason="prelock_wait_budget_exceeded",
-                            targets=targets,
-                            budget_s=budget_s,
-                            detail=str(exc),
-                        )
-            with self._lock:
-                snapshot = self._snapshot_locked()
-            txn = AgentTransaction(
-                self,
-                str(task_id),
-                snapshot,
-                effective_metadata,
-                prelock_lease=lease,
-                precomputed_operation_policy_decisions=effective_decisions,
-            )
-            if lease is not None:
-                lease.bind_owner(txn)
-            return txn
-        except BaseException:
-            if lease is not None:
-                lease.release()
-            raise
-
-    def _should_budget_prelock(self, decisions: Iterable[Any]) -> bool:
-        if self.prelock_wait_budget_s <= 0.0:
-            return False
-        rows = tuple(decisions)
-        if not rows:
-            return False
-        return any(
-            str(getattr(decision, "rule", ""))
-            != "pre-snapshot-2pl-all-operations"
-            for decision in rows
+    def commit(self, txn: AgentTransaction, *, strategy: str = "occ") -> TransactionResult:
+        strategy_impl = self.cc_registry.resolve(strategy)
+        plan = strategy_impl.plan(txn)
+        txn._event(
+            "validate",
+            {
+                "strategy": plan.strategy,
+                "family": plan.family,
+                "lock_targets": list(plan.lock_targets),
+                "validate_reads": plan.validate_reads,
+                "validate_writes": plan.validate_writes,
+                "metadata": dict(plan.metadata),
+            },
         )
+        started_wait = time.perf_counter()
+        try:
+            lock_table = str(plan.metadata.get("lock_table", ""))
+            if lock_table == "2pl":
+                mode = "x" if txn.write_set else "s"
+                if self._has_prelock(txn, plan, "2pl"):
+                    return self._commit_under_lock(txn, strategy_impl, plan, started_wait)
+                with self.two_phase_locks.acquire(
+                    plan.lock_targets,
+                    owner=txn,
+                    mode=mode,
+                    policy=str(plan.metadata.get("policy", "nowait")),
+                ):
+                    return self._commit_under_lock(txn, strategy_impl, plan, started_wait)
+            if lock_table == "exclusive" and plan.lock_targets:
+                if self._has_prelock(txn, plan, "exclusive"):
+                    return self._commit_under_lock(txn, strategy_impl, plan, started_wait)
+                with self.exclusive_locks.acquire(
+                    plan.lock_targets,
+                    owner=txn,
+                    wait=bool(plan.metadata.get("wait", True)),
+                    priority=int(plan.metadata.get("priority", 0) or 0),
+                ):
+                    return self._commit_under_lock(txn, strategy_impl, plan, started_wait)
+            return self._commit_under_lock(txn, strategy_impl, plan, started_wait)
+        except LockConflict as exc:
+            validation = lock_conflict_result(exc)
+            result = self._finish_abort(
+                txn,
+                strategy=plan.strategy,
+                reason=validation.reason,
+                conflict_object_ids=validation.conflict_object_ids,
+                lock_wait_s=time.perf_counter() - started_wait,
+            )
+            self._observe_strategy(strategy_impl, plan, result, txn)
+            return result
 
-    def _fallback_prelock_decisions(
-        self,
-        decisions: Iterable[Any],
-        *,
-        object_ids: Iterable[str] = (),
-    ) -> tuple[Any, ...]:
-        target_ids = {str(object_id) for object_id in object_ids}
-        rows = []
-        for decision in decisions:
-            if getattr(decision, "policy", "") != "pessimistic":
-                rows.append(decision)
-                continue
-            if target_ids and str(getattr(decision, "object_id", "")) not in target_ids:
-                rows.append(decision)
-                continue
-            try:
-                rows.append(
-                    dataclasses.replace(
-                        decision,
-                        policy="optimistic",
-                        rule="prelock-budget-fallback-optimistic",
-                    )
-                )
-            except TypeError:
-                rows.append(decision)
-        return tuple(rows)
+    def _has_prelock(self, txn: AgentTransaction, plan: Any, lock_table: str) -> bool:
+        metadata = dict(getattr(txn, "metadata", {}) or {})
+        if str(metadata.get("prelocked_lock_table", "")) != str(lock_table):
+            return False
+        targets = {str(target) for target in metadata.get("prelocked_targets", ())}
+        return set(str(target) for target in plan.lock_targets).issubset(targets)
 
-    def _record_prelock_fallback(
+    def _commit_under_lock(
         self,
-        metadata: Dict[str, Any],
-        *,
-        reason: str,
-        targets: Iterable[str],
-        budget_s: float,
-        detail: str,
+        txn: AgentTransaction,
+        strategy_impl: Any,
+        plan: Any,
+        started_wait: float,
+    ) -> TransactionResult:
+        validation = strategy_impl.validate(txn, self.store)
+        if not validation.ok:
+            result = self._finish_abort(
+                txn,
+                strategy=plan.strategy,
+                reason=validation.reason,
+                conflict_object_ids=validation.conflict_object_ids,
+                lock_wait_s=time.perf_counter() - started_wait,
+            )
+            self._observe_strategy(strategy_impl, plan, result, txn)
+            return result
+        checks = []
+        for read in txn.read_set.values():
+            if plan.validate_reads:
+                checks.append((read.object_id, int(read.version)))
+        for write in txn.write_set.values():
+            checks.append((write.object_id, int(write.base_version)))
+        writes = [(write.object_id, write.value) for write in txn.write_set.values()]
+        with self._lock:
+            ok = self.store.batch_put_if_version(checks, writes)
+        if not ok:
+            result = self._finish_abort(
+                txn,
+                strategy=plan.strategy,
+                reason="atomic version check failed",
+                conflict_object_ids=self._conflict_targets(checks),
+                lock_wait_s=time.perf_counter() - started_wait,
+            )
+            self._observe_strategy(strategy_impl, plan, result, txn)
+            return result
+        txn.state = TransactionState.COMMITTED
+        txn._event("finish", {"state": txn.state.value, "action": "commit"})
+        txn.result = txn._result(
+            strategy=plan.strategy,
+            committed=True,
+            action="commit",
+            lock_wait_s=time.perf_counter() - started_wait,
+        )
+        self._record(txn)
+        self._observe_strategy(strategy_impl, plan, txn.result, txn)
+        return txn.result
+
+    def _observe_strategy(
+        self,
+        strategy_impl: Any,
+        plan: Any,
+        result: TransactionResult,
+        txn: AgentTransaction,
     ) -> None:
-        fallback = {
-            "reason": str(reason),
-            "targets": [str(target) for target in targets],
-            "budget_s": float(budget_s),
-            "detail": str(detail),
-        }
-        context = dict(metadata.get("context", {}) or {})
-        context["prelock_fallback"] = fallback
-        metadata["context"] = context
-        metadata["prelock_fallback"] = fallback
+        observer = getattr(strategy_impl, "observe", None)
+        if observer is None:
+            return
+        try:
+            observer(plan, result, txn)
+        except TypeError:
+            observer(plan, result)
 
-    def _prelock_priority(
+    def _finish_abort(
         self,
-        metadata: Optional[Dict[str, Any]],
-        operation_policy_decisions: Iterable[Any],
-    ) -> int:
-        metadata_dict = dict(metadata or {})
-        priorities = [
-            int(getattr(decision, "atcc_priority", 0) or 0)
-            for decision in operation_policy_decisions
-        ]
-        context = dict(metadata_dict.get("context", {}) or {})
-        for key in ("atcc_priority", "lock_priority", "priority"):
-            if key in metadata_dict:
-                priorities.append(int(metadata_dict.get(key) or 0))
-            if key in context:
-                priorities.append(int(context.get(key) or 0))
-        return max(priorities or [0])
+        txn: AgentTransaction,
+        *,
+        strategy: str,
+        reason: str,
+        conflict_object_ids: Iterable[str],
+        lock_wait_s: float,
+    ) -> TransactionResult:
+        txn.state = TransactionState.ABORTED
+        txn._event(
+            "finish",
+            {
+                "state": txn.state.value,
+                "action": "abort",
+                "reason": str(reason),
+                "conflict_object_ids": [str(value) for value in conflict_object_ids],
+            },
+        )
+        txn.result = txn._result(
+            strategy=strategy,
+            committed=False,
+            action="abort",
+            reason=str(reason),
+            conflict_object_ids=conflict_object_ids,
+            lock_wait_s=lock_wait_s,
+        )
+        self._record(txn)
+        return txn.result
 
     def _snapshot_locked(self) -> Dict[str, SnapshotValue]:
         return {
-            oid: SnapshotValue(
-                value=(value := self.store.get(oid)).value,
+            object_id: SnapshotValue(
+                value=(value := self.store.get(object_id)).value,
                 version=int(value.version),
                 exists=bool(value.exists),
             )
-            for oid in self._catalog
+            for object_id in self._catalog
         }
 
-    def _snapshot_threadsafe(self) -> Dict[str, SnapshotValue]:
-        with self._lock:
-            return self._snapshot_locked()
-
-    def _snapshot_entries_threadsafe(
-        self,
-        object_ids: Iterable[str],
-    ) -> Dict[str, SnapshotValue]:
-        targets = tuple(dict.fromkeys(str(object_id) for object_id in object_ids))
-        with self._lock:
-            return {
-                oid: SnapshotValue(
-                    value=(value := self.store.get(oid)).value,
-                    version=int(value.version),
-                    exists=bool(value.exists),
-                )
-                for oid in targets
-                if oid in self._catalog
-            }
-
-    def _resolve_cc_module(self, strategy: str, txn: AgentTransaction) -> tuple[Any, str, str]:
-        resolution = self.cc_registry.resolve(strategy, txn)
-        return (
-            resolution.module,
-            resolution.requested_strategy,
-            resolution.selected_strategy,
-        )
-
-    def _select_adaptive_cc(self, txn: AgentTransaction) -> str:
-        return self.cc_registry.resolve("adaptive", txn).selected_strategy
-
-    def _operation_policy_decisions(self, txn: AgentTransaction):
-        return self.cc_registry.operation_policy_decisions(txn)
-
-    def _pessimistic_operation_targets(self, txn: AgentTransaction) -> tuple[List[str], List[Dict[str, Any]]]:
-        return self.cc_registry.pessimistic_operation_targets(txn)
-
-    def _object_lock_scope(self, branches: List[Any], cc_module: Any, targets: Optional[List[str]] = None):
-        return self.object_locks.scope_for_branches(branches, cc_module, targets)
-
-    def commit(
-        self,
-        txn: AgentTransaction,
-        *,
-        strategy: str = "cast",
-        regenerator: Optional[Callable[[AgentTransaction], None]] = None,
-        max_regenerations: int = 1,
-    ) -> TransactionResult:
-        with txn._lifecycle_lock:
-            try:
-                return self._commit_locked(
-                    txn,
-                    strategy=strategy,
-                    regenerator=regenerator,
-                    max_regenerations=max_regenerations,
-                )
-            finally:
-                txn._release_prelocks()
-
-    def _commit_locked(
-        self,
-        txn: AgentTransaction,
-        *,
-        strategy: str = "cast",
-        regenerator: Optional[Callable[[AgentTransaction], None]] = None,
-        max_regenerations: int = 1,
-    ) -> TransactionResult:
-        return self.commit_protocol.commit(
-            txn,
-            strategy=strategy,
-            regenerator=regenerator,
-            max_regenerations=max_regenerations,
-            refresh_snapshot=self._snapshot_threadsafe,
-            record=self._record,
-        )
+    def _conflict_targets(self, checks: Iterable[tuple[str, int]]) -> tuple[str, ...]:
+        conflicts = []
+        for object_id, expected_version in checks:
+            if int(self.store.get_version(str(object_id))) != int(expected_version):
+                conflicts.append(str(object_id))
+        return tuple(sorted(set(conflicts)))
 
     def value_of(self, object_id: str) -> str:
         with self._lock:
-            return self.store.get(object_id).value
+            return self.store.get(str(object_id)).value
 
     def values(self) -> Dict[str, str]:
         with self._lock:
-            return {oid: self.store.get(oid).value for oid in self._catalog}
+            return {object_id: self.store.get(object_id).value for object_id in self._catalog}
 
     def _record(self, txn: AgentTransaction) -> None:
         with self._lock:
             self._traces.append(txn.to_trace())
 
-    def traces(self) -> List[Dict[str, Any]]:
+    def traces(self) -> list[Dict[str, Any]]:
         with self._lock:
             return list(self._traces)

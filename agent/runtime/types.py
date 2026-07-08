@@ -1,16 +1,15 @@
-"""Shared transaction DTOs for the agent runtime."""
+"""Shared DTOs for the single-plan agent transaction runtime."""
 
 from __future__ import annotations
 
 import dataclasses
 import enum
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 
 class TransactionState(str, enum.Enum):
     ACTIVE = "active"
     COMMITTED = "committed"
-    REJECTED = "rejected"
     ABORTED = "aborted"
 
 
@@ -28,24 +27,37 @@ class TransactionEvent:
     detail: Dict[str, Any]
 
 
+@dataclasses.dataclass(frozen=True)
+class ReadRecord:
+    object_id: str
+    version: int
+
+
+@dataclasses.dataclass(frozen=True)
+class WriteRecord:
+    object_id: str
+    base_value: str
+    base_version: int
+    value: str
+    metadata: Dict[str, Any] = dataclasses.field(default_factory=dict)
+
+
 @dataclasses.dataclass
 class TransactionResult:
     task_id: str
     state: TransactionState
+    strategy: str
     committed: bool
-    rejected: bool
     action: str
-    winner_branch_id: str
     reason: str
     elapsed_s: float
-    model_latency_s: float
-    total_tokens: int
-    candidates: int
-    n_merge: int
-    n_reselect: int
-    n_regen: int
+    read_count: int
+    write_count: int
+    conflict_object_ids: Tuple[str, ...] = ()
+    lock_wait_s: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         row = dataclasses.asdict(self)
         row["state"] = self.state.value
+        row["conflict_object_ids"] = list(self.conflict_object_ids)
         return row

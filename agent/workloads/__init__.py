@@ -1,57 +1,45 @@
-"""Reusable agent-style workloads derived from DBx1000 benchmarks."""
+"""Workloads for CAST-DAS experiments."""
 
 from .base import (
-    AgentCandidate,
     AgentOperation,
-    AgentStage,
     AgentTask,
     AgentWorkload,
     ObjectSpec,
-    WorkloadManifest,
+    apply_operation,
     execute_task,
-    populate_task_stage,
     populate_task_transaction,
     prepare_task_transaction,
     register_workload,
-    stage_operations,
-    task_agent_stages,
-    task_stage_view,
 )
-from .layers import (
-    WORKLOAD_LAYERS,
-    build_agent_workload,
-    layer_summary,
-    native_workload_manifest,
-)
-from .tpcc import TPCCAgentWorkload, TPCCConfig
-from .tpcc import TPCCFaithfulAgentWorkload
-from .ycsb import YCSBAgentWorkload, YCSBConfig
-from .ycsb import YCSBFaithfulAgentWorkload
+from .tpcc import TPCCConfig, TPCCWorkload, tpcc_config
+from .ycsb import YCSBConfig, YCSBWorkload, ycsb_config
+
+
+def build_workload(family: str, level: str, profile: str = "small") -> AgentWorkload:
+    family = str(family).strip().lower()
+    profile = str(profile).strip().lower() or "small"
+    if family == "ycsb":
+        return YCSBWorkload(ycsb_config(level, profile))
+    if family in {"tpcc", "tpc-c"}:
+        return TPCCWorkload(tpcc_config(level, profile))
+    raise ValueError(f"unsupported workload: {family}")
+
 
 __all__ = [
-    "AgentCandidate",
     "AgentOperation",
-    "AgentStage",
     "AgentTask",
     "AgentWorkload",
     "ObjectSpec",
-    "WorkloadManifest",
+    "apply_operation",
     "execute_task",
-    "populate_task_stage",
     "populate_task_transaction",
     "prepare_task_transaction",
     "register_workload",
-    "stage_operations",
-    "task_agent_stages",
-    "task_stage_view",
-    "WORKLOAD_LAYERS",
-    "build_agent_workload",
-    "layer_summary",
-    "native_workload_manifest",
-    "TPCCAgentWorkload",
-    "TPCCFaithfulAgentWorkload",
+    "build_workload",
     "TPCCConfig",
-    "YCSBAgentWorkload",
-    "YCSBFaithfulAgentWorkload",
+    "TPCCWorkload",
+    "tpcc_config",
     "YCSBConfig",
+    "YCSBWorkload",
+    "ycsb_config",
 ]
