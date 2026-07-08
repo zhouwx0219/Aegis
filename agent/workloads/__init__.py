@@ -15,11 +15,17 @@ from .tpcc import TPCCConfig, TPCCWorkload, tpcc_config
 from .ycsb import YCSBConfig, YCSBWorkload, ycsb_config
 
 
-def build_workload(family: str, level: str, profile: str = "small") -> AgentWorkload:
+def build_workload(
+    family: str,
+    level: str,
+    profile: str = "small",
+    *,
+    ycsb_zipf_theta: float | None = None,
+) -> AgentWorkload:
     family = str(family).strip().lower()
     profile = str(profile).strip().lower() or "small"
     if family == "ycsb":
-        return YCSBWorkload(ycsb_config(level, profile))
+        return YCSBWorkload(ycsb_config(level, profile, zipf_theta=ycsb_zipf_theta))
     if family in {"tpcc", "tpc-c"}:
         return TPCCWorkload(tpcc_config(level, profile))
     raise ValueError(f"unsupported workload: {family}")

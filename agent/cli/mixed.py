@@ -15,6 +15,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workload", "-w", choices=("ycsb", "tpcc"), default="tpcc")
     parser.add_argument("--level", "-l", choices=("low", "medium", "high"), default="high")
     parser.add_argument("--workload-profile", choices=("small", "paper"), default="small")
+    parser.add_argument(
+        "--ycsb-zipf-theta",
+        "--zipfian",
+        dest="ycsb_zipf_theta",
+        type=float,
+        help="Override YCSB Zipfian theta and use Zipfian record sampling.",
+    )
     parser.add_argument("--cc", default="occ,dynamic-atcc")
     parser.add_argument("--duration", "-d", type=float, default=3.0)
     parser.add_argument("--clients", "-c", type=int, default=0, help="Total clients. When set, derives agents/background from --agent-ratio.")
@@ -61,6 +68,7 @@ def main(
             workload=args.workload,
             level=args.level,
             workload_profile=args.workload_profile,
+            ycsb_zipf_theta=args.ycsb_zipf_theta,
             cc=args.cc,
             duration_s=args.duration,
             clients=args.clients,

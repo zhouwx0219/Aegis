@@ -15,6 +15,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workload", "-w", choices=("ycsb", "tpcc"), default="ycsb")
     parser.add_argument("--level", "-l", choices=("low", "medium", "high"), default="low")
     parser.add_argument("--workload-profile", choices=("small", "paper"), default="small")
+    parser.add_argument(
+        "--ycsb-zipf-theta",
+        "--zipfian",
+        dest="ycsb_zipf_theta",
+        type=float,
+        help="Override YCSB Zipfian theta and use Zipfian record sampling.",
+    )
     parser.add_argument("--cc", default="all", help="Comma-separated CC names or all.")
     parser.add_argument("--tasks", "-n", type=int, default=10)
     parser.add_argument("--workers", "-j", type=int, default=8)
@@ -44,6 +51,7 @@ def run_compare(
     tasks: int,
     seed: int,
     workload_profile: str = "small",
+    ycsb_zipf_theta: Optional[float] = None,
     workers: int = 8,
     retries: int = 0,
     reasoning_profile: str = "agentic",
@@ -57,6 +65,7 @@ def run_compare(
             workload=workload,
             level=level,
             workload_profile=workload_profile,
+            ycsb_zipf_theta=ycsb_zipf_theta,
             cc=cc,
             tasks=tasks,
             workers=workers,
@@ -80,6 +89,7 @@ def main(
         workload=args.workload,
         level=args.level,
         workload_profile=args.workload_profile,
+        ycsb_zipf_theta=args.ycsb_zipf_theta,
         cc=args.cc,
         tasks=args.tasks,
         workers=args.workers,

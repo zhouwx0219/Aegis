@@ -21,6 +21,7 @@ class YCSBConfig:
     zipf_theta: float = 0.0
     hotspot_fraction: float = 0.0
     hotspot_access_probability: float = 0.0
+    access_distribution: str = "hotspot"
     initial_value: str = "0"
 
     def __post_init__(self) -> None:
@@ -32,9 +33,18 @@ class YCSBConfig:
             raise ValueError("YCSB weights must be non-negative")
         if self.read_weight + self.update_weight <= 0:
             raise ValueError("YCSB needs at least one operation type")
+        if self.zipf_theta < 0:
+            raise ValueError("YCSB Zipfian theta must be non-negative")
+        if self.access_distribution not in {"hotspot", "zipfian"}:
+            raise ValueError(f"unsupported YCSB access distribution: {self.access_distribution}")
 
 
-def ycsb_config(level: str, profile: str = "small") -> YCSBConfig:
+def ycsb_config(
+    level: str,
+    profile: str = "small",
+    *,
+    zipf_theta: float | None = None,
+) -> YCSBConfig:
     level = str(level).strip().lower()
     profile = str(profile).strip().lower()
     if profile == "small":
@@ -45,7 +55,14 @@ def ycsb_config(level: str, profile: str = "small") -> YCSBConfig:
         raise ValueError(f"unsupported YCSB profile: {profile}")
     if level not in configs:
         raise ValueError(f"unsupported YCSB level: {level}")
-    return configs[level]
+    config = configs[level]
+    if zipf_theta is not None:
+        config = dataclasses.replace(
+            config,
+            zipf_theta=float(zipf_theta),
+            access_distribution="zipfian",
+        )
+    return config
 
 
 def small_ycsb_configs() -> dict[str, YCSBConfig]:
@@ -189,6 +206,7 @@ class YCSBWorkload(AgentWorkload):
                         "zipf_theta": self.config.zipf_theta,
                         "hotspot_fraction": self.config.hotspot_fraction,
                         "hotspot_access_probability": self.config.hotspot_access_probability,
+                        "access_distribution": self.config.access_distribution,
                         "operations_per_task": self.config.operations_per_task,
                         "agent_cost_class": agent_cost_class(self.level, task_index),
                         "phase_shape": "tool_heavy" if self.level == "high" and task_index % 3 == 0 else "multi_stage",
@@ -204,6 +222,13 @@ class YCSBWorkload(AgentWorkload):
         return max(1, int(self.config.record_count * self.config.hotspot_fraction))
 
     def _sample_target(self, rng: random.Random) -> tuple[int, int]:
+        if self.config.access_distribution == "zipfian":
+            record = rng.choices(
+                range(self.config.record_count),
+                weights=self._record_weights,
+                k=1,
+            )[0]
+            return record, rng.randrange(self.config.field_count)
         hot_count = self._hot_record_count()
         if hot_count and rng.random() < self.config.hotspot_access_probability:
             record = rng.randrange(hot_count)

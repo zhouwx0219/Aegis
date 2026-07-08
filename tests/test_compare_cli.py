@@ -133,6 +133,18 @@ class CompareCliTests(unittest.TestCase):
         self.assertIn("new_order", {task.task_type for task in tpcc_tasks})
         self.assertEqual({"payment", "new_order"}, {name for name, _weight in tpcc.config.transaction_mix})
 
+    def test_ycsb_zipfian_override_switches_sampling_mode(self):
+        default_medium = build_workload("ycsb", "medium", "paper")
+        zipf_medium = build_workload("ycsb", "medium", "paper", ycsb_zipf_theta=0.8)
+        task = zipf_medium.generate_tasks(1, seed=920104)[0]
+
+        self.assertEqual(0.7, default_medium.config.zipf_theta)
+        self.assertEqual("hotspot", default_medium.config.access_distribution)
+        self.assertEqual(0.8, zipf_medium.config.zipf_theta)
+        self.assertEqual("zipfian", zipf_medium.config.access_distribution)
+        self.assertEqual(0.8, task.context["zipf_theta"])
+        self.assertEqual("zipfian", task.context["access_distribution"])
+
     def test_concurrent_benchmark_exposes_occ_conflicts(self):
         report = compare.run_compare(
             workload="tpcc",
@@ -415,6 +427,38 @@ class CompareCliTests(unittest.TestCase):
         self.assertEqual([1, 1], report["background_retry_backoff_ms"])
         self.assertIn("agent_p9999_latency_ms", row)
         self.assertIn("agent_avg_tokens", row)
+
+    def test_mixed_clients_supports_all_agent_split(self):
+        stdout = io.StringIO()
+        status = mixed.main(
+            [
+                "--workload",
+                "ycsb",
+                "--level",
+                "low",
+                "--cc",
+                "occ",
+                "--duration",
+                "0.1",
+                "--clients",
+                "4",
+                "--agent-ratio",
+                "1.0",
+                "--reasoning-profile",
+                "none",
+            ],
+            stdout=stdout,
+        )
+
+        self.assertEqual(0, status)
+        report = json.loads(stdout.getvalue())
+        row = report["cc_results"][0]
+        self.assertEqual(4, report["clients"])
+        self.assertEqual(1.0, report["agent_ratio"])
+        self.assertEqual(4, report["agent_workers"])
+        self.assertEqual(0, report["background_workers"])
+        self.assertEqual(0, row["background_attempts"])
+        self.assertEqual(0, row["background_tps"])
 
     def test_mixed_procedure_background_uses_workload_tasks(self):
         stdout = io.StringIO()
@@ -1074,6 +1118,46 @@ class CompareCliTests(unittest.TestCase):
         for name in ("agent_throughput", "total_throughput", "avg_tokens", "p9999_latency_ms"):
             self.assertIn(name, report["paper_figures"])
             self.assertEqual(2, len(report["paper_figures"][name]))
+
+    def test_matrix_clients_supports_all_agent_split_and_zipfian_override(self):
+        stdout = io.StringIO()
+        status = matrix.main(
+            [
+                "--workloads",
+                "ycsb",
+                "--levels",
+                "medium",
+                "--workload-profile",
+                "paper",
+                "--zipfian",
+                "0.8",
+                "--seeds",
+                "920104",
+                "--client-counts",
+                "4,8",
+                "--cc",
+                "occ",
+                "--duration",
+                "0.1",
+                "--agent-ratio",
+                "1.0",
+                "--reasoning-profile",
+                "none",
+            ],
+            stdout=stdout,
+        )
+
+        self.assertEqual(0, status)
+        report = json.loads(stdout.getvalue())
+        self.assertEqual(0.8, report["ycsb_zipf_theta"])
+        self.assertEqual(
+            [
+                {"clients": 4, "agent_workers": 4, "background_workers": 0},
+                {"clients": 8, "agent_workers": 8, "background_workers": 0},
+            ],
+            report["client_worker_mix"],
+        )
+        self.assertEqual({0}, {row["background_workers"] for row in report["summary"]})
 
 
 if __name__ == "__main__":

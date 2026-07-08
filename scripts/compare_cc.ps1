@@ -8,6 +8,8 @@ param(
     [ValidateSet("small", "paper")]
     [string]$WorkloadProfile = "small",
 
+    [double]$YcsbZipfTheta = -1.0,
+
     [string]$Cc = "all",
     [int]$Tasks = 10,
     [int]$Workers = 8,
@@ -67,8 +69,12 @@ $PolicyModeArgs = ""
 if ($PolicyMode) {
     $PolicyModeArgs = "--policy-mode $PolicyMode"
 }
+$YcsbZipfArgs = ""
+if ($YcsbZipfTheta -ge 0) {
+    $YcsbZipfArgs = "--ycsb-zipf-theta $YcsbZipfTheta"
+}
 
-$ArgsLine = "--workload $Workload --level $Level --workload-profile $WorkloadProfile --cc $Cc --tasks $Tasks --workers $Workers --retries $Retries --reasoning-profile $ReasoningProfile --reasoning-scale $ReasoningScale --seed $Seed $PolicyArgs $PolicyModeArgs $OutputArgs"
+$ArgsLine = "--workload $Workload --level $Level --workload-profile $WorkloadProfile $YcsbZipfArgs --cc $Cc --tasks $Tasks --workers $Workers --retries $Retries --reasoning-profile $ReasoningProfile --reasoning-scale $ReasoningScale --seed $Seed $PolicyArgs $PolicyModeArgs $OutputArgs"
 $Command = "cd $WslRepo && timeout 180s python3 -m agent.cli.compare $ArgsLine"
 
 wsl -e bash -lc $Command

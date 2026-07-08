@@ -43,6 +43,7 @@ def run_cc_benchmark(config: BenchmarkConfig) -> Dict[str, Any]:
         "workload": config.workload,
         "level": config.level,
         "workload_profile": config.workload_profile,
+        "ycsb_zipf_theta": config.ycsb_zipf_theta,
         "tasks": int(config.tasks),
         "workers": int(config.workers),
         "retries": int(config.retries),
@@ -61,7 +62,12 @@ def run_strategy_benchmark(
     config: BenchmarkConfig,
     strategy: str,
 ) -> Dict[str, Any]:
-    workload = build_workload(config.workload, config.level, config.workload_profile)
+    workload = build_workload(
+        config.workload,
+        config.level,
+        config.workload_profile,
+        ycsb_zipf_theta=config.ycsb_zipf_theta,
+    )
     manager = AgentTransactionManager(
         cc_registry=registry_for(config)
     )

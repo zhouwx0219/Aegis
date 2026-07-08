@@ -12,6 +12,7 @@ class BenchmarkConfig:
     workload: str = "ycsb"
     level: str = "low"
     workload_profile: str = "small"
+    ycsb_zipf_theta: Optional[float] = None
     cc: str = "all"
     tasks: int = 10
     workers: int = 8
@@ -32,6 +33,8 @@ class BenchmarkConfig:
             raise ValueError("retries must be non-negative")
         if self.reasoning_scale < 0:
             raise ValueError("reasoning scale must be non-negative")
+        if self.ycsb_zipf_theta is not None and self.ycsb_zipf_theta < 0:
+            raise ValueError("YCSB Zipfian theta must be non-negative")
         mode = str(self.policy_mode).strip().lower()
         if mode not in {"train", "eval", "online"}:
             raise ValueError(f"unsupported policy mode: {self.policy_mode}")

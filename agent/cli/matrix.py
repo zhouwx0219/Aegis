@@ -22,6 +22,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workload-profile", choices=("small", "paper"), default="small")
     parser.add_argument("--seeds", "-s", default="920104,920105,920106")
     parser.add_argument("--client-counts", default="", help="Comma-separated total clients for matrix sweeps, e.g. 8,16,24,32,40,48.")
+    parser.add_argument(
+        "--ycsb-zipf-theta",
+        "--zipfian",
+        dest="ycsb_zipf_theta",
+        type=float,
+        help="Override YCSB Zipfian theta and use Zipfian record sampling.",
+    )
     parser.add_argument("--cc", default="occ,dynamic-atcc")
     parser.add_argument("--duration", "-d", type=float, default=3.0)
     parser.add_argument("--clients", "-c", type=int, default=0, help="Total clients. When set, derives agents/background from --agent-ratio.")
@@ -71,6 +78,7 @@ def main(
             seeds=tuple(int(value) for value in split_csv(args.seeds)),
             client_counts=tuple(int(value) for value in split_csv(args.client_counts)),
             workload_profile=args.workload_profile,
+            ycsb_zipf_theta=args.ycsb_zipf_theta,
             cc=args.cc,
             duration_s=args.duration,
             clients=args.clients,

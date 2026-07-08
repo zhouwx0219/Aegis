@@ -8,6 +8,8 @@ param(
     [ValidateSet("small", "paper")]
     [string]$WorkloadProfile = "small",
 
+    [double]$YcsbZipfTheta = -1.0,
+
     [string]$Cc = "occ,dynamic-atcc",
     [double]$Duration = 3.0,
     [int]$Clients = 0,
@@ -86,8 +88,12 @@ $RetryUntilCommitArgs = ""
 if ($RetryUntilCommit) {
     $RetryUntilCommitArgs = "--retry-until-commit"
 }
+$YcsbZipfArgs = ""
+if ($YcsbZipfTheta -ge 0) {
+    $YcsbZipfArgs = "--ycsb-zipf-theta $YcsbZipfTheta"
+}
 
-$ArgsLine = "--workload $Workload --level $Level --workload-profile $WorkloadProfile --cc $Cc --duration $Duration --clients $Clients --agent-ratio $AgentRatio --agents $Agents --background $Background --reasoning-profile $ReasoningProfile --reasoning-scale $ReasoningScale --seed $Seed --retries $Retries $RetryUntilCommitArgs --max-attempts-per-task $MaxAttemptsPerTask --agent-retry-backoff-ms $AgentRetryBackoffMs --background-retry-backoff-ms $BackgroundRetryBackoffMs --tokens-per-operation $TokensPerOperation --background-mode $BackgroundMode --reservation-ttl-s $ReservationTtlS $BackgroundWaitArgs $PolicyArgs $PolicyModeArgs $OutputArgs"
+$ArgsLine = "--workload $Workload --level $Level --workload-profile $WorkloadProfile $YcsbZipfArgs --cc $Cc --duration $Duration --clients $Clients --agent-ratio $AgentRatio --agents $Agents --background $Background --reasoning-profile $ReasoningProfile --reasoning-scale $ReasoningScale --seed $Seed --retries $Retries $RetryUntilCommitArgs --max-attempts-per-task $MaxAttemptsPerTask --agent-retry-backoff-ms $AgentRetryBackoffMs --background-retry-backoff-ms $BackgroundRetryBackoffMs --tokens-per-operation $TokensPerOperation --background-mode $BackgroundMode --reservation-ttl-s $ReservationTtlS $BackgroundWaitArgs $PolicyArgs $PolicyModeArgs $OutputArgs"
 $Command = "cd $WslRepo && timeout 240s python3 -m agent.cli.mixed $ArgsLine"
 
 wsl -e bash -lc $Command

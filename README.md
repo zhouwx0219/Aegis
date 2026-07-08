@@ -96,6 +96,37 @@ python3 -m agent.cli.matrix \
   --output results/paper_matrix.json
 ```
 
+All-agent client sweep:
+
+```bash
+python3 -m agent.cli.matrix \
+  --workloads ycsb,tpcc \
+  --levels medium,high \
+  --workload-profile paper \
+  --background-mode procedure \
+  --client-counts 8,16,24,32,40,48 \
+  --agent-ratio 1.0 \
+  --retry-until-commit \
+  --duration 5 \
+  --output results/all_agent_matrix.json
+```
+
+YCSB Zipfian override, for example medium with theta 0.8:
+
+```bash
+python3 -m agent.cli.matrix \
+  --workloads ycsb \
+  --levels medium \
+  --workload-profile paper \
+  --zipfian 0.8 \
+  --client-counts 8,16,24,32,40,48 \
+  --agent-ratio 0.8 \
+  --background-mode procedure \
+  --retry-until-commit \
+  --duration 5 \
+  --output results/ycsb_medium_zipf08_matrix.json
+```
+
 Train ATCC policy:
 
 ```bash
@@ -209,6 +240,8 @@ barrier batches controlled by `--workers`.
 `agent.cli.mixed` runs wall-clock mixed contention with long agent transactions
 and short background transactions. `--background-mode procedure` runs short
 YCSB/TPC-C tasks against the same store and is the preferred paper-style setup.
+Set `--agent-ratio 1.0` with `--clients` or `--client-counts` to run an all-agent
+sweep with zero background workers.
 
 With `--retry-until-commit`, agent latency is measured from first submission to
 eventual commit, including retries and injected reasoning delay. Token cost
@@ -227,6 +260,12 @@ low     95/5 read/write, uniform
 medium  90/10 read/write, 10% hot tuples receive about 50% of accesses
 high    50/50 read/write, 10% hot tuples receive about 75% of accesses
 ```
+
+By default, these profiles keep the hotspot access model above. Passing
+`--zipfian <theta>` or `--ycsb-zipf-theta <theta>` switches YCSB to global
+Zipfian record sampling for that run and records the theta in the JSON output.
+This is intended for sweeps such as YCSB medium theta 0.7/0.8 and YCSB high
+theta 0.99.
 
 The paper TPC-C profile uses `NewOrder` and `Payment` transactions.
 

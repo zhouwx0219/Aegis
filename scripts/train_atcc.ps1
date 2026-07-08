@@ -10,6 +10,7 @@ param(
 
     [ValidateSet("small", "paper")]
     [string]$WorkloadProfile = "small",
+    [double]$YcsbZipfTheta = -1.0,
 
     [string]$Workloads = "",
     [string]$Levels = "",
@@ -111,7 +112,11 @@ $RetryUntilCommitArgs = ""
 if ($RetryUntilCommit) {
     $RetryUntilCommitArgs = "--retry-until-commit"
 }
-$ArgsLine = "--benchmark $Benchmark --workload $Workload --level $Level --workload-profile $WorkloadProfile $MatrixArgs --episodes $Episodes --tasks $Tasks --workers $Workers --duration $Duration --clients $Clients --agent-ratio $AgentRatio --agents $Agents --background $Background --background-mode $BackgroundMode --retries $Retries $RetryUntilCommitArgs --max-attempts-per-task $MaxAttemptsPerTask --agent-retry-backoff-ms $AgentRetryBackoffMs --background-retry-backoff-ms $BackgroundRetryBackoffMs --tokens-per-operation $TokensPerOperation --seed $Seed --abort-threshold $AbortThreshold --min-visits $MinVisits --protect-cost-threshold-ms $ProtectCostThresholdMs --low-conflict-safe-abort-rate $LowConflictSafeAbortRate $LowConflictGuardArgs $SparseRiskArgs --commit-value $CommitValue --abort-penalty $AbortPenalty --reasoning-weight $ReasoningWeight --lock-wait-weight $LockWaitWeight --latency-weight $LatencyWeight --lock-hold-weight $LockHoldWeight --background-abort-weight $BackgroundAbortWeight --background-tps-loss-weight $BackgroundTpsLossWeight --ucb-c $UcbC --actions $Actions $BudgetArgs --reasoning-profile $ReasoningProfile --reasoning-scale $ReasoningScale --output $WslOutput"
+$YcsbZipfArgs = ""
+if ($YcsbZipfTheta -ge 0) {
+    $YcsbZipfArgs = "--ycsb-zipf-theta $YcsbZipfTheta"
+}
+$ArgsLine = "--benchmark $Benchmark --workload $Workload --level $Level --workload-profile $WorkloadProfile $YcsbZipfArgs $MatrixArgs --episodes $Episodes --tasks $Tasks --workers $Workers --duration $Duration --clients $Clients --agent-ratio $AgentRatio --agents $Agents --background $Background --background-mode $BackgroundMode --retries $Retries $RetryUntilCommitArgs --max-attempts-per-task $MaxAttemptsPerTask --agent-retry-backoff-ms $AgentRetryBackoffMs --background-retry-backoff-ms $BackgroundRetryBackoffMs --tokens-per-operation $TokensPerOperation --seed $Seed --abort-threshold $AbortThreshold --min-visits $MinVisits --protect-cost-threshold-ms $ProtectCostThresholdMs --low-conflict-safe-abort-rate $LowConflictSafeAbortRate $LowConflictGuardArgs $SparseRiskArgs --commit-value $CommitValue --abort-penalty $AbortPenalty --reasoning-weight $ReasoningWeight --lock-wait-weight $LockWaitWeight --latency-weight $LatencyWeight --lock-hold-weight $LockHoldWeight --background-abort-weight $BackgroundAbortWeight --background-tps-loss-weight $BackgroundTpsLossWeight --ucb-c $UcbC --actions $Actions $BudgetArgs --reasoning-profile $ReasoningProfile --reasoning-scale $ReasoningScale --output $WslOutput"
 $Command = "cd $WslRepo && timeout 900s python3 -m agent.cli.train_atcc $ArgsLine"
 
 wsl -e bash -lc $Command

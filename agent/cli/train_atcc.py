@@ -23,6 +23,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workload", "-w", choices=("ycsb", "tpcc"), default="tpcc")
     parser.add_argument("--level", "-l", choices=("low", "medium", "high"), default="high")
     parser.add_argument("--workload-profile", choices=("small", "paper"), default="small")
+    parser.add_argument(
+        "--ycsb-zipf-theta",
+        "--zipfian",
+        dest="ycsb_zipf_theta",
+        type=float,
+        help="Override YCSB Zipfian theta and use Zipfian record sampling.",
+    )
     parser.add_argument("--workloads", help="Comma-separated workloads for one shared policy, or all.")
     parser.add_argument("--levels", help="Comma-separated conflict levels for one shared policy, or all.")
     parser.add_argument("--episodes", "-e", type=int, default=5)
@@ -88,6 +95,7 @@ def train_policy(
     duration_s: float,
     agents: int,
     background: int,
+    ycsb_zipf_theta: float | None = None,
     clients: int = 0,
     agent_ratio: float = 0.80,
     background_mode: str = "hotspot",
@@ -160,6 +168,7 @@ def train_policy(
                     workload=workload,
                     level=level,
                     workload_profile=workload_profile,
+                    ycsb_zipf_theta=ycsb_zipf_theta,
                     cc=ATCC_STRATEGY,
                     duration_s=float(duration_s),
                     agent_workers=int(agents),
@@ -188,6 +197,7 @@ def train_policy(
                     workload=workload,
                     level=level,
                     workload_profile=workload_profile,
+                    ycsb_zipf_theta=ycsb_zipf_theta,
                     cc=ATCC_STRATEGY,
                     tasks=tasks,
                     workers=workers,
@@ -216,6 +226,7 @@ def train_policy(
         "workload": workload,
         "level": level,
         "workload_profile": workload_profile,
+        "ycsb_zipf_theta": ycsb_zipf_theta,
         "episodes": int(episodes),
         "tasks": int(tasks),
         "workers": int(workers),
@@ -269,6 +280,7 @@ def train_policy_matrix(
     duration_s: float,
     agents: int,
     background: int,
+    ycsb_zipf_theta: float | None = None,
     clients: int = 0,
     agent_ratio: float = 0.80,
     background_mode: str = "hotspot",
@@ -346,6 +358,7 @@ def train_policy_matrix(
                 workload=workload,
                 level=level,
                 workload_profile=workload_profile,
+                ycsb_zipf_theta=ycsb_zipf_theta,
                 episode=run_index,
                 tasks=tasks,
                 workers=workers,
@@ -391,6 +404,7 @@ def train_policy_matrix(
         "workloads": list(workload_names),
         "levels": list(level_names),
         "workload_profile": workload_profile,
+        "ycsb_zipf_theta": ycsb_zipf_theta,
         "episodes": int(episodes),
         "runs": int(run_index),
         "tasks": int(tasks),
@@ -481,6 +495,7 @@ def run_training_episode(
     workload: str,
     level: str,
     workload_profile: str,
+    ycsb_zipf_theta: float | None,
     episode: int,
     tasks: int,
     workers: int,
@@ -509,6 +524,7 @@ def run_training_episode(
                 workload=workload,
                 level=level,
                 workload_profile=workload_profile,
+                ycsb_zipf_theta=ycsb_zipf_theta,
                 cc=strategy,
                 duration_s=float(duration_s),
                 agent_workers=int(agents),
@@ -536,6 +552,7 @@ def run_training_episode(
             workload=workload,
             level=level,
             workload_profile=workload_profile,
+            ycsb_zipf_theta=ycsb_zipf_theta,
             cc=strategy,
             tasks=tasks,
             workers=workers,
@@ -648,7 +665,7 @@ def effective_client_mix(
     if int(clients) <= 0:
         return int(agents), int(background)
     agent_workers = max(1, int(round(int(clients) * float(agent_ratio))))
-    background_workers = max(1, int(clients) - agent_workers)
+    background_workers = max(0, int(clients) - agent_workers)
     return agent_workers, background_workers
 
 
@@ -663,6 +680,7 @@ def main(
     common = {
         "benchmark": args.benchmark,
         "workload_profile": args.workload_profile,
+        "ycsb_zipf_theta": args.ycsb_zipf_theta,
         "episodes": args.episodes,
         "tasks": args.tasks,
         "workers": args.workers,

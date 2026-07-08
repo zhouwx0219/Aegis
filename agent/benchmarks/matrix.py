@@ -17,6 +17,7 @@ class MixedMatrixConfig:
     seeds: tuple[int, ...] = (920104, 920105, 920106)
     client_counts: tuple[int, ...] = ()
     workload_profile: str = "small"
+    ycsb_zipf_theta: float | None = None
     cc: str = "occ,2pl-nowait,2pl-wait-die,mvcc,silo,tictoc,dynamic-atcc"
     duration_s: float = 3.0
     agent_workers: int = 2
@@ -57,12 +58,16 @@ class MixedMatrixConfig:
         if clients > 0:
             if clients < 2:
                 raise ValueError("clients must be at least 2 when set")
-            if not 0.0 < agent_ratio < 1.0:
-                raise ValueError("agent ratio must be between 0 and 1")
+            if not 0.0 < agent_ratio <= 1.0:
+                raise ValueError("agent ratio must be > 0 and <= 1")
             agent_workers = max(1, int(round(clients * agent_ratio)))
-            background_workers = max(1, clients - agent_workers)
-        if agent_workers <= 0 or background_workers <= 0:
-            raise ValueError("worker counts must be positive")
+            background_workers = max(0, clients - agent_workers)
+        if agent_workers <= 0:
+            raise ValueError("agent workers must be positive")
+        if background_workers < 0:
+            raise ValueError("background workers must be non-negative")
+        if self.ycsb_zipf_theta is not None and self.ycsb_zipf_theta < 0:
+            raise ValueError("YCSB Zipfian theta must be non-negative")
         if self.retries < 0:
             raise ValueError("retries must be non-negative")
         if self.max_attempts_per_task <= 0:
@@ -90,6 +95,7 @@ class MixedMatrixConfig:
             seeds=seeds,
             client_counts=client_counts,
             workload_profile=str(self.workload_profile).strip().lower() or "small",
+            ycsb_zipf_theta=self.ycsb_zipf_theta,
             cc=str(self.cc).strip() or "occ",
             agent_workers=agent_workers,
             background_workers=background_workers,
@@ -117,6 +123,7 @@ def run_mixed_matrix(config: MixedMatrixConfig) -> Dict[str, Any]:
                             workload=workload,
                             level=level,
                             workload_profile=config.workload_profile,
+                            ycsb_zipf_theta=config.ycsb_zipf_theta,
                             cc=config.cc,
                             duration_s=config.duration_s,
                             agent_workers=config.agent_workers,
@@ -160,6 +167,7 @@ def run_mixed_matrix(config: MixedMatrixConfig) -> Dict[str, Any]:
         "client_counts": list(client_counts),
         "client_worker_mix": worker_mix,
         "workload_profile": config.workload_profile,
+        "ycsb_zipf_theta": config.ycsb_zipf_theta,
         "cc": config.cc,
         "duration_s": float(config.duration_s),
         "clients": int(config.clients),
@@ -273,7 +281,7 @@ def client_worker_mix_rows(config: MixedMatrixConfig, client_counts: Sequence[in
     for clients in client_counts:
         if int(clients) > 0:
             agent_workers = max(1, int(round(int(clients) * float(config.agent_ratio))))
-            background_workers = max(1, int(clients) - agent_workers)
+            background_workers = max(0, int(clients) - agent_workers)
         else:
             agent_workers = int(config.agent_workers)
             background_workers = int(config.background_workers)

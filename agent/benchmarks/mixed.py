@@ -32,6 +32,7 @@ class MixedBenchmarkConfig:
     workload: str = "tpcc"
     level: str = "high"
     workload_profile: str = "small"
+    ycsb_zipf_theta: float | None = None
     cc: str = "occ,dynamic-atcc"
     duration_s: float = 3.0
     agent_workers: int = 2
@@ -65,14 +66,16 @@ class MixedBenchmarkConfig:
         if clients > 0:
             if clients < 2:
                 raise ValueError("clients must be at least 2 when set")
-            if not 0.0 < agent_ratio < 1.0:
-                raise ValueError("agent ratio must be between 0 and 1")
+            if not 0.0 < agent_ratio <= 1.0:
+                raise ValueError("agent ratio must be > 0 and <= 1")
             agent_workers = max(1, int(round(clients * agent_ratio)))
-            background_workers = max(1, clients - agent_workers)
+            background_workers = max(0, clients - agent_workers)
         if agent_workers <= 0:
             raise ValueError("agent workers must be positive")
-        if background_workers <= 0:
-            raise ValueError("background workers must be positive")
+        if background_workers < 0:
+            raise ValueError("background workers must be non-negative")
+        if self.ycsb_zipf_theta is not None and self.ycsb_zipf_theta < 0:
+            raise ValueError("YCSB Zipfian theta must be non-negative")
         if self.retries < 0:
             raise ValueError("retries must be non-negative")
         if self.max_attempts_per_task <= 0:
@@ -98,6 +101,7 @@ class MixedBenchmarkConfig:
             workload=str(self.workload).strip().lower(),
             level=str(self.level).strip().lower(),
             workload_profile=str(self.workload_profile).strip().lower() or "small",
+            ycsb_zipf_theta=self.ycsb_zipf_theta,
             cc=str(self.cc).strip() or "occ",
             agent_workers=agent_workers,
             background_workers=background_workers,
@@ -145,6 +149,7 @@ def run_mixed_benchmark(config: MixedBenchmarkConfig) -> Dict[str, Any]:
         "workload": config.workload,
         "level": config.level,
         "workload_profile": config.workload_profile,
+        "ycsb_zipf_theta": config.ycsb_zipf_theta,
         "duration_s": float(config.duration_s),
         "clients": int(config.clients),
         "agent_ratio": float(config.agent_ratio),
@@ -174,7 +179,12 @@ def run_mixed_strategy(config: MixedBenchmarkConfig, strategy: str) -> Dict[str,
     manager = AgentTransactionManager(
         cc_registry=registry_for(config),
     )
-    workload = build_workload(config.workload, config.level, config.workload_profile)
+    workload = build_workload(
+        config.workload,
+        config.level,
+        config.workload_profile,
+        ycsb_zipf_theta=config.ycsb_zipf_theta,
+    )
     register_workload(manager, workload)
     tasks = list(workload.generate_tasks(256, seed=config.seed))
     background_tasks = list(workload.generate_tasks(512, seed=config.seed + 700_000))
