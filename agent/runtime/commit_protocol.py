@@ -314,7 +314,9 @@ class _PriorityObjectLock:
         *,
         deadline: Optional[float] = None,
     ) -> None:
-        if self.queue_policy == "race":
+        if self.queue_policy == "race" or (
+            self.queue_policy == "bounded-priority" and int(requester.priority) <= 0
+        ):
             self._acquire_race(requester, deadline=deadline)
             return
         self._acquire_priority(requester, deadline=deadline)
@@ -326,30 +328,13 @@ class _PriorityObjectLock:
         deadline: Optional[float] = None,
     ) -> None:
         while True:
-            wounded_owner = None
             with self._condition:
                 if self._owner is None:
                     self._owner = requester
                     return
-                owner = self._owner
-                if (
-                    requester.priority > owner.priority
-                    and not owner.wounded
-                    and not owner.committing
-                ):
-                    wounded_owner = owner
-                else:
-                    self._condition.wait(
-                        timeout=self._wait_interval(deadline=deadline)
-                    )
-                    continue
-            if wounded_owner is not None:
-                wounded = wounded_owner.wound(
-                    f"wounded by priority {requester.priority} on {self.object_id}"
+                self._condition.wait(
+                    timeout=self._wait_interval(deadline=deadline)
                 )
-                if wounded:
-                    with self._condition:
-                        self._condition.notify_all()
 
     def _acquire_priority(
         self,
@@ -380,6 +365,7 @@ class _PriorityObjectLock:
                     owner = self._owner
                     if (
                         owner is not None
+                        and self.queue_policy == "priority"
                         and requester.priority > owner.priority
                         and not owner.wounded
                         and not owner.committing

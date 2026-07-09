@@ -1,1 +1,2 @@
-"""Core regression tests."""
+"""Delivery acceptance tests."""
+

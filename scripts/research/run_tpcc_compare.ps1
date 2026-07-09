@@ -31,7 +31,7 @@ function Convert-ToWslPath([string]$Path) {
     throw "Cannot convert path to WSL path: $resolved"
 }
 
-$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $WslRepo = Convert-ToWslPath $RepoRoot
 $PolicyArtifactArgs = @()
 if ($PolicyArtifact) {

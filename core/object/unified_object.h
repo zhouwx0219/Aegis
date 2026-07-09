@@ -1,7 +1,4 @@
 #pragma once
-// 统一对象抽象（事务语义扩大化的落点）。
-// 第一版聚焦三类对象：结构化行(row)、文本(text)、数值计数器(counter)。
-// kGeneric/kCandidateResult 保留以兼容现有 Data-Agent-System 的 ObjectType 语义。
 #include <cstdint>
 #include <string>
 

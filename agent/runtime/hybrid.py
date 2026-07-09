@@ -38,14 +38,14 @@ class ATCCFamilyPolicyTable:
     hot_write_ratio_threshold: float = 0.30
     hotspot_probability_threshold: float = 0.70
     read_heavy_strategy: str = "tictoc-full"
-    cold_read_heavy_strategy: str = "tictoc-full"
+    cold_read_heavy_strategy: str = "occ"
     adaptive_cold_mvcc_write_ratio_threshold: float = 0.05
     adaptive_hotspot_mvcc_write_ratio_threshold: float = 0.11
     cold_hotspot_probability_threshold: float = 0.01
     hot_write_strategy: str = "adaptive-op-strict"
-    fallback_strategy: str = "tictoc-full"
-    tpcc_low_contention_strategy: str = ""
-    tpcc_low_contention_min_distinct_order_counters: int = 0
+    fallback_strategy: str = "transaction-atcc-strict"
+    tpcc_low_contention_strategy: str = "occ"
+    tpcc_low_contention_min_distinct_order_counters: int = 16
     tpcc_window_distinct_order_counters: int = 0
     requested_strategy: str = "adaptive-hybrid"
 
@@ -59,6 +59,7 @@ class ATCCFamilyPolicyTable:
             "mvcc-full",
             "tictoc-full",
             "adaptive-op-strict",
+            "transaction-atcc-strict",
             "silo-full",
             "occ",
         }
@@ -221,6 +222,34 @@ class ATCCFamilyPolicyTable:
                         "to avoid ATCC refresh and prelock fixed costs."
                     ),
                 )
+        if "tpcc" in workload:
+            if (
+                self.tpcc_low_contention_strategy
+                and self.tpcc_window_distinct_order_counters
+                >= self.tpcc_low_contention_min_distinct_order_counters
+                > 0
+            ):
+                return ATCCFamilyDecision(
+                    requested_strategy=self.requested_strategy,
+                    selected_strategy=self.tpcc_low_contention_strategy,
+                    rule="tpcc-low-contention-fast-through",
+                    signals=signals,
+                    reason=(
+                        "TPC-C task window has enough distinct order counters; "
+                        "use the configured low-contention fast-through family."
+                    ),
+                )
+            return ATCCFamilyDecision(
+                requested_strategy=self.requested_strategy,
+                selected_strategy=self.fallback_strategy,
+                rule="tpcc-hot-write-atcc",
+                signals=signals,
+                reason=(
+                    "TPC-C task window does not meet the low-contention "
+                    "distinct-counter threshold; use the configured hot-write "
+                    "family for order-counter and stock-update contention."
+                ),
+            )
         return ATCCFamilyDecision(
             requested_strategy=self.requested_strategy,
             selected_strategy=self.fallback_strategy,
@@ -274,12 +303,19 @@ class ATCCFamilyPolicyTable:
             if (
                 self.tpcc_low_contention_strategy
                 and self.tpcc_low_contention_min_distinct_order_counters > 0
-                and distinct_order_counters
-                >= self.tpcc_low_contention_min_distinct_order_counters
             ):
+                if (
+                    distinct_order_counters
+                    >= self.tpcc_low_contention_min_distinct_order_counters
+                ):
+                    return dataclasses.replace(
+                        self,
+                        fallback_strategy=self.tpcc_low_contention_strategy,
+                        tpcc_window_distinct_order_counters=distinct_order_counters,
+                    )
                 return dataclasses.replace(
                     self,
-                    fallback_strategy=self.tpcc_low_contention_strategy,
+                    fallback_strategy=self.hot_write_strategy,
                     tpcc_window_distinct_order_counters=distinct_order_counters,
                 )
             if distinct_order_counters != self.tpcc_window_distinct_order_counters:
