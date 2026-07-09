@@ -192,9 +192,15 @@ class AgentTransactionManager:
             self.store.put(key, str(initial_value))
             self._catalog[key] = self._KIND_MAP[kind]
 
-    def begin(self, task_id: Any, metadata: Optional[Dict[str, Any]] = None) -> AgentTransaction:
+    def begin(
+        self,
+        task_id: Any,
+        metadata: Optional[Dict[str, Any]] = None,
+        *,
+        snapshot_object_ids: Optional[Iterable[str]] = None,
+    ) -> AgentTransaction:
         with self._lock:
-            snapshot = self._snapshot_locked()
+            snapshot = self._snapshot_locked(snapshot_object_ids)
         return AgentTransaction(self, str(task_id), snapshot, metadata)
 
     def commit(self, txn: AgentTransaction, *, strategy: str = "occ") -> TransactionResult:
@@ -349,14 +355,24 @@ class AgentTransactionManager:
         self._record(txn)
         return txn.result
 
-    def _snapshot_locked(self) -> Dict[str, SnapshotValue]:
+    def _snapshot_locked(
+        self,
+        object_ids: Optional[Iterable[str]] = None,
+    ) -> Dict[str, SnapshotValue]:
+        if object_ids is None:
+            keys = tuple(self._catalog)
+        else:
+            keys = tuple(dict.fromkeys(str(object_id) for object_id in object_ids))
+            missing = [key for key in keys if key not in self._catalog]
+            if missing:
+                raise KeyError(f"object is not registered: {missing[0]}")
         return {
             object_id: SnapshotValue(
                 value=(value := self.store.get(object_id)).value,
                 version=int(value.version),
                 exists=bool(value.exists),
             )
-            for object_id in self._catalog
+            for object_id in keys
         }
 
     def _conflict_targets(self, checks: Iterable[tuple[str, int]]) -> tuple[str, ...]:

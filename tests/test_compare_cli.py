@@ -1,21 +1,28 @@
 import dataclasses
 import io
 import json
+import threading
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
-from agent.cc import ConcurrencyControlRegistry
+from agent.cc import ConcurrencyControlRegistry, LockConflict, ReservationTable
 from agent.benchmarks.mixed import (
+    MixedBenchmarkConfig,
+    apply_atcc_experiment_overrides,
     can_defer_transaction_begin,
     can_defer_read_heavy_transaction_begin,
     mixed_transaction_metadata,
     run_agent_with_deferred_commit_lock,
     run_agent_with_deferred_read_optimistic,
     run_agent_with_deferred_read_reservation,
+    run_agent_attempt,
 )
 from agent.benchmarks.phases import PlannedPhase, PlannedTask
 from agent.cli import compare, matrix, mixed, train_atcc
+from agent.cc.atcc.common import ATCCDecision
 from agent.cc.atcc.dynamic import DynamicATCC
 from agent.cc.atcc.features import ATCCFeatures
 from agent.cc.atcc.policy import ATCCActionStats, ATCCPolicyTable, ATCCPolicyRow
@@ -24,6 +31,76 @@ from agent.workloads import AgentOperation, AgentTask, build_workload
 
 
 class CompareCliTests(unittest.TestCase):
+    def test_reservation_waiter_blocks_later_background_writer(self):
+        reservations = ReservationTable()
+        first_writer = SimpleNamespace()
+        agent = SimpleNamespace(started_at=time.perf_counter() - 1.0)
+        acquired = threading.Event()
+
+        def reserve_agent() -> None:
+            with reservations.reserve(
+                ("hot",),
+                owner=agent,
+                wait=True,
+                timeout_s=1.0,
+                priority=9,
+            ):
+                acquired.set()
+
+        with reservations.write_guard(("hot",), owner=first_writer, wait=False):
+            thread = threading.Thread(target=reserve_agent)
+            thread.start()
+            deadline = time.perf_counter() + 1.0
+            while not reservations._waiters and time.perf_counter() < deadline:
+                time.sleep(0.001)
+            self.assertTrue(reservations._waiters)
+            with self.assertRaises(LockConflict):
+                with reservations.write_guard(("hot",), owner=SimpleNamespace(), wait=False):
+                    pass
+            self.assertFalse(acquired.is_set())
+
+        thread.join(timeout=1.0)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(acquired.is_set())
+        diagnostics = reservations.snapshot_diagnostics()
+        self.assertEqual(1, diagnostics["reservation_waiter_count"])
+        self.assertEqual([1], diagnostics["reservation_waiter_target_sizes"])
+        self.assertGreater(diagnostics["background_writer_waiter_blocked_checks"], 0)
+
+    def test_reservation_pressure_marks_inconsistent_front_queue_convoy(self):
+        reservations = ReservationTable()
+        first_writer = SimpleNamespace()
+        second_writer = SimpleNamespace()
+        first_agent = SimpleNamespace(started_at=time.perf_counter() - 2.0)
+        second_agent = SimpleNamespace(started_at=time.perf_counter() - 1.0)
+
+        def reserve_first() -> None:
+            with reservations.reserve(("a", "b"), owner=first_agent, wait=True, timeout_s=1.0):
+                pass
+
+        def reserve_second() -> None:
+            with reservations.reserve(("b", "c"), owner=second_agent, wait=True, timeout_s=1.0):
+                pass
+
+        with reservations.write_guard(("a",), owner=first_writer, wait=False):
+            with reservations.write_guard(("c",), owner=second_writer, wait=False):
+                first_thread = threading.Thread(target=reserve_first)
+                second_thread = threading.Thread(target=reserve_second)
+                first_thread.start()
+                second_thread.start()
+                deadline = time.perf_counter() + 1.0
+                while len(reservations._waiters) < 3 and time.perf_counter() < deadline:
+                    time.sleep(0.001)
+                pressure = reservations.snapshot_pressure(("a", "b", "c"))
+                self.assertTrue(pressure["reservation_convoy_active"])
+                self.assertEqual(3, pressure["reservation_convoy_queue_target_count"])
+                self.assertEqual(2, pressure["reservation_convoy_front_waiter_count"])
+
+        first_thread.join(timeout=1.0)
+        second_thread.join(timeout=1.0)
+        self.assertFalse(first_thread.is_alive())
+        self.assertFalse(second_thread.is_alive())
+
     def test_registry_resolves_all_strategies(self):
         registry = ConcurrencyControlRegistry()
         expected = [
@@ -385,6 +462,11 @@ class CompareCliTests(unittest.TestCase):
         self.assertIn("background_retries", report["cc_results"][0])
         self.assertIn("agent_commit_rate", report["cc_results"][0])
         self.assertIn("guard_wait_ms", report["cc_results"][0])
+        self.assertIn("agent_task_guard_wait_ms_p95", report["cc_results"][0])
+        self.assertIn("reservation_all_or_nothing_failed_grant_checks", report["cc_results"][0])
+        self.assertIn("reservation_front_queue_wait_ms", report["cc_results"][0])
+        self.assertIn("background_writer_waiter_blocked_checks", report["cc_results"][0])
+        self.assertIn("reserve_read_write_set_hot_target_count_p95", report["cc_results"][0])
 
     def test_mixed_clients_derives_paper_agent_background_split(self):
         stdout = io.StringIO()
@@ -491,6 +573,8 @@ class CompareCliTests(unittest.TestCase):
         self.assertEqual("paper", report["workload_profile"])
         self.assertEqual("procedure", report["background_mode"])
         self.assertGreater(report["cc_results"][0]["background_attempts"], 0)
+        self.assertGreater(report["cc_results"][0]["background_commits"], 0)
+        self.assertGreater(report["cc_results"][0]["background_tps"], 0)
 
     def test_mixed_train_atcc_cli_writes_reservation_action_stats(self):
         stdout = io.StringIO()
@@ -603,6 +687,224 @@ class CompareCliTests(unittest.TestCase):
             {"policy", "runtime-hot-read-protect"},
         )
 
+    def test_dynamic_atcc_keeps_full_set_until_reservation_convoy(self):
+        atcc = DynamicATCC(policy=ATCCPolicyTable(min_visits=5))
+        features = ATCCFeatures(
+            workload="ycsb",
+            task_type="read-update",
+            level="high",
+            read_count=6,
+            write_count=4,
+            hot_write_count=2,
+            retry_count=0,
+            hot_targets=("ycsb:record:0:field:0", "ycsb:record:1:field:0"),
+            hot_read_targets=("ycsb:record:0:field:1", "ycsb:record:1:field:2"),
+            write_targets=(
+                "ycsb:record:0:field:0",
+                "ycsb:record:1:field:0",
+                "ycsb:record:2:field:0",
+                "ycsb:record:3:field:0",
+            ),
+            read_targets=(
+                "ycsb:record:0:field:1",
+                "ycsb:record:1:field:2",
+                "ycsb:record:2:field:1",
+                "ycsb:record:3:field:1",
+                "ycsb:record:4:field:1",
+                "ycsb:record:5:field:1",
+            ),
+            phase_count=3,
+            reasoning_delay_ms=180,
+            background_workers=6,
+            reservation_queue_lengths={"ycsb:record:0:field:0": 4},
+            reservation_waiter_count_current=4,
+        )
+
+        no_convoy_decision = atcc.decide(features)
+        self.assertEqual("reserve-read-write-set", no_convoy_decision.action)
+        self.assertFalse(no_convoy_decision.metadata["post_policy_override"])
+        self.assertTrue(no_convoy_decision.metadata["background_pressure_background_high"])
+        self.assertTrue(no_convoy_decision.metadata["background_pressure_queue_high"])
+        self.assertFalse(no_convoy_decision.metadata["reservation_convoy_active"])
+
+        features = dataclasses.replace(
+            features,
+            reservation_convoy_active=True,
+            reservation_convoy_queue_target_count=3,
+            reservation_convoy_front_waiter_count=2,
+            reservation_convoy_pressure=3,
+        )
+        decision = atcc.decide(features)
+
+        self.assertEqual("reserve-hot-rw-k", decision.action)
+        self.assertEqual("hot-rw-k", decision.lock_scope)
+        self.assertEqual(3, len(decision.targets))
+        self.assertTrue(
+            set(decision.targets).issubset(
+                {
+                    "ycsb:record:0:field:0",
+                    "ycsb:record:1:field:0",
+                    "ycsb:record:0:field:1",
+                    "ycsb:record:1:field:2",
+                }
+            )
+        )
+        self.assertEqual("reserve-read-write-set", decision.metadata["pre_override_action"])
+        self.assertTrue(decision.metadata["post_policy_override"])
+        self.assertEqual(3, decision.metadata["post_policy_override_target_limit"])
+        self.assertIn("post-policy-background-pressure", decision.metadata["selected_action_source"])
+        self.assertEqual("hot-set-reservation-k", decision.metadata["execution_path"])
+        self.assertTrue(decision.metadata["bp_mode_active"])
+        self.assertTrue(decision.metadata["bp_mode_entered"])
+        self.assertEqual(1, decision.metadata["bp_mode_windows"])
+        self.assertEqual(3, decision.metadata["bp_mode_min_windows"])
+        self.assertTrue(decision.metadata["reservation_convoy_active"])
+        self.assertEqual(3, decision.metadata["reservation_convoy_pressure"])
+
+        retry_decision = atcc.decide(dataclasses.replace(features, retry_count=1))
+        self.assertEqual("reserve-hot-rw-k", retry_decision.action)
+        self.assertTrue(retry_decision.metadata["post_policy_override"])
+        self.assertTrue(retry_decision.metadata["bp_mode_active"])
+        self.assertEqual(2, retry_decision.metadata["bp_mode_windows"])
+        recovered_features = dataclasses.replace(
+            features,
+            background_workers=5,
+            reservation_queue_lengths={},
+            reservation_waiter_count_current=0,
+            reservation_convoy_active=False,
+            reservation_convoy_queue_target_count=0,
+            reservation_convoy_front_waiter_count=0,
+            reservation_convoy_pressure=0,
+        )
+        medium_pressure_decision = atcc.decide(recovered_features)
+        self.assertEqual("reserve-hot-rw-k", medium_pressure_decision.action)
+        self.assertTrue(medium_pressure_decision.metadata["post_policy_override"])
+        self.assertTrue(medium_pressure_decision.metadata["bp_mode_active"])
+        self.assertTrue(medium_pressure_decision.metadata["bp_mode_exited_after_decision"])
+        self.assertEqual(3, medium_pressure_decision.metadata["bp_mode_windows"])
+        recovered_decision = atcc.decide(recovered_features)
+        self.assertEqual("reserve-read-write-set", recovered_decision.action)
+        self.assertFalse(recovered_decision.metadata["post_policy_override"])
+        self.assertFalse(recovered_decision.metadata["bp_mode_active"])
+
+    def test_dynamic_atcc_uses_queue_pressure_aware_hot_rw_k_targets(self):
+        atcc = DynamicATCC(policy=ATCCPolicyTable(min_visits=5), hot_rw_k_target_limit=2)
+        features = ATCCFeatures(
+            workload="ycsb",
+            task_type="read-update",
+            level="high",
+            read_count=6,
+            write_count=4,
+            hot_write_count=3,
+            retry_count=0,
+            hot_targets=(
+                "ycsb:record:0:field:0",
+                "ycsb:record:1:field:0",
+                "ycsb:record:2:field:0",
+            ),
+            hot_read_targets=(
+                "ycsb:record:0:field:1",
+                "ycsb:record:1:field:1",
+            ),
+            write_targets=(
+                "ycsb:record:0:field:0",
+                "ycsb:record:1:field:0",
+                "ycsb:record:2:field:0",
+                "ycsb:record:3:field:0",
+            ),
+            read_targets=(
+                "ycsb:record:0:field:1",
+                "ycsb:record:1:field:1",
+                "ycsb:record:2:field:1",
+                "ycsb:record:3:field:1",
+                "ycsb:record:4:field:1",
+                "ycsb:record:5:field:1",
+            ),
+            phase_count=3,
+            reasoning_delay_ms=180,
+            background_workers=2,
+            reservation_queue_lengths={"ycsb:record:0:field:0": 4},
+            reservation_waiter_count_current=2,
+            reservation_convoy_active=True,
+            reservation_convoy_queue_target_count=2,
+            reservation_convoy_front_waiter_count=2,
+            reservation_convoy_pressure=2,
+            target_selection_seed=12345,
+        )
+
+        decision = atcc.decide(features)
+
+        self.assertEqual("reserve-hot-rw-k", decision.action)
+        self.assertEqual(2, len(decision.targets))
+        self.assertNotIn("ycsb:record:0:field:0", decision.targets)
+        self.assertEqual(2, decision.metadata["post_policy_override_target_limit"])
+        self.assertTrue(decision.metadata["background_pressure_queue_high"])
+        self.assertEqual(4, decision.metadata["reservation_queue_pressure"])
+        self.assertTrue(decision.metadata["reservation_convoy_active"])
+
+    def test_mixed_atcc_experiment_overrides_apply_guardrail_and_full_fallback(self):
+        task = AgentTask(
+            task_id="task-override",
+            workload="ycsb",
+            task_type="read-update",
+            operations=(
+                AgentOperation("read", "ycsb:record:0:field:1"),
+                AgentOperation("write", "ycsb:record:0:field:0", "v"),
+                AgentOperation("write", "ycsb:record:1:field:0", "v"),
+            ),
+            context={"level": "high", "hot_record_count": 2},
+        )
+        features = ATCCFeatures(
+            workload="ycsb",
+            task_type="read-update",
+            level="high",
+            read_count=1,
+            write_count=2,
+            hot_write_count=2,
+            retry_count=0,
+            hot_targets=("ycsb:record:0:field:0", "ycsb:record:1:field:0"),
+            hot_read_targets=("ycsb:record:0:field:1",),
+            write_targets=("ycsb:record:0:field:0", "ycsb:record:1:field:0"),
+            read_targets=("ycsb:record:0:field:1",),
+            reservation_queue_lengths={"ycsb:record:0:field:0": 3},
+        )
+        decision = ATCCDecision(
+            action="reserve-hot-rw-k",
+            targets=("ycsb:record:0:field:0", "ycsb:record:1:field:0"),
+            lock_scope="hot-rw-k",
+            lock_phase="reserve",
+            metadata={},
+        )
+
+        guarded = apply_atcc_experiment_overrides(
+            task,
+            decision,
+            features,
+            MixedBenchmarkConfig(atcc_agent_guardrail=True),
+            retry_count=0,
+        )
+        self.assertEqual(("ycsb:record:1:field:0",), guarded.targets)
+        self.assertEqual("agent-guardrail", guarded.metadata["mixed_experiment_override"])
+
+        full = apply_atcc_experiment_overrides(
+            task,
+            decision,
+            features,
+            MixedBenchmarkConfig(atcc_full_reservation_fallback_ratio=1.0),
+            retry_count=0,
+        )
+        self.assertEqual("reserve-read-write-set", full.action)
+        self.assertEqual("read-write-set", full.lock_scope)
+        self.assertEqual(
+            {
+                "ycsb:record:0:field:0",
+                "ycsb:record:1:field:0",
+                "ycsb:record:0:field:1",
+            },
+            set(full.targets),
+        )
+        self.assertEqual("full-reservation-fallback", full.metadata["mixed_experiment_override"])
+
     def test_dynamic_atcc_prefers_optimistic_first_attempt_for_medium_reads(self):
         policy = ATCCPolicyTable(min_visits=1)
         atcc = DynamicATCC(policy=policy)
@@ -643,6 +945,47 @@ class CompareCliTests(unittest.TestCase):
         self.assertEqual("none", decision.lock_scope)
         self.assertEqual("snapshot-write-validate", decision.metadata["execution_path"])
         self.assertEqual("runtime-medium-read-write-validate", decision.metadata["selected_action_source"])
+
+    def test_dynamic_atcc_pure_policy_keeps_policy_action_for_medium_reads(self):
+        policy = ATCCPolicyTable(min_visits=1)
+        atcc = DynamicATCC(policy=policy, runtime_guards_enabled=False)
+        features = ATCCFeatures(
+            workload="ycsb",
+            task_type="read-update",
+            level="medium",
+            read_count=8,
+            write_count=2,
+            hot_write_count=1,
+            retry_count=0,
+            hot_targets=("ycsb:record:0:field:0",),
+            hot_read_targets=("ycsb:record:0:field:1", "ycsb:record:1:field:1"),
+            write_targets=("ycsb:record:0:field:0", "ycsb:record:1:field:0"),
+            read_targets=(
+                "ycsb:record:0:field:1",
+                "ycsb:record:1:field:1",
+                "ycsb:record:2:field:1",
+                "ycsb:record:3:field:1",
+                "ycsb:record:4:field:1",
+                "ycsb:record:5:field:1",
+                "ycsb:record:6:field:1",
+                "ycsb:record:7:field:1",
+            ),
+            reasoning_delay_ms=120,
+        )
+        row = policy.rows.setdefault(features.state_key, ATCCPolicyRow(action="reserve-read-write-set"))
+        row.visits = 1
+        row.actions["reserve-read-write-set"] = ATCCActionStats(
+            visits=1,
+            commits=1,
+            avg_reward=75.0,
+        )
+
+        decision = atcc.decide(features)
+
+        self.assertEqual("reserve-read-write-set", decision.action)
+        self.assertEqual("read-write-set", decision.lock_scope)
+        self.assertEqual("policy", decision.metadata["selected_action_source"])
+        self.assertFalse(decision.metadata["runtime_guards_enabled"])
 
     def test_dynamic_atcc_write_validate_skips_read_validation_only(self):
         manager = AgentTransactionManager()
@@ -871,6 +1214,66 @@ class CompareCliTests(unittest.TestCase):
         self.assertEqual({"a", "b"}, set(trace["read_set"]))
         self.assertEqual({"c"}, set(trace["write_set"]))
         self.assertTrue(trace["metadata"]["atcc_runtime"]["deferred_read_begin"])
+
+    def test_mixed_low_conflict_atcc_runtime_fast_path_bypasses_preplan(self):
+        manager = AgentTransactionManager()
+        for object_id in ("a", "b"):
+            manager.register_object(object_id, "0", kind="row")
+        task = AgentTask(
+            task_id="low-fast-path",
+            workload="ycsb",
+            task_type="read-update",
+            operations=(
+                AgentOperation.read("a"),
+                AgentOperation.write("b", "1"),
+            ),
+            context={"level": "low"},
+        )
+        planned = PlannedTask(
+            task=task,
+            phases=(
+                PlannedPhase("explore", (task.operations[0],), reasoning_delay_ms=0),
+                PlannedPhase("commit", (task.operations[1],), reasoning_delay_ms=0),
+            ),
+        )
+
+        result, action, wait_s, diagnostics = run_agent_attempt(
+            manager,
+            planned,
+            "dynamic-atcc",
+            ttl_s=1.0,
+            jitter_ms=0,
+            retry_count=0,
+            background_workers=0,
+            config=MixedBenchmarkConfig(),
+        )
+
+        self.assertTrue(result["committed"])
+        self.assertEqual("occ", action)
+        self.assertEqual(0.0, wait_s)
+        self.assertEqual("low-conflict-optimistic", diagnostics["runtime_fast_path"])
+        trace = manager.traces()[-1]
+        self.assertEqual("occ", trace["result"]["strategy"])
+        self.assertEqual("low-conflict-optimistic", trace["metadata"]["atcc_runtime_fast_path"])
+        self.assertNotIn("atcc_preplan", trace["metadata"])
+
+        retry_result, retry_action, _retry_wait_s, retry_diagnostics = run_agent_attempt(
+            manager,
+            planned,
+            "dynamic-atcc",
+            ttl_s=1.0,
+            jitter_ms=0,
+            retry_count=1,
+            background_workers=0,
+            config=MixedBenchmarkConfig(),
+        )
+
+        self.assertTrue(retry_result["committed"])
+        self.assertEqual("occ", retry_action)
+        self.assertEqual("low-conflict-optimistic", retry_diagnostics["runtime_fast_path"])
+        retry_trace = manager.traces()[-1]
+        self.assertEqual("low-conflict-optimistic", retry_trace["metadata"]["atcc_runtime_fast_path"])
+        self.assertNotIn("atcc_preplan", retry_trace["metadata"])
 
     def test_low_conflict_policy_guard_keeps_occ(self):
         policy = ATCCPolicyTable(min_visits=2)
@@ -1143,12 +1546,14 @@ class CompareCliTests(unittest.TestCase):
                 "1.0",
                 "--reasoning-profile",
                 "none",
+                "--atcc-pure-policy",
             ],
             stdout=stdout,
         )
 
         self.assertEqual(0, status)
         report = json.loads(stdout.getvalue())
+        self.assertTrue(report["atcc_pure_policy"])
         self.assertEqual(0.8, report["ycsb_zipf_theta"])
         self.assertEqual(
             [
@@ -1158,6 +1563,7 @@ class CompareCliTests(unittest.TestCase):
             report["client_worker_mix"],
         )
         self.assertEqual({0}, {row["background_workers"] for row in report["summary"]})
+        self.assertEqual({True}, {row["atcc_pure_policy"] for row in report["summary"]})
 
 
 if __name__ == "__main__":

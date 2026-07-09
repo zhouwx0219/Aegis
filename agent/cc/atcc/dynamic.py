@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+import zlib
 from typing import Any, Optional
 
 from agent.cc.atcc.actions import (
@@ -10,6 +12,7 @@ from agent.cc.atcc.actions import (
     OCC,
     RESERVE_HOT,
     RESERVE_HOT_RW,
+    RESERVE_HOT_RW_K,
     RESERVE_READ_WRITE_SET,
     RETRY_PROTECT,
     WRITE_VALIDATE,
@@ -20,6 +23,13 @@ from agent.cc.atcc.common import ATCCDecision, decision_from_preplan
 from agent.cc.atcc.features import ATCCFeatures, agent_cost_bucket, contention_bucket, extract_features
 from agent.cc.atcc.policy import ATCCPolicyTable, ATCCPolicyRow, priority_from_cost
 from agent.cc.base import CCPlan, ConcurrencyControl
+
+
+HIGH_BACKGROUND_WORKERS = 6
+LOW_AGENT_RETRY_COUNT = 0
+BP_MODE_MIN_WINDOWS = 3
+HOT_RW_K_TARGET_LIMIT = 3
+BP_QUEUE_PRESSURE_THRESHOLD = 2
 
 
 class DynamicATCC(ConcurrencyControl):
@@ -34,6 +44,11 @@ class DynamicATCC(ConcurrencyControl):
         policy: Optional[ATCCPolicyTable] = None,
         decision_mode: str = "trained",
         priority_enabled: bool = True,
+        runtime_guards_enabled: bool = True,
+        bp_background_threshold: int = HIGH_BACKGROUND_WORKERS,
+        bp_min_windows: int = BP_MODE_MIN_WINDOWS,
+        bp_queue_pressure_threshold: int = BP_QUEUE_PRESSURE_THRESHOLD,
+        hot_rw_k_target_limit: int = HOT_RW_K_TARGET_LIMIT,
     ):
         self.name = name
         self.policy = policy or ATCCPolicyTable()
@@ -41,6 +56,14 @@ class DynamicATCC(ConcurrencyControl):
         if self.decision_mode not in {"trained", "static"}:
             raise ValueError(f"unsupported ATCC decision mode: {decision_mode}")
         self.priority_enabled = bool(priority_enabled)
+        self.runtime_guards_enabled = bool(runtime_guards_enabled)
+        self.bp_background_threshold = max(0, int(bp_background_threshold))
+        self.bp_min_windows = max(1, int(bp_min_windows))
+        self.bp_queue_pressure_threshold = max(0, int(bp_queue_pressure_threshold))
+        self.hot_rw_k_target_limit = max(1, int(hot_rw_k_target_limit))
+        self._bp_mode_lock = threading.Lock()
+        self._bp_mode_active = False
+        self._bp_mode_windows = 0
 
     def decide(self, features: ATCCFeatures) -> ATCCDecision:
         state_key = self.state_key_for(features)
@@ -49,12 +72,29 @@ class DynamicATCC(ConcurrencyControl):
             action, action_source = policy_action, "static-threshold"
         else:
             policy_action = self.policy.action_for(state_key)
-            action, action_source = self._paper_like_action(policy_action, features)
+            if self.runtime_guards_enabled:
+                action, action_source = self._paper_like_action(policy_action, features)
+            else:
+                action, action_source = policy_action, "policy"
+        bp_mode = self._update_bp_mode(features) if self.runtime_guards_enabled else self._inactive_bp_mode(features)
+        pre_override_action = normalize_action(action)
+        pre_override_action_source = action_source
+        if self.runtime_guards_enabled:
+            action, action_source, override_reason = self._post_policy_override(
+                action,
+                action_source,
+                features,
+                bp_mode=bp_mode,
+            )
+        else:
+            action, action_source, override_reason = normalize_action(action), action_source, ""
         spec = action_spec(action, retry_count=features.retry_count)
         if spec.lock_scope == "hot":
             targets = features.hot_targets
         elif spec.lock_scope == "hot-rw":
             targets = tuple(sorted(set(features.hot_targets) | set(features.hot_read_targets)))
+        elif spec.lock_scope == "hot-rw-k":
+            targets = hot_rw_k_targets(features, limit=self.hot_rw_k_target_limit)
         elif spec.lock_scope == "read-write-set":
             targets = tuple(sorted(set(features.read_targets) | set(features.write_targets)))
         elif spec.lock_scope == "write-set":
@@ -85,10 +125,34 @@ class DynamicATCC(ConcurrencyControl):
                 "hot_read_count": features.hot_read_count,
                 "hot_access_count": features.hot_access_count,
                 "policy_action": normalize_action(policy_action),
+                "pre_override_action": pre_override_action,
+                "pre_override_action_source": pre_override_action_source,
                 "selected_action_source": action_source,
+                "post_policy_override": bool(override_reason),
+                "post_policy_override_reason": override_reason,
+                "post_policy_override_target_limit": (
+                    self.hot_rw_k_target_limit if normalize_action(action) == RESERVE_HOT_RW_K else 0
+                ),
+                "background_pressure_high": bool(bp_mode["pressure_high"]),
+                "background_pressure_background_high": bool(bp_mode["background_high"]),
+                "background_pressure_queue_high": bool(bp_mode["queue_high"]),
+                "background_pressure_threshold": self.bp_background_threshold,
+                "background_pressure_queue_threshold": self.bp_queue_pressure_threshold,
+                "reservation_queue_pressure": int(bp_mode["queue_pressure"]),
+                "reservation_convoy_active": bool(bp_mode["convoy_high"]),
+                "reservation_convoy_queue_target_count": int(bp_mode["convoy_queue_target_count"]),
+                "reservation_convoy_front_waiter_count": int(bp_mode["convoy_front_waiter_count"]),
+                "reservation_convoy_pressure": int(bp_mode["convoy_pressure"]),
+                "bp_pressure_gate_high": bool(bp_mode["pressure_gate_high"]),
+                "bp_mode_active": bool(bp_mode["active"]),
+                "bp_mode_entered": bool(bp_mode["entered"]),
+                "bp_mode_exited_after_decision": bool(bp_mode["exited_after_decision"]),
+                "bp_mode_windows": int(bp_mode["windows"]),
+                "bp_mode_min_windows": self.bp_min_windows,
                 "priority_reason": priority_reason,
                 "decision_mode": self.decision_mode,
                 "priority_enabled": self.priority_enabled,
+                "runtime_guards_enabled": self.runtime_guards_enabled,
             }
         )
         return ATCCDecision(
@@ -104,6 +168,109 @@ class DynamicATCC(ConcurrencyControl):
 
     def state_key_for(self, features: ATCCFeatures) -> str:
         return features.state_key
+
+    def _post_policy_override(
+        self,
+        action: str,
+        action_source: str,
+        features: ATCCFeatures,
+        *,
+        bp_mode: dict[str, object],
+    ) -> tuple[str, str, str]:
+        normalized = normalize_action(action)
+        if normalized != RESERVE_READ_WRITE_SET:
+            return normalized, action_source, ""
+        if self.policy.training:
+            return normalized, action_source, ""
+        available = {normalize_action(item) for item in self.policy.trainable_actions}
+        if normalize_action(RESERVE_HOT_RW) not in available:
+            return normalized, action_source, ""
+        if bool(bp_mode["active"]):
+            reason = (
+                "bp_mode_active;"
+                f"background_workers={int(features.background_workers)};"
+                f"queue_pressure={int(bp_mode['queue_pressure'])};"
+                f"convoy_pressure={int(bp_mode['convoy_pressure'])};"
+                f"k={self.hot_rw_k_target_limit};"
+                f"windows={int(bp_mode['windows'])}"
+            )
+            return (
+                RESERVE_HOT_RW_K,
+                f"{action_source}+post-policy-background-pressure",
+                reason,
+            )
+        return normalized, action_source, ""
+
+    def _update_bp_mode(self, features: ATCCFeatures) -> dict[str, object]:
+        background_workers = int(features.background_workers)
+        queue_pressure = int(features.reservation_queue_pressure)
+        background_high = background_workers >= self.bp_background_threshold
+        queue_high = (
+            background_workers > 0
+            and self.bp_queue_pressure_threshold > 0
+            and queue_pressure >= self.bp_queue_pressure_threshold
+        )
+        full_set_target_count = len(set(features.read_targets) | set(features.write_targets))
+        convoy_high = (
+            bool(features.reservation_convoy_active)
+            and full_set_target_count > self.hot_rw_k_target_limit
+        )
+        pressure_gate_high = background_high or queue_high
+        pressure_high = convoy_high and pressure_gate_high
+        retry_low = int(features.retry_count) <= LOW_AGENT_RETRY_COUNT
+        with self._bp_mode_lock:
+            entered = False
+            exited_after_decision = False
+            if not self._bp_mode_active and pressure_high and retry_low:
+                self._bp_mode_active = True
+                self._bp_mode_windows = 0
+                entered = True
+
+            active_for_decision = bool(self._bp_mode_active)
+            if active_for_decision:
+                self._bp_mode_windows += 1
+                windows = int(self._bp_mode_windows)
+                if not pressure_high and windows >= self.bp_min_windows:
+                    self._bp_mode_active = False
+                    self._bp_mode_windows = 0
+                    exited_after_decision = True
+            else:
+                windows = 0
+
+        return {
+            "active": active_for_decision,
+            "entered": entered,
+            "exited_after_decision": exited_after_decision,
+            "windows": windows,
+            "pressure_high": pressure_high,
+            "background_high": background_high,
+            "queue_high": queue_high,
+            "queue_pressure": queue_pressure,
+            "convoy_high": convoy_high,
+            "convoy_queue_target_count": int(features.reservation_convoy_queue_target_count),
+            "convoy_front_waiter_count": int(features.reservation_convoy_front_waiter_count),
+            "convoy_pressure": int(features.reservation_convoy_pressure),
+            "pressure_gate_high": pressure_gate_high,
+            "retry_low": retry_low,
+        }
+
+    def _inactive_bp_mode(self, features: ATCCFeatures) -> dict[str, object]:
+        return {
+            "active": False,
+            "entered": False,
+            "exited_after_decision": False,
+            "windows": 0,
+            "pressure_high": False,
+            "background_high": False,
+            "queue_high": False,
+            "queue_pressure": int(features.reservation_queue_pressure),
+            "convoy_high": False,
+            "convoy_queue_target_count": int(features.reservation_convoy_queue_target_count),
+            "convoy_front_waiter_count": int(features.reservation_convoy_front_waiter_count),
+            "convoy_pressure": int(features.reservation_convoy_pressure),
+            "pressure_gate_high": False,
+            "retry_low": int(features.retry_count) <= LOW_AGENT_RETRY_COUNT,
+        }
 
     def plan(self, txn: Any) -> CCPlan:
         decision = decision_from_preplan(txn) or self.decide(extract_features(txn))
@@ -413,6 +580,79 @@ def read_stale_risk_score(features: ATCCFeatures) -> int:
     return score
 
 
+def hot_rw_k_targets(features: ATCCFeatures, *, limit: int) -> tuple[str, ...]:
+    cap = max(1, int(limit))
+    writes = unique_ordered(features.hot_targets)
+    reads = unique_ordered(target for target in features.hot_read_targets if str(target) not in set(writes))
+    ordered = unique_ordered(tuple(writes) + tuple(reads))
+    pressure_aware = (
+        bool(int(features.target_selection_seed))
+        or any(int(features.reservation_queue_lengths.get(target, 0) or 0) > 0 for target in ordered)
+        or bool(set(ordered) & set(features.reservation_owner_targets))
+        or bool(set(ordered) & set(features.reservation_writer_targets))
+    )
+    if not pressure_aware:
+        selected: list[str] = []
+        for target in ordered:
+            if target and target not in selected:
+                selected.append(target)
+            if len(selected) >= cap:
+                break
+        return tuple(selected)
+
+    selected = []
+    write_candidates = sorted(writes, key=lambda target: target_pressure_key(features, target, kind_rank=0))
+    read_candidates = sorted(reads, key=lambda target: target_pressure_key(features, target, kind_rank=1))
+    if write_candidates:
+        selected.append(write_candidates[0])
+    if len(selected) < cap and read_candidates:
+        selected.append(read_candidates[0])
+    remaining = [
+        target
+        for target in sorted(
+            tuple(write_candidates[1:]) + tuple(read_candidates[1:]),
+            key=lambda item: target_pressure_key(
+                features,
+                item,
+                kind_rank=0 if item in set(writes) else 1,
+            ),
+        )
+        if target not in selected
+    ]
+    for target in remaining:
+        selected.append(target)
+        if len(selected) >= cap:
+            break
+    return tuple(selected[:cap])
+
+
+def unique_ordered(values: Any) -> list[str]:
+    ordered: list[str] = []
+    for target in values:
+        text = str(target)
+        if text and text not in ordered:
+            ordered.append(text)
+    return ordered
+
+
+def target_pressure_key(features: ATCCFeatures, target: str, *, kind_rank: int) -> tuple[int, int, int, int]:
+    text = str(target)
+    queue_length = int(features.reservation_queue_lengths.get(text, 0) or 0)
+    active_owner = 1 if text in set(features.reservation_owner_targets) else 0
+    active_writer = 1 if text in set(features.reservation_writer_targets) else 0
+    return (
+        active_owner + active_writer,
+        queue_length,
+        int(kind_rank),
+        stable_target_rank(int(features.target_selection_seed), text),
+    )
+
+
+def stable_target_rank(seed: int, target: str) -> int:
+    payload = f"{int(seed)}:{target}".encode("utf-8", errors="ignore")
+    return int(zlib.crc32(payload) & 0xFFFFFFFF)
+
+
 def risk_bucket(score: int) -> str:
     value = int(score)
     if value <= 2:
@@ -442,5 +682,7 @@ def execution_path(action: str, lock_phase: str) -> str:
     if str(lock_phase) == "before-commit":
         return "deferred-protect"
     if str(lock_phase) == "reserve":
+        if action == RESERVE_HOT_RW_K:
+            return "hot-set-reservation-k"
         return "hot-set-reservation"
     return "early-protect"

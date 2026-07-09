@@ -39,6 +39,15 @@ class MixedMatrixConfig:
     reservation_ttl_s: float = 5.0
     policy: Path | None = None
     policy_mode: str = "eval"
+    atcc_hot_rw_k: int = 3
+    atcc_bp_background_threshold: int = 6
+    atcc_bp_queue_pressure_threshold: int = 2
+    atcc_bp_min_windows: int = 3
+    atcc_agent_guardrail: bool = False
+    atcc_agent_guardrail_queue_threshold: int = 1
+    atcc_full_reservation_fallback_ratio: float = 0.0
+    atcc_pure_policy: bool = False
+    background_admission_cap: int = 0
 
     def normalized(self) -> "MixedMatrixConfig":
         workloads = normalize_names(self.workloads, allowed={"ycsb", "tpcc"}, field="workloads")
@@ -82,6 +91,20 @@ class MixedMatrixConfig:
             raise ValueError("background retry backoff min must be <= max")
         if self.tokens_per_operation <= 0:
             raise ValueError("tokens per operation must be positive")
+        if self.atcc_hot_rw_k <= 0:
+            raise ValueError("ATCC hot-rw-k target limit must be positive")
+        if self.atcc_bp_background_threshold < 0:
+            raise ValueError("ATCC BP background threshold must be non-negative")
+        if self.atcc_bp_queue_pressure_threshold < 0:
+            raise ValueError("ATCC BP queue pressure threshold must be non-negative")
+        if self.atcc_bp_min_windows <= 0:
+            raise ValueError("ATCC BP min windows must be positive")
+        if self.atcc_agent_guardrail_queue_threshold < 0:
+            raise ValueError("ATCC agent guardrail queue threshold must be non-negative")
+        if not 0.0 <= float(self.atcc_full_reservation_fallback_ratio) <= 1.0:
+            raise ValueError("ATCC full reservation fallback ratio must be between 0 and 1")
+        if self.background_admission_cap < 0:
+            raise ValueError("background admission cap must be non-negative")
         background_mode = str(self.background_mode).strip().lower()
         if background_mode not in {"hotspot", "procedure"}:
             raise ValueError(f"unsupported background mode: {self.background_mode}")
@@ -104,6 +127,15 @@ class MixedMatrixConfig:
             reasoning_profile=str(self.reasoning_profile).strip().lower() or "agentic",
             background_mode=background_mode,
             policy_mode=policy_mode,
+            atcc_hot_rw_k=int(self.atcc_hot_rw_k),
+            atcc_bp_background_threshold=int(self.atcc_bp_background_threshold),
+            atcc_bp_queue_pressure_threshold=int(self.atcc_bp_queue_pressure_threshold),
+            atcc_bp_min_windows=int(self.atcc_bp_min_windows),
+            atcc_agent_guardrail=bool(self.atcc_agent_guardrail),
+            atcc_agent_guardrail_queue_threshold=int(self.atcc_agent_guardrail_queue_threshold),
+            atcc_full_reservation_fallback_ratio=float(self.atcc_full_reservation_fallback_ratio),
+            atcc_pure_policy=bool(self.atcc_pure_policy),
+            background_admission_cap=int(self.background_admission_cap),
         )
 
 
@@ -146,6 +178,15 @@ def run_mixed_matrix(config: MixedMatrixConfig) -> Dict[str, Any]:
                             reservation_ttl_s=config.reservation_ttl_s,
                             policy=config.policy,
                             policy_mode=config.policy_mode,
+                            atcc_hot_rw_k=config.atcc_hot_rw_k,
+                            atcc_bp_background_threshold=config.atcc_bp_background_threshold,
+                            atcc_bp_queue_pressure_threshold=config.atcc_bp_queue_pressure_threshold,
+                            atcc_bp_min_windows=config.atcc_bp_min_windows,
+                            atcc_agent_guardrail=config.atcc_agent_guardrail,
+                            atcc_agent_guardrail_queue_threshold=config.atcc_agent_guardrail_queue_threshold,
+                            atcc_full_reservation_fallback_ratio=config.atcc_full_reservation_fallback_ratio,
+                            atcc_pure_policy=config.atcc_pure_policy,
+                            background_admission_cap=config.background_admission_cap,
                         )
                     )
                     for row in report["cc_results"]:
@@ -191,6 +232,15 @@ def run_mixed_matrix(config: MixedMatrixConfig) -> Dict[str, Any]:
         "background_mode": config.background_mode,
         "policy_mode": config.policy_mode,
         "policy": str(config.policy) if config.policy else "",
+        "atcc_hot_rw_k": int(config.atcc_hot_rw_k),
+        "atcc_bp_background_threshold": int(config.atcc_bp_background_threshold),
+        "atcc_bp_queue_pressure_threshold": int(config.atcc_bp_queue_pressure_threshold),
+        "atcc_bp_min_windows": int(config.atcc_bp_min_windows),
+        "atcc_agent_guardrail": bool(config.atcc_agent_guardrail),
+        "atcc_agent_guardrail_queue_threshold": int(config.atcc_agent_guardrail_queue_threshold),
+        "atcc_full_reservation_fallback_ratio": float(config.atcc_full_reservation_fallback_ratio),
+        "atcc_pure_policy": bool(config.atcc_pure_policy),
+        "background_admission_cap": int(config.background_admission_cap),
         "paper_figures": paper_figure_rows(summary),
         "summary": summary,
         "runs": runs,
@@ -229,6 +279,19 @@ def summarize_runs(runs: Sequence[Dict[str, Any]]) -> list[Dict[str, Any]]:
             "background_workers": int(rows[0].get("background_workers", 0) or 0),
             "cc": cc,
             "runs": len(rows),
+            "atcc_hot_rw_k": int(rows[0].get("atcc_hot_rw_k", 0) or 0),
+            "atcc_bp_background_threshold": int(rows[0].get("atcc_bp_background_threshold", 0) or 0),
+            "atcc_bp_queue_pressure_threshold": int(rows[0].get("atcc_bp_queue_pressure_threshold", 0) or 0),
+            "atcc_bp_min_windows": int(rows[0].get("atcc_bp_min_windows", 0) or 0),
+            "atcc_agent_guardrail": bool(rows[0].get("atcc_agent_guardrail", False)),
+            "atcc_agent_guardrail_queue_threshold": int(
+                rows[0].get("atcc_agent_guardrail_queue_threshold", 0) or 0
+            ),
+            "atcc_full_reservation_fallback_ratio": float(
+                rows[0].get("atcc_full_reservation_fallback_ratio", 0.0) or 0.0
+            ),
+            "atcc_pure_policy": bool(rows[0].get("atcc_pure_policy", False)),
+            "background_admission_cap": int(rows[0].get("background_admission_cap", 0) or 0),
             "agent_tps_mean": average(agent_tps),
             "agent_tps_std": stddev(agent_tps),
             "total_tps_mean": average(total_tps),
@@ -252,6 +315,8 @@ def summarize_runs(runs: Sequence[Dict[str, Any]]) -> list[Dict[str, Any]]:
             "background_aborts_mean": average(row_float(rows, "background_aborts")),
             "wasted_reasoning_ms_mean": average(row_float(rows, "wasted_reasoning_ms")),
         }
+        for metric in diagnostic_metric_keys():
+            row[f"{metric}_mean"] = average(row_float(rows, metric))
         row["agent_tps_speedup_vs_occ"] = safe_ratio(row["agent_tps_mean"], baseline.get("agent_tps", 0.0))
         row["total_tps_speedup_vs_occ"] = safe_ratio(row["total_tps_mean"], baseline.get("total_tps", 0.0))
         row["background_tps_ratio_vs_occ"] = safe_ratio(row["background_tps_mean"], baseline.get("background_tps", 0.0))
@@ -266,6 +331,53 @@ def summarize_runs(runs: Sequence[Dict[str, Any]]) -> list[Dict[str, Any]]:
         )
         summary.append(row)
     return summary
+
+
+def diagnostic_metric_keys() -> tuple[str, ...]:
+    return (
+        "agent_task_guard_wait_ms_mean",
+        "agent_task_guard_wait_ms_p50",
+        "agent_task_guard_wait_ms_p95",
+        "agent_task_guard_wait_ms_p99",
+        "agent_task_guard_wait_ms_max",
+        "reservation_waiter_count",
+        "reservation_unique_target_count",
+        "reservation_waiter_target_set_size_mean",
+        "reservation_waiter_target_set_size_p50",
+        "reservation_waiter_target_set_size_p95",
+        "reservation_waiter_target_set_size_p99",
+        "reservation_waiter_target_set_size_max",
+        "reservation_all_or_nothing_failed_grant_checks",
+        "reservation_all_or_nothing_not_front_wait_ms",
+        "reservation_front_queue_wait_ms",
+        "reservation_owner_blocked_checks",
+        "reservation_writer_blocked_checks",
+        "reservation_blocked_target_checks",
+        "background_writer_waiter_blocked_checks",
+        "background_writer_waiter_blocked_targets",
+        "background_writer_reservation_blocked_checks",
+        "reserve_read_write_set_attempts",
+        "reserve_read_write_set_target_size_mean",
+        "reserve_read_write_set_target_size_p50",
+        "reserve_read_write_set_target_size_p95",
+        "reserve_read_write_set_target_size_p99",
+        "reserve_read_write_set_target_size_max",
+        "reserve_read_write_set_hot_target_count_mean",
+        "reserve_read_write_set_hot_target_count_p50",
+        "reserve_read_write_set_hot_target_count_p95",
+        "reserve_read_write_set_hot_target_count_p99",
+        "reserve_read_write_set_hot_target_count_max",
+        "reserve_read_write_set_hot_coverage_ratio_mean",
+        "reserve_read_write_set_unique_target_count",
+        "reserve_read_write_set_unique_hot_target_count",
+        "reserve_hot_rw_k_attempts",
+        "reserve_hot_rw_k_target_size_mean",
+        "reserve_hot_rw_k_target_size_p50",
+        "reserve_hot_rw_k_target_size_p95",
+        "reserve_hot_rw_k_target_size_p99",
+        "reserve_hot_rw_k_target_size_max",
+        "reserve_hot_rw_k_unique_target_count",
+    )
 
 
 def effective_client_counts(config: MixedMatrixConfig) -> tuple[int, ...]:

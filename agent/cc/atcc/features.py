@@ -24,6 +24,16 @@ class ATCCFeatures:
     phase_count: int = 0
     reasoning_delay_ms: int = 0
     retry_delay_ms: int = 0
+    background_workers: int = 0
+    reservation_queue_lengths: Dict[str, int] = dataclasses.field(default_factory=dict)
+    reservation_owner_targets: Tuple[str, ...] = ()
+    reservation_writer_targets: Tuple[str, ...] = ()
+    reservation_waiter_count_current: int = 0
+    reservation_convoy_active: bool = False
+    reservation_convoy_queue_target_count: int = 0
+    reservation_convoy_front_waiter_count: int = 0
+    reservation_convoy_pressure: int = 0
+    target_selection_seed: int = 0
 
     @property
     def state_key(self) -> str:
@@ -48,6 +58,15 @@ class ATCCFeatures:
     def hot_access_count(self) -> int:
         return len(set(self.hot_targets) | set(self.hot_read_targets))
 
+    @property
+    def reservation_max_queue_length(self) -> int:
+        values = [int(value) for value in self.reservation_queue_lengths.values()]
+        return max(values) if values else 0
+
+    @property
+    def reservation_queue_pressure(self) -> int:
+        return max(int(self.reservation_waiter_count_current), self.reservation_max_queue_length)
+
 
 def extract_features(txn: Any) -> ATCCFeatures:
     metadata = dict(getattr(txn, "metadata", {}) or {})
@@ -68,6 +87,16 @@ def extract_features(txn: Any) -> ATCCFeatures:
         phase_count=int(agentic.get("phase_count", 0) or 0),
         reasoning_delay_ms=int(agentic.get("reasoning_delay_ms", 0) or 0),
         retry_delay_ms=int(agentic.get("retry_delay_ms", 0) or 0),
+        background_workers=int(agentic.get("background_workers", 0) or 0),
+        reservation_queue_lengths=normalized_queue_lengths(agentic.get("reservation_queue_lengths", {})),
+        reservation_owner_targets=unique_targets(agentic.get("reservation_owner_targets", ()) or ()),
+        reservation_writer_targets=unique_targets(agentic.get("reservation_writer_targets", ()) or ()),
+        reservation_waiter_count_current=int(agentic.get("reservation_waiter_count_current", 0) or 0),
+        reservation_convoy_active=bool(agentic.get("reservation_convoy_active", False)),
+        reservation_convoy_queue_target_count=int(agentic.get("reservation_convoy_queue_target_count", 0) or 0),
+        reservation_convoy_front_waiter_count=int(agentic.get("reservation_convoy_front_waiter_count", 0) or 0),
+        reservation_convoy_pressure=int(agentic.get("reservation_convoy_pressure", 0) or 0),
+        target_selection_seed=int(agentic.get("target_selection_seed", 0) or 0),
         hot_targets=hot_targets,
         hot_read_targets=hot_reads,
         write_targets=write_targets,
@@ -107,11 +136,37 @@ def extract_task_features(
         phase_count=int(agentic.get("phase_count", 0) or 0),
         reasoning_delay_ms=int(agentic.get("reasoning_delay_ms", 0) or 0),
         retry_delay_ms=int(agentic.get("retry_delay_ms", 0) or 0),
+        background_workers=int(agentic.get("background_workers", 0) or 0),
+        reservation_queue_lengths=normalized_queue_lengths(agentic.get("reservation_queue_lengths", {})),
+        reservation_owner_targets=unique_targets(agentic.get("reservation_owner_targets", ()) or ()),
+        reservation_writer_targets=unique_targets(agentic.get("reservation_writer_targets", ()) or ()),
+        reservation_waiter_count_current=int(agentic.get("reservation_waiter_count_current", 0) or 0),
+        reservation_convoy_active=bool(agentic.get("reservation_convoy_active", False)),
+        reservation_convoy_queue_target_count=int(agentic.get("reservation_convoy_queue_target_count", 0) or 0),
+        reservation_convoy_front_waiter_count=int(agentic.get("reservation_convoy_front_waiter_count", 0) or 0),
+        reservation_convoy_pressure=int(agentic.get("reservation_convoy_pressure", 0) or 0),
+        target_selection_seed=int(agentic.get("target_selection_seed", 0) or 0),
         hot_targets=hot_targets,
         hot_read_targets=hot_reads,
         write_targets=write_targets,
         read_targets=read_targets,
     )
+
+
+def normalized_queue_lengths(value: Any) -> Dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    rows: Dict[str, int] = {}
+    for key, raw_count in value.items():
+        text = str(key)
+        if not text:
+            continue
+        try:
+            count = int(raw_count)
+        except (TypeError, ValueError):
+            continue
+        rows[text] = max(0, count)
+    return rows
 
 
 def hot_write_targets(txn: Any) -> Tuple[str, ...]:

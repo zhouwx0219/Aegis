@@ -11,6 +11,7 @@ WRITE_VALIDATE = "write-validate"
 LOCK_HOT = "lock-hot"
 RESERVE_HOT = "reserve-hot"
 RESERVE_HOT_RW = "reserve-hot-rw"
+RESERVE_HOT_RW_K = "reserve-hot-rw-k"
 RESERVE_READ_WRITE_SET = "reserve-read-write-set"
 LOCK_WRITE_SET = "lock-write-set"
 LOCK_BEFORE_COMMIT = "lock-before-commit"
@@ -37,6 +38,12 @@ MIXED_TRAINABLE_ACTIONS: Tuple[str, ...] = (
     LOCK_BEFORE_COMMIT,
     RETRY_PROTECT,
 )
+
+RUNTIME_ACTIONS: Tuple[str, ...] = (
+    RESERVE_HOT_RW_K,
+)
+
+KNOWN_ACTIONS = set(TRAINABLE_ACTIONS) | set(RUNTIME_ACTIONS)
 
 LEGACY_ACTIONS = {
     "protect": LOCK_WRITE_SET,
@@ -73,7 +80,7 @@ class ATCCActionSpec:
 def normalize_action(action: str) -> str:
     normalized = str(action).strip().lower().replace("_", "-")
     normalized = LEGACY_ACTIONS.get(normalized, normalized)
-    if normalized not in TRAINABLE_ACTIONS:
+    if normalized not in KNOWN_ACTIONS:
         return OCC
     return normalized
 
@@ -88,6 +95,8 @@ def action_spec(action: str, *, retry_count: int = 0) -> ATCCActionSpec:
         return ATCCActionSpec(normalized, lock_scope="hot", lock_phase="reserve")
     if normalized == RESERVE_HOT_RW:
         return ATCCActionSpec(normalized, lock_scope="hot-rw", lock_phase="reserve")
+    if normalized == RESERVE_HOT_RW_K:
+        return ATCCActionSpec(normalized, lock_scope="hot-rw-k", lock_phase="reserve")
     if normalized == RESERVE_READ_WRITE_SET:
         return ATCCActionSpec(normalized, lock_scope="read-write-set", lock_phase="reserve")
     if normalized == LOCK_WRITE_SET:

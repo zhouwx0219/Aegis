@@ -44,6 +44,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--background-wait", action="store_true")
     parser.add_argument("--background-mode", choices=("hotspot", "procedure"), default="hotspot")
     parser.add_argument("--reservation-ttl-s", type=float, default=5.0)
+    parser.add_argument("--atcc-hot-rw-k", type=int, default=3)
+    parser.add_argument("--atcc-bp-background-threshold", type=int, default=6)
+    parser.add_argument("--atcc-bp-queue-pressure-threshold", type=int, default=2)
+    parser.add_argument("--atcc-bp-min-windows", type=int, default=3)
+    parser.add_argument("--atcc-agent-guardrail", action="store_true")
+    parser.add_argument("--atcc-agent-guardrail-queue-threshold", type=int, default=1)
+    parser.add_argument("--atcc-full-reservation-fallback-ratio", type=float, default=0.0)
+    parser.add_argument(
+        "--atcc-pure-policy",
+        action="store_true",
+        help="Execute trained ATCC policy actions directly, bypassing runtime guards and post-policy overrides.",
+    )
+    parser.add_argument("--background-admission-cap", type=int, default=0)
     parser.add_argument("--policy", type=Path)
     parser.add_argument(
         "--policy-mode",
@@ -91,6 +104,15 @@ def main(
             reservation_ttl_s=args.reservation_ttl_s,
             policy=args.policy,
             policy_mode=policy_mode,
+            atcc_hot_rw_k=args.atcc_hot_rw_k,
+            atcc_bp_background_threshold=args.atcc_bp_background_threshold,
+            atcc_bp_queue_pressure_threshold=args.atcc_bp_queue_pressure_threshold,
+            atcc_bp_min_windows=args.atcc_bp_min_windows,
+            atcc_agent_guardrail=args.atcc_agent_guardrail,
+            atcc_agent_guardrail_queue_threshold=args.atcc_agent_guardrail_queue_threshold,
+            atcc_full_reservation_fallback_ratio=args.atcc_full_reservation_fallback_ratio,
+            atcc_pure_policy=args.atcc_pure_policy,
+            background_admission_cap=args.background_admission_cap,
         )
     )
     payload = json.dumps(report, indent=2, sort_keys=True)

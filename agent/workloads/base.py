@@ -88,6 +88,7 @@ def prepare_task_transaction(
             "context": context,
             "retry_count": int(context.get("retry_count", 0) or 0),
         },
+        snapshot_object_ids=tuple(operation.object_id for operation in task.operations),
     )
     populate_task_transaction(txn, task)
     return txn

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Mapping
 
 from agent.cc.atcc import (
     ATCCPolicyTable,
@@ -22,9 +22,15 @@ from agent.cc.traditional import (
 class ConcurrencyControlRegistry:
     """Named CC registry with explicit all-strategy expansion."""
 
-    def __init__(self, *, atcc_policy: ATCCPolicyTable | None = None):
+    def __init__(
+        self,
+        *,
+        atcc_policy: ATCCPolicyTable | None = None,
+        atcc_options: Mapping[str, Any] | None = None,
+    ):
         self._strategies: Dict[str, ConcurrencyControl] = {}
         policy = atcc_policy or ATCCPolicyTable()
+        atcc_kwargs = dict(atcc_options or {})
         for strategy in (
             OccConcurrencyControl(),
             TwoPhaseLockingConcurrencyControl("2pl-nowait", "nowait"),
@@ -32,37 +38,46 @@ class ConcurrencyControlRegistry:
             MvccConcurrencyControl(),
             SiloConcurrencyControl(),
             TicTocConcurrencyControl(),
-            DynamicATCC(policy=policy),
+            DynamicATCC(policy=policy, **atcc_kwargs),
             DynamicATCC(
                 name="static-atcc",
                 policy=ATCCPolicyTable(),
                 decision_mode="static",
                 priority_enabled=False,
+                **atcc_kwargs,
             ),
             DynamicATCC(
                 name="static-atcc-priority",
                 policy=ATCCPolicyTable(),
                 decision_mode="static",
                 priority_enabled=True,
+                **atcc_kwargs,
             ),
             DynamicATCC(
                 name="trained-atcc",
                 policy=policy,
                 priority_enabled=False,
+                **atcc_kwargs,
             ),
             DynamicATCC(
                 name="trained-atcc-priority",
                 policy=policy,
                 priority_enabled=True,
+                **atcc_kwargs,
             ),
         ):
             self.register(strategy)
 
     @classmethod
-    def from_policy_file(cls, path: str | Path | None) -> "ConcurrencyControlRegistry":
+    def from_policy_file(
+        cls,
+        path: str | Path | None,
+        *,
+        atcc_options: Mapping[str, Any] | None = None,
+    ) -> "ConcurrencyControlRegistry":
         if path is None or str(path).strip() == "":
-            return cls()
-        return cls(atcc_policy=ATCCPolicyTable.load_json(Path(path)))
+            return cls(atcc_options=atcc_options)
+        return cls(atcc_policy=ATCCPolicyTable.load_json(Path(path)), atcc_options=atcc_options)
 
     def register(self, strategy: ConcurrencyControl) -> None:
         name = normalize_name(strategy.name)
