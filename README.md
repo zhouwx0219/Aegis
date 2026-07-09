@@ -1,6 +1,6 @@
-# CAST-DAS
+# Aegis
 
-CAST-DAS is a minimal research prototype for a Data Agent System transaction
+Aegis is a minimal research prototype for a Data Agent System transaction
 runtime.  The storage backend exposes versioned KV primitives, while the
 agent-side runtime owns transaction semantics, candidate plans, concurrency
 control selection, commit orchestration, and retry behavior.
