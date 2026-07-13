@@ -168,6 +168,7 @@ class AgentTransactionManager:
         store: Optional[Any] = None,
         cc_registry: Optional[ConcurrencyControlRegistry] = None,
         atcc_policy: Optional[Any] = None,
+        record_traces: bool = True,
     ):
         self.store = store if store is not None else cc.Dbx1000VersionedKVStore()
         self.cc_registry = cc_registry or ConcurrencyControlRegistry(atcc_policy=atcc_policy)
@@ -177,6 +178,7 @@ class AgentTransactionManager:
         self._lock = threading.RLock()
         self._catalog: Dict[str, Any] = {}
         self._traces: list[Dict[str, Any]] = []
+        self._record_traces = bool(record_traces)
 
     @property
     def backend_name(self) -> str:
@@ -199,8 +201,7 @@ class AgentTransactionManager:
         *,
         snapshot_object_ids: Optional[Iterable[str]] = None,
     ) -> AgentTransaction:
-        with self._lock:
-            snapshot = self._snapshot_locked(snapshot_object_ids)
+        snapshot = self._snapshot_locked(snapshot_object_ids)
         return AgentTransaction(self, str(task_id), snapshot, metadata)
 
     def commit(self, txn: AgentTransaction, *, strategy: str = "occ") -> TransactionResult:
@@ -286,8 +287,7 @@ class AgentTransactionManager:
         for write in txn.write_set.values():
             checks.append((write.object_id, int(write.base_version)))
         writes = [(write.object_id, write.value) for write in txn.write_set.values()]
-        with self._lock:
-            ok = self.store.batch_put_if_version(checks, writes)
+        ok = self.store.batch_put_if_version(checks, writes)
         if not ok:
             result = self._finish_abort(
                 txn,
@@ -391,6 +391,8 @@ class AgentTransactionManager:
             return {object_id: self.store.get(object_id).value for object_id in self._catalog}
 
     def _record(self, txn: AgentTransaction) -> None:
+        if not self._record_traces:
+            return
         with self._lock:
             self._traces.append(txn.to_trace())
 

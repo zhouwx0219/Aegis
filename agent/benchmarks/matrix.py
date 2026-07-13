@@ -18,7 +18,7 @@ class MixedMatrixConfig:
     client_counts: tuple[int, ...] = ()
     workload_profile: str = "small"
     ycsb_zipf_theta: float | None = None
-    cc: str = "occ,2pl-nowait,2pl-wait-die,mvcc,silo,tictoc,dynamic-atcc"
+    cc: str = "occ,2pl-nowait,2pl-wait-die,mvcc,silo,tictoc,bamboo,polaris,dynamic-atcc"
     duration_s: float = 3.0
     agent_workers: int = 2
     background_workers: int = 8
@@ -296,6 +296,11 @@ def summarize_runs(runs: Sequence[Dict[str, Any]]) -> list[Dict[str, Any]]:
             "agent_tps_std": stddev(agent_tps),
             "total_tps_mean": average(total_tps),
             "total_tps_std": stddev(total_tps),
+            "bottom_txn_attempt_tps_mean": average(row_float(rows, "bottom_txn_attempt_tps")),
+            "bottom_txn_commit_tps_mean": average(row_float(rows, "bottom_txn_commit_tps")),
+            "underlying_txn_attempt_tps_mean": average(row_float(rows, "underlying_txn_attempt_tps")),
+            "underlying_txn_commit_tps_mean": average(row_float(rows, "underlying_txn_commit_tps")),
+            "native_throughput_mean": average(row_float(rows, "native_throughput")),
             "background_tps_mean": average(background_tps),
             "background_tps_std": stddev(background_tps),
             "agent_commit_rate_mean": average(commit_rates),
@@ -356,6 +361,9 @@ def diagnostic_metric_keys() -> tuple[str, ...]:
         "background_writer_waiter_blocked_checks",
         "background_writer_waiter_blocked_targets",
         "background_writer_reservation_blocked_checks",
+        "version_conflict_count",
+        "guarded_conflict_checks",
+        "conflict_pressure_count",
         "reserve_read_write_set_attempts",
         "reserve_read_write_set_target_size_mean",
         "reserve_read_write_set_target_size_p50",

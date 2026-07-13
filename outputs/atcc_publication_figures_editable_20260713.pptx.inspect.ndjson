@@ -1,0 +1,229 @@
+{"kind":"deck","id":"pr/bj50z4","name":"Deck"}
+{"kind":"layout","layoutId":"8ab603b8-eb7c-467d-a21b-d8bbb758b7c7","name":"Master","type":"master"}
+{"kind":"layout","layoutId":"26168175-c07b-4018-afeb-480810c7fa26","name":"Title Slide","type":"title"}
+{"kind":"slide","id":"sl/pqm9k2","slide":1,"title":"OCC","textShapes":15}
+{"kind":"shape","id":"sh/y18bilsv","slide":1,"name":"leg-line-OCC","bbox":[34,25,24,0]}
+{"kind":"shape","id":"sh/lozatgb6","slide":1,"name":"leg-mark-OCC","bbox":[43,21,8,8]}
+{"kind":"textbox","id":"sh/knqtkbal","slide":1,"name":"leg-OCC","text":"OCC","textPreview":"OCC","textChars":3,"textLines":1,"bbox":[62,15,145,20]}
+{"kind":"shape","id":"sh/byxsn6t4","slide":1,"name":"leg-line-2PL-nowait","bbox":[212,25,24,0]}
+{"kind":"shape","id":"sh/axobe1sj","slide":1,"name":"leg-mark-2PL-nowait","bbox":[221,21,8,8]}
+{"kind":"textbox","id":"sh/x0fapgba","slide":1,"name":"leg-2PL-nowait","text":"2PL-nowait","textPreview":"2PL-nowait","textChars":10,"textLines":1,"bbox":[240,15,145,20]}
+{"kind":"shape","id":"sh/wz6tgbap","slide":1,"name":"leg-line-2PL-wait-die","bbox":[390,25,24,0]}
+{"kind":"shape","id":"sh/vu1czat8","slide":1,"name":"leg-mark-2PL-wait-die","bbox":[399,21,8,8]}
+{"kind":"textbox","id":"sh/utsbq5s3","slide":1,"name":"leg-2PL-wait-die","text":"2PL-wait-die","textPreview":"2PL-wait-die","textChars":12,"textLines":1,"bbox":[418,15,145,20]}
+{"kind":"shape","id":"sh/wrux0rq1","slide":1,"name":"leg-line-MVCC","bbox":[568,25,24,0]}
+{"kind":"shape","id":"sh/hs3ytw7m","slide":1,"name":"leg-mark-MVCC","bbox":[577,21,8,8]}
+{"kind":"textbox","id":"sh/upcfy18b","slide":1,"name":"leg-MVCC","text":"MVCC","textPreview":"MVCC","textChars":4,"textLines":1,"bbox":[596,15,145,20]}
+{"kind":"shape","id":"sh/vqlgrmpg","slide":1,"name":"leg-line-Silo","bbox":[746,25,24,0]}
+{"kind":"shape","id":"sh/83axwrq5","slide":1,"name":"leg-mark-Silo","bbox":[755,21,8,8]}
+{"kind":"textbox","id":"sh/943ypw7q","slide":1,"name":"leg-Silo","text":"Silo","textPreview":"Silo","textChars":4,"textLines":1,"bbox":[774,15,145,20]}
+{"kind":"shape","id":"sh/m1sfuh8z","slide":1,"name":"leg-line-TicToc","bbox":[34,51,24,0]}
+{"kind":"shape","id":"sh/721gnmpk","slide":1,"name":"leg-mark-TicToc","bbox":[43,47,8,8]}
+{"kind":"textbox","id":"sh/kzaxs7qt","slide":1,"name":"leg-TicToc","text":"TicToc","textPreview":"TicToc","textChars":6,"textLines":1,"bbox":[62,41,145,20]}
+{"kind":"shape","id":"sh/l0jylc7e","slide":1,"name":"leg-line-Bamboo","bbox":[212,51,24,0]}
+{"kind":"shape","id":"sh/1krm94v6","slide":1,"name":"leg-mark-Bamboo","bbox":[221,47,8,8]}
+{"kind":"textbox","id":"sh/0ji50zel","slide":1,"name":"leg-Bamboo","text":"Bamboo","textPreview":"Bamboo","textChars":6,"textLines":1,"bbox":[240,41,145,20]}
+{"kind":"shape","id":"sh/fi947ex0","slide":1,"name":"leg-line-Polaris","bbox":[390,51,24,0]}
+{"kind":"shape","id":"sh/eh0ny9wf","slide":1,"name":"leg-mark-Polaris","bbox":[399,47,8,8]}
+{"kind":"textbox","id":"sh/dgrm54fu","slide":1,"name":"leg-Polaris","text":"Polaris","textPreview":"Polaris","textChars":7,"textLines":1,"bbox":[418,41,145,20]}
+{"kind":"shape","id":"sh/sfy5wze9","slide":1,"name":"leg-line-ATCC","bbox":[568,51,24,0]}
+{"kind":"shape","id":"sh/rep43ux4","slide":1,"name":"leg-mark-ATCC","bbox":[577,47,8,8]}
+{"kind":"textbox","id":"sh/qdg3apwj","slide":1,"name":"leg-ATCC","text":"ATCC","textPreview":"ATCC","textChars":4,"textLines":1,"bbox":[596,41,145,20]}
+{"kind":"textbox","id":"sh/uxwj2lcb","slide":1,"name":"panel-a","text":"(a) Agent transaction throughput","textPreview":"(a) Agent transaction throughput","textChars":32,"textLines":1,"bbox":[40,306,420,25]}
+{"kind":"textbox","id":"sh/vi5kbqdw","slide":1,"name":"panel-b","text":"(b) Transaction throughput","textPreview":"(b) Transaction throughput","textChars":26,"textLines":1,"bbox":[500,306,420,25]}
+{"kind":"textbox","id":"sh/mtcjylcz","slide":1,"name":"panel-c","text":"(c) Estimated tokens per agent transaction","textPreview":"(c) Estimated tokens per agent transaction","textChars":42,"textLines":1,"bbox":[32,582,436,25]}
+{"kind":"textbox","id":"sh/7ulk7qdk","slide":1,"name":"panel-d","text":"(d) Latency distribution at 40 clients","textPreview":"(d) Latency distribution at 40 clients","textChars":38,"textLines":1,"bbox":[492,582,436,25]}
+{"kind":"textbox","id":"sh/8vu10bu5","slide":1,"name":"figure-caption","text":"Results when varying the number of clients (YCSB Low-Contention).","textPreview":"Results when varying the number of clients (YCSB Low-Contention).","textChars":65,"textLines":1,"bbox":[40,628,880,34]}
+{"kind":"textbox","id":"sh/9w329gvq","slide":1,"name":"method-note","text":"All-agent · fixed trace replay · mean of 3 seeds · warmup 2 s · measure 10 s","textPreview":"All-agent · fixed trace replay · mean of 3 seeds · warmup 2 s · measure 10 s","textChars":76,"textLines":1,"bbox":[40,666,880,22]}
+{"kind":"chart","id":"ch/lwnulsfa","slide":1,"name":"","chartType":"line","bbox":[40,74,420,230]}
+{"kind":"chart","id":"ch/kvedcnep","slide":1,"name":"","chartType":"line","bbox":[500,74,420,230]}
+{"kind":"chart","id":"ch/476hsvq1","slide":1,"name":"","chartType":"line","bbox":[40,350,420,230]}
+{"kind":"chart","id":"ch/58fil0rm","slide":1,"name":"","chartType":"line","bbox":[500,350,420,230]}
+{"kind":"notes","id":"nt/pqm9k2","slide":1,"text":""}
+{"kind":"slide","id":"sl/qqqroz","slide":2,"title":"OCC","textShapes":15}
+{"kind":"shape","id":"sh/i1kv2pcz","slide":2,"name":"leg-line-OCC","bbox":[34,25,24,0]}
+{"kind":"shape","id":"sh/5ovux4va","slide":2,"name":"leg-mark-OCC","bbox":[43,21,8,8]}
+{"kind":"textbox","id":"sh/knmd4zu5","slide":2,"name":"leg-OCC","text":"OCC","textPreview":"OCC","textChars":3,"textLines":1,"bbox":[62,15,145,20]}
+{"kind":"shape","id":"sh/vytcrud8","slide":2,"name":"leg-line-2PL-nowait","bbox":[212,25,24,0]}
+{"kind":"shape","id":"sh/axkvypcn","slide":2,"name":"leg-mark-2PL-nowait","bbox":[221,21,8,8]}
+{"kind":"textbox","id":"sh/x0butkve","slide":2,"name":"leg-2PL-nowait","text":"2PL-nowait","textPreview":"2PL-nowait","textChars":10,"textLines":1,"bbox":[240,15,145,20]}
+{"kind":"shape","id":"sh/wz2d0fut","slide":2,"name":"leg-line-2PL-wait-die","bbox":[390,25,24,0]}
+{"kind":"shape","id":"sh/fuxw3eds","slide":2,"name":"leg-mark-2PL-wait-die","bbox":[399,21,8,8]}
+{"kind":"textbox","id":"sh/ut4va9c7","slide":2,"name":"leg-2PL-wait-die","text":"2PL-wait-die","textPreview":"2PL-wait-die","textChars":12,"textLines":1,"bbox":[418,15,145,20]}
+{"kind":"shape","id":"sh/4nidg7m9","slide":2,"name":"leg-line-MVCC","bbox":[568,25,24,0]}
+{"kind":"shape","id":"sh/porepc3e","slide":2,"name":"leg-mark-MVCC","bbox":[577,21,8,8]}
+{"kind":"textbox","id":"sh/2l0vex43","slide":2,"name":"leg-MVCC","text":"MVCC","textPreview":"MVCC","textChars":4,"textLines":1,"bbox":[596,15,145,20]}
+{"kind":"shape","id":"sh/3m9wn2lo","slide":2,"name":"leg-line-Silo","bbox":[746,25,24,0]}
+{"kind":"shape","id":"sh/gjydcnmx","slide":2,"name":"leg-mark-Silo","bbox":[755,21,8,8]}
+{"kind":"textbox","id":"sh/hkrels3i","slide":2,"name":"leg-Silo","text":"Silo","textPreview":"Silo","textChars":4,"textLines":1,"bbox":[774,15,145,20]}
+{"kind":"shape","id":"sh/uhgvax4r","slide":2,"name":"leg-line-TicToc","bbox":[34,51,24,0]}
+{"kind":"shape","id":"sh/fipcj2lc","slide":2,"name":"leg-mark-TicToc","bbox":[43,47,8,8]}
+{"kind":"textbox","id":"sh/8fyd8nm1","slide":2,"name":"leg-TicToc","text":"TicToc","textPreview":"TicToc","textChars":6,"textLines":1,"bbox":[62,41,145,20]}
+{"kind":"shape","id":"sh/tg7uhs3m","slide":2,"name":"leg-line-Bamboo","bbox":[212,51,24,0]}
+{"kind":"shape","id":"sh/9czulofa","slide":2,"name":"leg-mark-Bamboo","bbox":[221,47,8,8]}
+{"kind":"textbox","id":"sh/8bqtcjep","slide":2,"name":"leg-Bamboo","text":"Bamboo","textPreview":"Bamboo","textChars":6,"textLines":1,"bbox":[240,41,145,20]}
+{"kind":"shape","id":"sh/nahsjex4","slide":2,"name":"leg-line-Polaris","bbox":[390,51,24,0]}
+{"kind":"shape","id":"sh/m98ba9wj","slide":2,"name":"leg-mark-Polaris","bbox":[399,47,8,8]}
+{"kind":"textbox","id":"sh/l8fah4fy","slide":2,"name":"leg-Polaris","text":"Polaris","textPreview":"Polaris","textChars":7,"textLines":1,"bbox":[418,41,145,20]}
+{"kind":"shape","id":"sh/0n6t8zet","slide":2,"name":"leg-line-ATCC","bbox":[568,51,24,0]}
+{"kind":"shape","id":"sh/zmxsfux8","slide":2,"name":"leg-mark-ATCC","bbox":[577,47,8,8]}
+{"kind":"textbox","id":"sh/ylob6pwn","slide":2,"name":"leg-ATCC","text":"ATCC","textPreview":"ATCC","textChars":4,"textLines":1,"bbox":[596,41,145,20]}
+{"kind":"textbox","id":"sh/2pkrelcf","slide":2,"name":"panel-a","text":"(a) Agent transaction throughput","textPreview":"(a) Agent transaction throughput","textChars":32,"textLines":1,"bbox":[40,306,420,25]}
+{"kind":"textbox","id":"sh/3qd8nqd0","slide":2,"name":"panel-b","text":"(b) Transaction throughput","textPreview":"(b) Transaction throughput","textChars":26,"textLines":1,"bbox":[500,306,420,25]}
+{"kind":"textbox","id":"sh/elk7alc3","slide":2,"name":"panel-c","text":"(c) Estimated tokens per agent transaction","textPreview":"(c) Estimated tokens per agent transaction","textChars":42,"textLines":1,"bbox":[32,582,436,25]}
+{"kind":"textbox","id":"sh/fmt8jqdo","slide":2,"name":"panel-d","text":"(d) Latency distribution at 40 clients","textPreview":"(d) Latency distribution at 40 clients","textChars":38,"textLines":1,"bbox":[492,582,436,25]}
+{"kind":"textbox","id":"sh/gn2pcvu9","slide":2,"name":"figure-caption","text":"Results when varying the number of clients (YCSB Medium-Contention, Zipfian = 0.7).","textPreview":"Results when varying the number of clients (YCSB Medium-Contention, Zipfian = 0.7).","textChars":83,"textLines":1,"bbox":[40,628,880,34]}
+{"kind":"textbox","id":"sh/1obql0vu","slide":2,"name":"method-note","text":"All-agent · fixed trace replay · mean of 3 seeds · warmup 2 s · measure 10 s","textPreview":"All-agent · fixed trace replay · mean of 3 seeds · warmup 2 s · measure 10 s","textChars":76,"textLines":1,"bbox":[40,666,880,22]}
+{"kind":"chart","id":"ch/poza983q","slide":2,"name":"","chartType":"line","bbox":[40,74,420,230]}
+{"kind":"chart","id":"ch/onqtg325","slide":2,"name":"","chartType":"line","bbox":[500,74,420,230]}
+{"kind":"chart","id":"ch/ojihgveh","slide":2,"name":"","chartType":"line","bbox":[40,350,420,230]}
+{"kind":"chart","id":"ch/9krypgf2","slide":2,"name":"","chartType":"line","bbox":[500,350,420,230]}
+{"kind":"notes","id":"nt/qqqroz","slide":2,"text":""}
+{"kind":"slide","id":"sl/wwja10","slide":3,"title":"OCC","textShapes":15}
+{"kind":"shape","id":"sh/07uho3it","slide":3,"name":"leg-line-OCC","bbox":[34,25,24,0]}
+{"kind":"shape","id":"sh/z6l0fyh8","slide":3,"name":"leg-mark-OCC","bbox":[43,21,8,8]}
+{"kind":"textbox","id":"sh/y5czmt0n","slide":3,"name":"leg-OCC","text":"OCC","textPreview":"OCC","textChars":3,"textLines":1,"bbox":[62,15,145,20]}
+{"kind":"shape","id":"sh/9cnil8za","slide":3,"name":"leg-line-2PL-nowait","bbox":[212,25,24,0]}
+{"kind":"shape","id":"sh/8behs3ip","slide":3,"name":"leg-mark-2PL-nowait","bbox":[221,21,8,8]}
+{"kind":"textbox","id":"sh/na50jih4","slide":3,"name":"leg-2PL-nowait","text":"2PL-nowait","textPreview":"2PL-nowait","textChars":10,"textLines":1,"bbox":[240,15,145,20]}
+{"kind":"shape","id":"sh/m9wzqd0j","slide":3,"name":"leg-line-2PL-wait-die","bbox":[390,25,24,0]}
+{"kind":"shape","id":"sh/x0nipsz6","slide":3,"name":"leg-mark-2PL-wait-die","bbox":[399,21,8,8]}
+{"kind":"textbox","id":"sh/wze1wnil","slide":3,"name":"leg-2PL-wait-die","text":"2PL-wait-die","textPreview":"2PL-wait-die","textChars":12,"textLines":1,"bbox":[418,15,145,20]}
+{"kind":"shape","id":"sh/y9c7qdwn","slide":3,"name":"leg-line-MVCC","bbox":[568,25,24,0]}
+{"kind":"shape","id":"sh/zalojid8","slide":3,"name":"leg-mark-MVCC","bbox":[577,21,8,8]}
+{"kind":"textbox","id":"sh/0beps3ut","slide":3,"name":"leg-MVCC","text":"MVCC","textPreview":"MVCC","textChars":4,"textLines":1,"bbox":[596,15,145,20]}
+{"kind":"shape","id":"sh/lcn6l8ve","slide":3,"name":"leg-line-Silo","bbox":[746,25,24,0]}
+{"kind":"shape","id":"sh/mdw7udcj","slide":3,"name":"leg-mark-Silo","bbox":[755,21,8,8]}
+{"kind":"textbox","id":"sh/ne5onid4","slide":3,"name":"leg-Silo","text":"Silo","textPreview":"Silo","textChars":4,"textLines":1,"bbox":[774,15,145,20]}
+{"kind":"shape","id":"sh/8fepwnup","slide":3,"name":"leg-line-TicToc","bbox":[34,51,24,0]}
+{"kind":"shape","id":"sh/9gnqpsva","slide":3,"name":"leg-mark-TicToc","bbox":[43,47,8,8]}
+{"kind":"textbox","id":"sh/2hsnitwf","slide":3,"name":"leg-TicToc","text":"TicToc","textPreview":"TicToc","textChars":6,"textLines":1,"bbox":[62,41,145,20]}
+{"kind":"shape","id":"sh/3i1obyd0","slide":3,"name":"leg-line-Bamboo","bbox":[212,51,24,0]}
+{"kind":"shape","id":"sh/7axc3qpg","slide":3,"name":"leg-mark-Bamboo","bbox":[221,47,8,8]}
+{"kind":"textbox","id":"sh/69ovul8v","slide":3,"name":"leg-Bamboo","text":"Bamboo","textPreview":"Bamboo","textChars":6,"textLines":1,"bbox":[240,41,145,20]}
+{"kind":"shape","id":"sh/tcfu507m","slide":3,"name":"leg-line-Polaris","bbox":[390,51,24,0]}
+{"kind":"shape","id":"sh/sb6dwvq1","slide":3,"name":"leg-mark-Polaris","bbox":[399,47,8,8]}
+{"kind":"textbox","id":"sh/j6dczqpk","slide":3,"name":"leg-Polaris","text":"Polaris","textPreview":"Polaris","textChars":7,"textLines":1,"bbox":[418,41,145,20]}
+{"kind":"shape","id":"sh/il4vql8z","slide":3,"name":"leg-line-ATCC","bbox":[568,51,24,0]}
+{"kind":"shape","id":"sh/58fu1g7a","slide":3,"name":"leg-mark-ATCC","bbox":[577,47,8,8]}
+{"kind":"textbox","id":"sh/k76dsbq5","slide":3,"name":"leg-ATCC","text":"ATCC","textPreview":"ATCC","textChars":4,"textLines":1,"bbox":[596,41,145,20]}
+{"kind":"textbox","id":"sh/0ni9w76l","slide":3,"name":"panel-a","text":"(a) Agent transaction throughput","textPreview":"(a) Agent transaction throughput","textChars":32,"textLines":1,"bbox":[40,306,420,25]}
+{"kind":"textbox","id":"sh/1oba5cn6","slide":3,"name":"panel-b","text":"(b) Transaction throughput","textPreview":"(b) Transaction throughput","textChars":26,"textLines":1,"bbox":[500,306,420,25]}
+{"kind":"textbox","id":"sh/8r290r6x","slide":3,"name":"panel-c","text":"(c) Estimated tokens per agent transaction","textPreview":"(c) Estimated tokens per agent transaction","textChars":42,"textLines":1,"bbox":[32,582,436,25]}
+{"kind":"textbox","id":"sh/9cba9cn2","slide":3,"name":"panel-d","text":"(d) Latency distribution at 40 clients","textPreview":"(d) Latency distribution at 40 clients","textChars":38,"textLines":1,"bbox":[492,582,436,25]}
+{"kind":"textbox","id":"sh/mpkryhor","slide":3,"name":"figure-caption","text":"Results when varying the number of clients (YCSB Medium-Contention, Zipfian = 0.8).","textPreview":"Results when varying the number of clients (YCSB Medium-Contention, Zipfian = 0.8).","textChars":83,"textLines":1,"bbox":[40,628,880,34]}
+{"kind":"textbox","id":"sh/nqts7m5c","slide":3,"name":"method-note","text":"All-agent · fixed trace replay · mean of 3 seeds · warmup 2 s · measure 10 s","textPreview":"All-agent · fixed trace replay · mean of 3 seeds · warmup 2 s · measure 10 s","textChars":76,"textLines":1,"bbox":[40,666,880,22]}
+{"kind":"chart","id":"ch/nmtkbqxg","slide":3,"name":"","chartType":"line","bbox":[40,74,420,230]}
+{"kind":"chart","id":"ch/2lk32lgv","slide":3,"name":"","chartType":"line","bbox":[500,74,420,230]}
+{"kind":"chart","id":"ch/ydcre9sv","slide":3,"name":"","chartType":"line","bbox":[40,350,420,230]}
+{"kind":"chart","id":"ch/zel8ne9g","slide":3,"name":"","chartType":"line","bbox":[500,350,420,230]}
+{"kind":"notes","id":"nt/wwja10","slide":3,"text":""}
+{"kind":"slide","id":"sl/s918vb","slide":4,"title":"OCC","textShapes":15}
+{"kind":"shape","id":"sh/5kv25kvq","slide":4,"name":"leg-line-OCC","bbox":[34,25,24,0]}
+{"kind":"shape","id":"sh/ih4ju5wz","slide":4,"name":"leg-mark-OCC","bbox":[43,21,8,8]}
+{"kind":"textbox","id":"sh/3idk3adk","slide":4,"name":"leg-OCC","text":"OCC","textPreview":"OCC","textChars":3,"textLines":1,"bbox":[62,15,145,20]}
+{"kind":"shape","id":"sh/s7ml0fuh","slide":4,"name":"leg-line-2PL-nowait","bbox":[212,25,24,0]}
+{"kind":"shape","id":"sh/d8f29kv2","slide":4,"name":"leg-mark-2PL-nowait","bbox":[221,21,8,8]}
+{"kind":"textbox","id":"sh/ql4jypcb","slide":4,"name":"leg-2PL-nowait","text":"2PL-nowait","textPreview":"2PL-nowait","textChars":10,"textLines":1,"bbox":[240,15,145,20]}
+{"kind":"shape","id":"sh/r6dk7adw","slide":4,"name":"leg-line-2PL-wait-die","bbox":[390,25,24,0]}
+{"kind":"shape","id":"sh/8b21ovex","slide":4,"name":"leg-mark-2PL-wait-die","bbox":[399,21,8,8]}
+{"kind":"textbox","id":"sh/9cb2x0vi","slide":4,"name":"leg-2PL-wait-die","text":"2PL-wait-die","textPreview":"2PL-wait-die","textChars":12,"textLines":1,"bbox":[418,15,145,20]}
+{"kind":"shape","id":"sh/9cre1orm","slide":4,"name":"leg-line-MVCC","bbox":[568,25,24,0]}
+{"kind":"shape","id":"sh/8bid83a1","slide":4,"name":"leg-mark-MVCC","bbox":[577,21,8,8]}
+{"kind":"textbox","id":"sh/7a9wzy9g","slide":4,"name":"leg-MVCC","text":"MVCC","textPreview":"MVCC","textChars":4,"textLines":1,"bbox":[596,15,145,20]}
+{"kind":"shape","id":"sh/m90v6tsv","slide":4,"name":"leg-line-Silo","bbox":[746,25,24,0]}
+{"kind":"shape","id":"sh/hgbe58ri","slide":4,"name":"leg-mark-Silo","bbox":[755,21,8,8]}
+{"kind":"textbox","id":"sh/wf2dc3ad","slide":4,"name":"leg-Silo","text":"Silo","textPreview":"Silo","textChars":4,"textLines":1,"bbox":[774,15,145,20]}
+{"kind":"shape","id":"sh/vetw3y9s","slide":4,"name":"leg-line-TicToc","bbox":[34,51,24,0]}
+{"kind":"shape","id":"sh/udkvats7","slide":4,"name":"leg-mark-TicToc","bbox":[43,47,8,8]}
+{"kind":"textbox","id":"sh/54be98ru","slide":4,"name":"leg-TicToc","text":"TicToc","textPreview":"TicToc","textChars":6,"textLines":1,"bbox":[62,41,145,20]}
+{"kind":"shape","id":"sh/432xgna9","slide":4,"name":"leg-line-Bamboo","bbox":[212,51,24,0]}
+{"kind":"shape","id":"sh/o7ahcril","slide":4,"name":"leg-mark-Bamboo","bbox":[221,47,8,8]}
+{"kind":"textbox","id":"sh/p8jylwz6","slide":4,"name":"leg-Bamboo","text":"Bamboo","textPreview":"Bamboo","textChars":6,"textLines":1,"bbox":[240,41,145,20]}
+{"kind":"shape","id":"sh/2lsfah0f","slide":4,"name":"leg-line-Polaris","bbox":[390,51,24,0]}
+{"kind":"shape","id":"sh/3m1gjmh0","slide":4,"name":"leg-mark-Polaris","bbox":[399,47,8,8]}
+{"kind":"textbox","id":"sh/cbuhgrih","slide":4,"name":"leg-Polaris","text":"Polaris","textPreview":"Polaris","textChars":7,"textLines":1,"bbox":[418,41,145,20]}
+{"kind":"shape","id":"sh/dc3ypwz2","slide":4,"name":"leg-line-ATCC","bbox":[568,51,24,0]}
+{"kind":"shape","id":"sh/q9cze10b","slide":4,"name":"leg-mark-ATCC","bbox":[577,47,8,8]}
+{"kind":"textbox","id":"sh/balgn6hw","slide":4,"name":"leg-ATCC","text":"ATCC","textPreview":"ATCC","textChars":4,"textLines":1,"bbox":[596,41,145,20]}
+{"kind":"textbox","id":"sh/vm9szu5s","slide":4,"name":"panel-a","text":"(a) Agent transaction throughput","textPreview":"(a) Agent transaction throughput","textChars":32,"textLines":1,"bbox":[40,306,420,25]}
+{"kind":"textbox","id":"sh/ul0r69o7","slide":4,"name":"panel-b","text":"(b) Transaction throughput","textPreview":"(b) Transaction throughput","textChars":26,"textLines":1,"bbox":[500,306,420,25]}
+{"kind":"textbox","id":"sh/7ipsvu5g","slide":4,"name":"panel-c","text":"(c) Estimated tokens per agent transaction","textPreview":"(c) Estimated tokens per agent transaction","textChars":42,"textLines":1,"bbox":[32,582,436,25]}
+{"kind":"textbox","id":"sh/mhgr2pov","slide":4,"name":"panel-d","text":"(d) Latency distribution at 40 clients","textPreview":"(d) Latency distribution at 40 clients","textChars":38,"textLines":1,"bbox":[492,582,436,25]}
+{"kind":"textbox","id":"sh/9k7ax4nm","slide":4,"name":"figure-caption","text":"Results when varying the number of clients (YCSB High-Contention, Zipfian = 0.99).","textPreview":"Results when varying the number of clients (YCSB High-Contention, Zipfian = 0.99).","textChars":82,"textLines":1,"bbox":[40,628,880,34]}
+{"kind":"textbox","id":"sh/8jy94z61","slide":4,"name":"method-note","text":"All-agent · fixed trace replay · mean of 3 seeds · warmup 2 s · measure 10 s","textPreview":"All-agent · fixed trace replay · mean of 3 seeds · warmup 2 s · measure 10 s","textChars":76,"textLines":1,"bbox":[40,666,880,22]}
+{"kind":"chart","id":"ch/0z2lsrad","slide":4,"name":"","chartType":"line","bbox":[40,74,420,230]}
+{"kind":"chart","id":"ch/10bm1wry","slide":4,"name":"","chartType":"line","bbox":[500,74,420,230]}
+{"kind":"chart","id":"ch/pwj694b6","slide":4,"name":"","chartType":"line","bbox":[40,350,420,230]}
+{"kind":"chart","id":"ch/4vap0za1","slide":4,"name":"","chartType":"line","bbox":[500,350,420,230]}
+{"kind":"notes","id":"nt/s918vb","slide":4,"text":""}
+{"kind":"slide","id":"sl/iw9cw3","slide":5,"title":"OCC","textShapes":13}
+{"kind":"shape","id":"sh/of65kje5","slide":5,"name":"leg-line-OCC","bbox":[34,25,24,0]}
+{"kind":"shape","id":"sh/nexobedk","slide":5,"name":"leg-mark-OCC","bbox":[43,21,8,8]}
+{"kind":"textbox","id":"sh/2doni9wz","slide":5,"name":"leg-OCC","text":"OCC","textPreview":"OCC","textChars":3,"textLines":1,"bbox":[62,15,145,20]}
+{"kind":"shape","id":"sh/xkz6hovm","slide":5,"name":"leg-line-2PL-nowait","bbox":[212,25,24,0]}
+{"kind":"shape","id":"sh/cjq5oje1","slide":5,"name":"leg-mark-2PL-nowait","bbox":[221,21,8,8]}
+{"kind":"textbox","id":"sh/bihofedg","slide":5,"name":"leg-2PL-nowait","text":"2PL-nowait","textPreview":"2PL-nowait","textChars":10,"textLines":1,"bbox":[240,15,145,20]}
+{"kind":"shape","id":"sh/ah8nmtwv","slide":5,"name":"leg-line-2PL-wait-die","bbox":[390,25,24,0]}
+{"kind":"shape","id":"sh/dovm54v2","slide":5,"name":"leg-mark-2PL-wait-die","bbox":[399,21,8,8]}
+{"kind":"textbox","id":"sh/snm5czex","slide":5,"name":"leg-2PL-wait-die","text":"2PL-wait-die","textPreview":"2PL-wait-die","textChars":12,"textLines":1,"bbox":[418,15,145,20]}
+{"kind":"shape","id":"sh/ql4nypoz","slide":5,"name":"leg-line-MVCC","bbox":[568,25,24,0]}
+{"kind":"shape","id":"sh/rmxo7u5k","slide":5,"name":"leg-mark-MVCC","bbox":[577,21,8,8]}
+{"kind":"textbox","id":"sh/sn650z65","slide":5,"name":"leg-MVCC","text":"MVCC","textPreview":"MVCC","textChars":4,"textLines":1,"bbox":[596,15,145,20]}
+{"kind":"shape","id":"sh/dof694nq","slide":5,"name":"leg-line-Silo","bbox":[746,25,24,0]}
+{"kind":"shape","id":"sh/epon29ob","slide":5,"name":"leg-mark-Silo","bbox":[755,21,8,8]}
+{"kind":"textbox","id":"sh/fqxobe5w","slide":5,"name":"leg-Silo","text":"Silo","textPreview":"Silo","textChars":4,"textLines":1,"bbox":[774,15,145,20]}
+{"kind":"shape","id":"sh/0r654z61","slide":5,"name":"leg-line-TicToc","bbox":[34,51,24,0]}
+{"kind":"shape","id":"sh/1sf6d4nm","slide":5,"name":"leg-mark-TicToc","bbox":[43,47,8,8]}
+{"kind":"textbox","id":"sh/md8n69o7","slide":5,"name":"leg-TicToc","text":"TicToc","textPreview":"TicToc","textChars":6,"textLines":1,"bbox":[62,41,145,20]}
+{"kind":"shape","id":"sh/nehofe5s","slide":5,"name":"leg-line-Bamboo","bbox":[212,51,24,0]}
+{"kind":"shape","id":"sh/jih43el0","slide":5,"name":"leg-mark-Bamboo","bbox":[221,47,8,8]}
+{"kind":"textbox","id":"sh/yh8nu9kf","slide":5,"name":"leg-Bamboo","text":"Bamboo","textPreview":"Bamboo","textChars":6,"textLines":1,"bbox":[240,41,145,20]}
+{"kind":"shape","id":"sh/lkjm5o36","slide":5,"name":"leg-line-Polaris","bbox":[390,51,24,0]}
+{"kind":"shape","id":"sh/kjq5wj2l","slide":5,"name":"leg-mark-Polaris","bbox":[399,47,8,8]}
+{"kind":"textbox","id":"sh/buh4zelo","slide":5,"name":"leg-Polaris","text":"Polaris","textPreview":"Polaris","textChars":7,"textLines":1,"bbox":[418,41,145,20]}
+{"kind":"shape","id":"sh/at83q94j","slide":5,"name":"leg-line-ATCC","bbox":[568,51,24,0]}
+{"kind":"shape","id":"sh/xgzm143u","slide":5,"name":"leg-mark-ATCC","bbox":[577,47,8,8]}
+{"kind":"textbox","id":"sh/wfq5sjm9","slide":5,"name":"leg-ATCC","text":"ATCC","textPreview":"ATCC","textChars":4,"textLines":1,"bbox":[596,41,145,20]}
+{"kind":"textbox","id":"sh/svm1wv25","slide":5,"name":"panel-a","text":"(a) Agent transaction throughput","textPreview":"(a) Agent transaction throughput","textChars":32,"textLines":1,"bbox":[50,476,410,28]}
+{"kind":"textbox","id":"sh/dwv2p0jq","slide":5,"name":"panel-b","text":"(b) Transaction throughput","textPreview":"(b) Transaction throughput","textChars":26,"textLines":1,"bbox":[500,476,410,28]}
+{"kind":"textbox","id":"sh/qtkjulkz","slide":5,"name":"figure-caption","text":"Results when varying the number of clients (TPC-C with 100 warehouses).","textPreview":"Results when varying the number of clients (TPC-C with 100 warehouses).","textChars":71,"textLines":1,"bbox":[40,555,880,34]}
+{"kind":"textbox","id":"sh/rudknq1k","slide":5,"name":"method-note","text":"All-agent · fixed trace replay · mean of 3 seeds · warmup 2 s · measure 10 s","textPreview":"All-agent · fixed trace replay · mean of 3 seeds · warmup 2 s · measure 10 s","textChars":76,"textLines":1,"bbox":[40,593,880,22]}
+{"kind":"chart","id":"ch/zylsjyd0","slide":5,"name":"","chartType":"line","bbox":[55,115,400,355]}
+{"kind":"chart","id":"ch/yxcbqtcv","slide":5,"name":"","chartType":"line","bbox":[505,115,400,355]}
+{"kind":"notes","id":"nt/iw9cw3","slide":5,"text":""}
+{"kind":"slide","id":"sl/c8clch","slide":6,"title":"OCC","textShapes":13}
+{"kind":"shape","id":"sh/zu18jy9o","slide":6,"name":"leg-line-OCC","bbox":[34,25,24,0]}
+{"kind":"shape","id":"sh/0vapc3a9","slide":6,"name":"leg-mark-OCC","bbox":[43,21,8,8]}
+{"kind":"textbox","id":"sh/1wjql8ru","slide":6,"name":"leg-OCC","text":"OCC","textPreview":"OCC","textChars":3,"textLines":1,"bbox":[62,15,145,20]}
+{"kind":"shape","id":"sh/mxs7edsf","slide":6,"name":"leg-line-2PL-nowait","bbox":[212,25,24,0]}
+{"kind":"shape","id":"sh/nyl8ni9k","slide":6,"name":"leg-mark-2PL-nowait","bbox":[221,21,8,8]}
+{"kind":"textbox","id":"sh/ozupgna5","slide":6,"name":"leg-2PL-nowait","text":"2PL-nowait","textPreview":"2PL-nowait","textChars":10,"textLines":1,"bbox":[240,15,145,20]}
+{"kind":"shape","id":"sh/903qpsrq","slide":6,"name":"leg-line-2PL-wait-die","bbox":[390,25,24,0]}
+{"kind":"shape","id":"sh/alcrixsb","slide":6,"name":"leg-mark-2PL-wait-die","bbox":[399,21,8,8]}
+{"kind":"textbox","id":"sh/bml8ri9w","slide":6,"name":"leg-2PL-wait-die","text":"2PL-wait-die","textPreview":"2PL-wait-die","textChars":12,"textLines":1,"bbox":[418,15,145,20]}
+{"kind":"shape","id":"sh/7e94falc","slide":6,"name":"leg-line-MVCC","bbox":[568,25,24,0]}
+{"kind":"shape","id":"sh/md0nm54r","slide":6,"name":"leg-mark-MVCC","bbox":[577,21,8,8]}
+{"kind":"textbox","id":"sh/9grmhk3i","slide":6,"name":"leg-MVCC","text":"MVCC","textPreview":"MVCC","textChars":4,"textLines":1,"bbox":[596,15,145,20]}
+{"kind":"shape","id":"sh/8fi5ofmx","slide":6,"name":"leg-line-Silo","bbox":[746,25,24,0]}
+{"kind":"shape","id":"sh/za94ba50","slide":6,"name":"leg-mark-Silo","bbox":[755,21,8,8]}
+{"kind":"textbox","id":"sh/y90ni54v","slide":6,"name":"leg-Silo","text":"Silo","textPreview":"Silo","textChars":4,"textLines":1,"bbox":[774,15,145,20]}
+{"kind":"shape","id":"sh/lcrmd036","slide":6,"name":"leg-line-TicToc","bbox":[34,51,24,0]}
+{"kind":"shape","id":"sh/kbi5kvml","slide":6,"name":"leg-mark-TicToc","bbox":[43,47,8,8]}
+{"kind":"textbox","id":"sh/j6tonulk","slide":6,"name":"leg-TicToc","text":"TicToc","textPreview":"TicToc","textChars":6,"textLines":1,"bbox":[62,41,145,20]}
+{"kind":"shape","id":"sh/i5knup4z","slide":6,"name":"leg-line-Bamboo","bbox":[212,51,24,0]}
+{"kind":"shape","id":"sh/e1o7mto7","slide":6,"name":"leg-mark-Bamboo","bbox":[221,47,8,8]}
+{"kind":"textbox","id":"sh/f2x8fy5s","slide":6,"name":"leg-Bamboo","text":"Bamboo","textPreview":"Bamboo","textChars":6,"textLines":1,"bbox":[240,41,145,20]}
+{"kind":"shape","id":"sh/g36po36d","slide":6,"name":"leg-line-Polaris","bbox":[390,51,24,0]}
+{"kind":"shape","id":"sh/14fqh8ni","slide":6,"name":"leg-mark-Polaris","bbox":[399,47,8,8]}
+{"kind":"textbox","id":"sh/25o7qdo3","slide":6,"name":"leg-Polaris","text":"Polaris","textPreview":"Polaris","textChars":7,"textLines":1,"bbox":[418,41,145,20]}
+{"kind":"shape","id":"sh/36x8jy5o","slide":6,"name":"leg-line-ATCC","bbox":[568,51,24,0]}
+{"kind":"shape","id":"sh/o769s369","slide":6,"name":"leg-mark-ATCC","bbox":[577,47,8,8]}
+{"kind":"textbox","id":"sh/p8zql8nu","slide":6,"name":"leg-ATCC","text":"ATCC","textPreview":"ATCC","textChars":4,"textLines":1,"bbox":[596,41,145,20]}
+{"kind":"textbox","id":"sh/lojatc72","slide":6,"name":"panel-a","text":"(a) Agent transaction throughput","textPreview":"(a) Agent transaction throughput","textChars":32,"textLines":1,"bbox":[50,476,410,28]}
+{"kind":"textbox","id":"sh/0natk7qh","slide":6,"name":"panel-b","text":"(b) Transaction throughput","textPreview":"(b) Transaction throughput","textChars":26,"textLines":1,"bbox":[500,476,410,28]}
+{"kind":"textbox","id":"sh/z21sr2pw","slide":6,"name":"figure-caption","text":"Results when varying the number of clients (TPC-C with 1 warehouse).","textPreview":"Results when varying the number of clients (TPC-C with 1 warehouse).","textChars":68,"textLines":1,"bbox":[40,555,880,34]}
+{"kind":"textbox","id":"sh/y1sbix8b","slide":6,"name":"method-note","text":"All-agent · fixed trace replay · mean of 3 seeds · warmup 2 s · measure 10 s","textPreview":"All-agent · fixed trace replay · mean of 3 seeds · warmup 2 s · measure 10 s","textChars":76,"textLines":1,"bbox":[40,593,880,22]}
+{"kind":"chart","id":"ch/a5g32hgb","slide":6,"name":"","chartType":"line","bbox":[55,115,400,355]}
+{"kind":"chart","id":"ch/bqpkvmhg","slide":6,"name":"","chartType":"line","bbox":[505,115,400,355]}
+{"kind":"notes","id":"nt/c8clch","slide":6,"text":""}

@@ -3,6 +3,8 @@
 #include <mm_malloc.h>
 
 #include <cstring>
+#include <array>
+#include <algorithm>
 #include <mutex>
 #include <stdexcept>
 #include <unordered_set>
@@ -24,6 +26,7 @@ constexpr int kValueSizeColumn = 3;
 constexpr int kKeyColumn = 4;
 constexpr int kValueColumn = 5;
 constexpr char kTableName[] = "CAST_DAS_VERSIONED_KV";
+constexpr std::size_t kLockShardCount = 256;
 
 std::uint64_t HashKey(const std::string& key) {
   std::uint64_t hash = 14695981039346656037ULL;
@@ -148,7 +151,8 @@ struct Dbx1000VersionedKVStore::Impl {
 
   std::size_t max_key_bytes;
   std::size_t max_value_bytes;
-  mutable std::mutex mutex;
+  mutable std::array<std::mutex, kLockShardCount> shard_mutexes;
+  mutable std::mutex create_mutex;
   Catalog schema;
   table_t table;
   mutable IndexHash index;
@@ -156,6 +160,26 @@ struct Dbx1000VersionedKVStore::Impl {
   std::vector<row_t*> rows;
   std::vector<itemid_t*> items;
 };
+
+namespace {
+
+std::size_t LockShard(const std::string& key) {
+  return static_cast<std::size_t>(HashKey(key) % kLockShardCount);
+}
+
+std::vector<std::size_t> LockShards(
+    const std::vector<VersionCheck>& checks,
+    const std::vector<WriteOp>& writes) {
+  std::vector<std::size_t> shards;
+  shards.reserve(checks.size() + writes.size());
+  for (const auto& check : checks) shards.push_back(LockShard(check.key));
+  for (const auto& write : writes) shards.push_back(LockShard(write.key));
+  std::sort(shards.begin(), shards.end());
+  shards.erase(std::unique(shards.begin(), shards.end()), shards.end());
+  return shards;
+}
+
+}  // namespace
 
 Dbx1000VersionedKVStore::Dbx1000VersionedKVStore(
     std::size_t max_key_bytes, std::size_t max_value_bytes,
@@ -166,7 +190,7 @@ Dbx1000VersionedKVStore::Dbx1000VersionedKVStore(
 Dbx1000VersionedKVStore::~Dbx1000VersionedKVStore() = default;
 
 VersionedValue Dbx1000VersionedKVStore::Get(const std::string& key) const {
-  std::lock_guard<std::mutex> lock(impl_->mutex);
+  std::lock_guard<std::mutex> lock(impl_->shard_mutexes[LockShard(key)]);
   return impl_->Read(impl_->Find(key));
 }
 
@@ -178,7 +202,8 @@ std::uint64_t Dbx1000VersionedKVStore::GetVersion(
 void Dbx1000VersionedKVStore::Put(const std::string& key,
                                   const std::string& value) {
   impl_->Validate(key, value);
-  std::lock_guard<std::mutex> lock(impl_->mutex);
+  std::lock_guard<std::mutex> lock(impl_->shard_mutexes[LockShard(key)]);
+  std::lock_guard<std::mutex> create_lock(impl_->create_mutex);
   row_t* row = impl_->FindOrCreate(key);
   VersionedValue current = impl_->Read(row);
   impl_->Write(row, value, current.version + 1, true);
@@ -188,18 +213,21 @@ bool Dbx1000VersionedKVStore::PutIfVersion(const std::string& key,
                                            std::uint64_t expected,
                                            const std::string& value) {
   impl_->Validate(key, value);
-  std::lock_guard<std::mutex> lock(impl_->mutex);
+  std::lock_guard<std::mutex> lock(impl_->shard_mutexes[LockShard(key)]);
   row_t* row = impl_->Find(key);
   VersionedValue current = impl_->Read(row);
   if (current.version != expected) return false;
-  if (row == nullptr) row = impl_->FindOrCreate(key);
+  if (row == nullptr) {
+    std::lock_guard<std::mutex> create_lock(impl_->create_mutex);
+    row = impl_->FindOrCreate(key);
+  }
   impl_->Write(row, value, expected + 1, true);
   return true;
 }
 
 bool Dbx1000VersionedKVStore::DeleteIfVersion(const std::string& key,
                                               std::uint64_t expected) {
-  std::lock_guard<std::mutex> lock(impl_->mutex);
+  std::lock_guard<std::mutex> lock(impl_->shard_mutexes[LockShard(key)]);
   row_t* row = impl_->Find(key);
   VersionedValue current = impl_->Read(row);
   if (row == nullptr || !current.exists || current.version != expected) {
@@ -218,14 +246,23 @@ bool Dbx1000VersionedKVStore::BatchPutIfVersion(
     if (!write_keys.insert(write.key).second) return false;
   }
 
-  std::lock_guard<std::mutex> lock(impl_->mutex);
+  const auto shards = LockShards(checks, writes);
+  std::vector<std::unique_lock<std::mutex>> locks;
+  locks.reserve(shards.size());
+  for (std::size_t shard : shards) {
+    locks.emplace_back(impl_->shard_mutexes[shard]);
+  }
   for (const auto& check : checks) {
     if (impl_->Read(impl_->Find(check.key)).version != check.expected_version) {
       return false;
     }
   }
   for (const auto& write : writes) {
-    row_t* row = impl_->FindOrCreate(write.key);
+    row_t* row = impl_->Find(write.key);
+    if (row == nullptr) {
+      std::lock_guard<std::mutex> create_lock(impl_->create_mutex);
+      row = impl_->FindOrCreate(write.key);
+    }
     VersionedValue current = impl_->Read(row);
     impl_->Write(row, write.value, current.version + 1, true);
   }

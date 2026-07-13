@@ -15,6 +15,7 @@ RESERVE_HOT_RW_K = "reserve-hot-rw-k"
 RESERVE_READ_WRITE_SET = "reserve-read-write-set"
 LOCK_WRITE_SET = "lock-write-set"
 LOCK_BEFORE_COMMIT = "lock-before-commit"
+LOCK_HOT_BEFORE_COMMIT = "lock-hot-before-commit"
 RETRY_PROTECT = "retry-protect"
 
 TRAINABLE_ACTIONS: Tuple[str, ...] = (
@@ -26,6 +27,7 @@ TRAINABLE_ACTIONS: Tuple[str, ...] = (
     RESERVE_READ_WRITE_SET,
     LOCK_WRITE_SET,
     LOCK_BEFORE_COMMIT,
+    LOCK_HOT_BEFORE_COMMIT,
     RETRY_PROTECT,
 )
 
@@ -34,8 +36,10 @@ MIXED_TRAINABLE_ACTIONS: Tuple[str, ...] = (
     WRITE_VALIDATE,
     RESERVE_HOT,
     RESERVE_HOT_RW,
+    RESERVE_HOT_RW_K,
     RESERVE_READ_WRITE_SET,
     LOCK_BEFORE_COMMIT,
+    LOCK_HOT_BEFORE_COMMIT,
     RETRY_PROTECT,
 )
 
@@ -103,6 +107,8 @@ def action_spec(action: str, *, retry_count: int = 0) -> ATCCActionSpec:
         return ATCCActionSpec(normalized, lock_scope="write-set", lock_phase="begin")
     if normalized == LOCK_BEFORE_COMMIT:
         return ATCCActionSpec(normalized, lock_scope="write-set", lock_phase="before-commit")
+    if normalized == LOCK_HOT_BEFORE_COMMIT:
+        return ATCCActionSpec(normalized, lock_scope="hot", lock_phase="before-commit")
     if normalized == RETRY_PROTECT:
         if int(retry_count) > 0:
             return ATCCActionSpec(normalized, lock_scope="write-set", lock_phase="begin", retry_only=True)

@@ -18,7 +18,8 @@ class ReasoningProfile:
     def delay_ms(self, *, level: str, phase: str, task_id: str, attempt: int) -> int:
         if self.name in {"none", "off", "disabled"}:
             return 0
-        low, high = delay_range_ms(level=level, phase=phase)
+        reasoning_level = "high" if self.name in {"agentic", "heavy", "long"} else level
+        low, high = delay_range_ms(level=reasoning_level, phase=phase)
         if self.name in {"light", "short"}:
             low, high = low // 2, high // 2
         elif self.name in {"heavy", "long"}:
@@ -34,7 +35,8 @@ class ReasoningProfile:
     def retry_delay_ms(self, *, level: str, task_id: str, attempt: int) -> int:
         if self.name in {"none", "off", "disabled"} or attempt <= 0:
             return 0
-        low, high = retry_delay_range_ms(level)
+        reasoning_level = "high" if self.name in {"agentic", "heavy", "long"} else level
+        low, high = retry_delay_range_ms(reasoning_level)
         low = int(max(0, round(low * self.scale)))
         high = int(max(low, round(high * self.scale)))
         return deterministic_int(

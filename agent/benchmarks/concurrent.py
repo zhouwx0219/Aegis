@@ -14,7 +14,6 @@ from agent.benchmarks.config import BenchmarkConfig
 from agent.benchmarks.metrics import BenchmarkAttempt, aggregate_metrics
 from agent.benchmarks.phases import PlannedPhase, ReasoningProfile, PlannedTask, plan_task_phases, sleep_for_reasoning
 from agent.cc import ConcurrencyControlRegistry, LockConflict
-from agent.cc.atcc.actions import LOCK_BEFORE_COMMIT
 from agent.cc.atcc.features import extract_task_features
 from agent.cc.base import CCPlan, unique_targets
 from agent.runtime import AgentTransactionManager
@@ -349,10 +348,7 @@ def execute_phase(txn: Any, phase: PlannedPhase) -> None:
 
 def decision_locks_before_commit(prelock: Dict[str, Any]) -> bool:
     decision = prelock.get("atcc_decision")
-    return (
-        decision is not None
-        and str(getattr(decision, "action", "")) == LOCK_BEFORE_COMMIT
-    )
+    return decision is not None and str(getattr(decision, "lock_phase", "")) == "before-commit"
 
 
 def execute_with_commit_phase_lock(

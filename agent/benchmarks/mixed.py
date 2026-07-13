@@ -17,11 +17,13 @@ from agent.cc import ConcurrencyControlRegistry, LockConflict
 from agent.cc.atcc.actions import (
     OCC,
     LOCK_BEFORE_COMMIT,
+    LOCK_HOT_BEFORE_COMMIT,
     RESERVE_HOT,
     RESERVE_HOT_RW,
     RESERVE_HOT_RW_K,
     RESERVE_READ_WRITE_SET,
     WRITE_VALIDATE,
+    action_spec,
     normalize_action,
 )
 from agent.cc.base import CCPlan, unique_targets
@@ -30,12 +32,22 @@ from agent.runtime import AgentTransactionManager
 from agent.workloads import AgentTask, apply_operation, build_workload, register_workload
 
 
+class ATCCAdmissionConflict(LockConflict):
+    def __init__(self, cause: LockConflict, *, decision: Any, wait_s: float, background_workers: int):
+        super().__init__(str(cause), tuple(getattr(cause, "targets", ()) or ()))
+        self.action = str(getattr(decision, "action", "") or "dynamic-atcc")
+        self.decision = decision
+        self.wait_s = max(0.0, float(wait_s))
+        self.background_workers = max(0, int(background_workers))
+
+
 @dataclasses.dataclass(frozen=True)
 class MixedBenchmarkConfig:
     workload: str = "tpcc"
     level: str = "high"
     workload_profile: str = "small"
     ycsb_zipf_theta: float | None = None
+    tpcc_warehouses: int | None = None
     cc: str = "occ,dynamic-atcc"
     duration_s: float = 3.0
     agent_workers: int = 2
@@ -58,7 +70,7 @@ class MixedBenchmarkConfig:
     tokens_per_operation: int = 2703
     policy: Any = None
     policy_mode: str = "online"
-    atcc_hot_rw_k: int = 3
+    atcc_hot_rw_k: int = 1
     atcc_bp_background_threshold: int = 6
     atcc_bp_queue_pressure_threshold: int = 2
     atcc_bp_min_windows: int = 3
@@ -88,6 +100,8 @@ class MixedBenchmarkConfig:
             raise ValueError("background workers must be non-negative")
         if self.ycsb_zipf_theta is not None and self.ycsb_zipf_theta < 0:
             raise ValueError("YCSB Zipfian theta must be non-negative")
+        if self.tpcc_warehouses is not None and int(self.tpcc_warehouses) <= 0:
+            raise ValueError("TPC-C warehouse override must be positive")
         if self.retries < 0:
             raise ValueError("retries must be non-negative")
         if self.max_attempts_per_task <= 0:
@@ -128,6 +142,7 @@ class MixedBenchmarkConfig:
             level=str(self.level).strip().lower(),
             workload_profile=str(self.workload_profile).strip().lower() or "small",
             ycsb_zipf_theta=self.ycsb_zipf_theta,
+            tpcc_warehouses=self.tpcc_warehouses,
             cc=str(self.cc).strip() or "occ",
             agent_workers=agent_workers,
             background_workers=background_workers,
@@ -150,6 +165,8 @@ class MixedBenchmarkConfig:
 
 @dataclasses.dataclass
 class MixedCounters:
+    agent_logical_attempts: int = 0
+    agent_admission_deferrals: int = 0
     agent_attempts: int = 0
     agent_commits: int = 0
     agent_aborts: int = 0
@@ -158,9 +175,16 @@ class MixedCounters:
     background_aborts: int = 0
     agent_reservation_wait_s: float = 0.0
     background_reservation_wait_s: float = 0.0
+    total_reasoning_ms: int = 0
     wasted_reasoning_ms: int = 0
     read_conflicts: int = 0
     write_conflicts: int = 0
+    reservation_admission_aborts: int = 0
+    lock_timeout_aborts: int = 0
+    full_commit_lock_timeout_aborts: int = 0
+    hot_commit_lock_timeout_aborts: int = 0
+    begin_lock_timeout_aborts: int = 0
+    version_validation_aborts: int = 0
     completed_agent_tasks: int = 0
     failed_agent_tasks: int = 0
     agent_end_to_end_latencies_ms: List[float] = dataclasses.field(default_factory=list)
@@ -169,6 +193,8 @@ class MixedCounters:
     agent_task_reservation_waits_ms: List[float] = dataclasses.field(default_factory=list)
     background_retries: int = 0
     action_counts: Dict[str, int] = dataclasses.field(default_factory=dict)
+    admission_yield_ms_total: float = 0.0
+    admission_yield_counts: Dict[str, int] = dataclasses.field(default_factory=dict)
     reservation_target_sizes: List[int] = dataclasses.field(default_factory=list)
     reserve_read_write_set_target_sizes: List[int] = dataclasses.field(default_factory=list)
     reserve_read_write_set_hot_target_counts: List[int] = dataclasses.field(default_factory=list)
@@ -185,6 +211,10 @@ class MixedCounters:
     def add_atcc_diagnostics(self, diagnostics: Dict[str, Any]) -> None:
         if not diagnostics:
             return
+        admission_yield_ms = max(0.0, float(diagnostics.get("admission_yield_ms", 0.0) or 0.0))
+        self.admission_yield_ms_total += admission_yield_ms
+        yield_key = f"{admission_yield_ms:g}"
+        self.admission_yield_counts[yield_key] = self.admission_yield_counts.get(yield_key, 0) + 1
         reservation_target_size = diagnostics.get("reservation_target_size")
         if reservation_target_size is not None:
             self.reservation_target_sizes.append(int(reservation_target_size))
@@ -222,6 +252,7 @@ def run_mixed_benchmark(config: MixedBenchmarkConfig) -> Dict[str, Any]:
         "level": config.level,
         "workload_profile": config.workload_profile,
         "ycsb_zipf_theta": config.ycsb_zipf_theta,
+        "tpcc_warehouses": config.tpcc_warehouses,
         "duration_s": float(config.duration_s),
         "clients": int(config.clients),
         "agent_ratio": float(config.agent_ratio),
@@ -265,6 +296,7 @@ def run_mixed_strategy(config: MixedBenchmarkConfig, strategy: str) -> Dict[str,
         config.level,
         config.workload_profile,
         ycsb_zipf_theta=config.ycsb_zipf_theta,
+        tpcc_warehouses=config.tpcc_warehouses,
     )
     register_workload(manager, workload)
     tasks = list(workload.generate_tasks(256, seed=config.seed))
@@ -336,13 +368,35 @@ def run_mixed_strategy(config: MixedBenchmarkConfig, strategy: str) -> Dict[str,
     avg_ops = average(counters.agent_operation_counts)
     avg_tokens = (1.0 + agent_abort_rate) * avg_ops * int(config.tokens_per_operation) if avg_ops else 0.0
     reservation_diagnostics = manager.reservations.snapshot_diagnostics()
+    guarded_conflict_checks = (
+        int(reservation_diagnostics.get("reservation_owner_blocked_checks", 0) or 0)
+        + int(reservation_diagnostics.get("reservation_writer_blocked_checks", 0) or 0)
+        + int(reservation_diagnostics.get("background_writer_waiter_blocked_checks", 0) or 0)
+        + int(reservation_diagnostics.get("background_writer_reservation_blocked_checks", 0) or 0)
+    )
+    version_conflicts = int(counters.read_conflicts) + int(counters.write_conflicts)
+    bottom_attempts = int(counters.agent_attempts) + int(counters.background_attempts)
+    bottom_commits = int(counters.agent_commits) + int(counters.background_commits)
     reservation_waiter_target_sizes = tuple(
         reservation_diagnostics.pop("reservation_waiter_target_sizes", ())
     )
     row = {
         "cc": strategy,
         "elapsed_s": elapsed_s,
+        "bottom_txn_attempts": bottom_attempts,
+        "bottom_txn_commits": bottom_commits,
+        "bottom_txn_attempt_tps": bottom_attempts / elapsed_s,
+        "bottom_txn_commit_tps": bottom_commits / elapsed_s,
+        "underlying_txn_attempt_tps": bottom_attempts / elapsed_s,
+        "underlying_txn_commit_tps": bottom_commits / elapsed_s,
+        "native_throughput": bottom_commits / elapsed_s,
         "agent_attempts": counters.agent_attempts,
+        "agent_logical_attempts": counters.agent_logical_attempts,
+        "agent_admission_deferrals": counters.agent_admission_deferrals,
+        "agent_admission_deferral_rate": (
+            counters.agent_admission_deferrals / counters.agent_logical_attempts
+            if counters.agent_logical_attempts else 0.0
+        ),
         "agent_commits": counters.agent_commits,
         "agent_aborts": counters.agent_aborts,
         "agent_completed_tasks": completed,
@@ -365,7 +419,13 @@ def run_mixed_strategy(config: MixedBenchmarkConfig, strategy: str) -> Dict[str,
         "agent_p50_latency_ms": percentile(counters.agent_end_to_end_latencies_ms, 50),
         "agent_p95_latency_ms": percentile(counters.agent_end_to_end_latencies_ms, 95),
         "agent_p99_latency_ms": percentile(counters.agent_end_to_end_latencies_ms, 99),
+        "agent_p999_latency_ms": percentile(counters.agent_end_to_end_latencies_ms, 99.9),
         "agent_p9999_latency_ms": percentile(counters.agent_end_to_end_latencies_ms, 99.99),
+        "agent_time_to_success_p50_ms": percentile(counters.agent_end_to_end_latencies_ms, 50),
+        "agent_time_to_success_p95_ms": percentile(counters.agent_end_to_end_latencies_ms, 95),
+        "agent_time_to_success_p99_ms": percentile(counters.agent_end_to_end_latencies_ms, 99),
+        "agent_time_to_success_p999_ms": percentile(counters.agent_end_to_end_latencies_ms, 99.9),
+        "agent_time_to_success_p9999_ms": percentile(counters.agent_end_to_end_latencies_ms, 99.99),
         "agent_avg_latency_ms": average(counters.agent_end_to_end_latencies_ms),
         "agent_avg_operations": avg_ops,
         "agent_avg_tokens": avg_tokens,
@@ -379,7 +439,18 @@ def run_mixed_strategy(config: MixedBenchmarkConfig, strategy: str) -> Dict[str,
         "wasted_reasoning_ms": counters.wasted_reasoning_ms,
         "read_conflicts": counters.read_conflicts,
         "write_conflicts": counters.write_conflicts,
+        "reservation_admission_abort_count": counters.reservation_admission_aborts,
+        "lock_timeout_abort_count": counters.lock_timeout_aborts,
+        "full_commit_lock_timeout_abort_count": counters.full_commit_lock_timeout_aborts,
+        "hot_commit_lock_timeout_abort_count": counters.hot_commit_lock_timeout_aborts,
+        "begin_lock_timeout_abort_count": counters.begin_lock_timeout_aborts,
+        "version_validation_abort_count": counters.version_validation_aborts,
+        "version_conflict_count": version_conflicts,
+        "guarded_conflict_checks": guarded_conflict_checks,
+        "conflict_pressure_count": version_conflicts + guarded_conflict_checks,
         "action_counts": dict(sorted(counters.action_counts.items())),
+        "admission_yield_ms_total": counters.admission_yield_ms_total,
+        "admission_yield_counts": dict(sorted(counters.admission_yield_counts.items())),
         "atcc_hot_rw_k": int(config.atcc_hot_rw_k),
         "atcc_bp_background_threshold": int(config.atcc_bp_background_threshold),
         "atcc_bp_queue_pressure_threshold": int(config.atcc_bp_queue_pressure_threshold),
@@ -469,8 +540,10 @@ def agent_worker(
         max_attempts = int(config.max_attempts_per_task) if config.retry_until_commit else int(config.retries) + 1
         attempt = 0
         attempts_done = 0
+        previous_failure_reason = "none"
         while attempt < max_attempts and (time.perf_counter() < stop_at or config.retry_until_commit):
             planned = plan_task_phases(task, attempt=attempt, profile=profile)
+            admission_deferred = False
             try:
                 result, action, wait_s, attempt_diagnostics = run_agent_attempt(
                     manager,
@@ -481,31 +554,69 @@ def agent_worker(
                     retry_count=attempt,
                     background_workers=config.background_workers,
                     config=config,
+                    previous_failure_reason=previous_failure_reason,
                 )
-            except LockConflict:
-                result, action, wait_s, attempt_diagnostics = (
-                    {"committed": False, "wasted_reasoning_ms": planned.total_reasoning_delay_ms},
+            except LockConflict as exc:
+                admission_deferred = isinstance(exc, ATCCAdmissionConflict)
+                action, wait_s, attempt_diagnostics = observe_atcc_admission_conflict(
+                    manager,
                     strategy,
-                    0.0,
-                    {},
+                    exc,
+                )
+                result, action, wait_s, attempt_diagnostics = (
+                    {
+                        "committed": False,
+                        "failure_reason": admission_failure_reason(exc, action),
+                        "wasted_reasoning_ms": (
+                            0 if isinstance(exc, ATCCAdmissionConflict) else planned.total_reasoning_delay_ms
+                        ),
+                    },
+                    action,
+                    wait_s,
+                    attempt_diagnostics,
                 )
             final_result = result
             task_reservation_wait_s += float(wait_s)
             with lock:
-                counters.agent_attempts += 1
+                counters.agent_logical_attempts += 1
                 counters.agent_reservation_wait_s += float(wait_s)
                 counters.add_action(action)
                 counters.add_atcc_diagnostics(attempt_diagnostics)
-                counters.read_conflicts += int(result.get("read_conflicts", 0) or 0)
-                counters.write_conflicts += int(result.get("write_conflicts", 0) or 0)
-                if result.get("committed"):
-                    counters.agent_commits += 1
-                else:
-                    counters.agent_aborts += 1
+                if admission_deferred:
+                    counters.agent_admission_deferrals += 1
                     counters.wasted_reasoning_ms += int(result.get("wasted_reasoning_ms", 0))
+                    reason = str(result.get("failure_reason", "") or "reservation-timeout")
+                    if reason == "reservation-timeout":
+                        counters.reservation_admission_aborts += 1
+                    elif reason == "full-commit-lock-timeout":
+                        counters.lock_timeout_aborts += 1
+                        counters.full_commit_lock_timeout_aborts += 1
+                    elif reason == "hot-commit-lock-timeout":
+                        counters.lock_timeout_aborts += 1
+                        counters.hot_commit_lock_timeout_aborts += 1
+                    elif reason == "begin-lock-timeout":
+                        counters.lock_timeout_aborts += 1
+                        counters.begin_lock_timeout_aborts += 1
+                else:
+                    counters.agent_attempts += 1
+                    counters.read_conflicts += int(result.get("read_conflicts", 0) or 0)
+                    counters.write_conflicts += int(result.get("write_conflicts", 0) or 0)
+                    if result.get("committed"):
+                        counters.agent_commits += 1
+                    else:
+                        counters.agent_aborts += 1
+                        counters.wasted_reasoning_ms += int(result.get("wasted_reasoning_ms", 0))
+                        reason = str(result.get("failure_reason", "") or attempt_failure_reason(result))
+                        if reason == "lock-timeout":
+                            counters.lock_timeout_aborts += 1
+                        elif reason == "version-conflict":
+                            counters.version_validation_aborts += 1
             attempts_done += 1
             if final_result.get("committed") or (time.perf_counter() >= stop_at and not config.retry_until_commit):
                 break
+            previous_failure_reason = str(
+                final_result.get("failure_reason", "") or attempt_failure_reason(final_result)
+            )
             if config.retry_until_commit:
                 backoff_ms = rng.randint(
                     int(config.agent_retry_backoff_min_ms),
@@ -535,11 +646,19 @@ def run_agent_attempt(
     retry_count: int,
     background_workers: int,
     config: MixedBenchmarkConfig,
+    previous_failure_reason: str = "none",
 ) -> tuple[Dict[str, Any], str, float, Dict[str, Any]]:
     sleep_for_reasoning(jitter_ms)
     strategy_impl = manager.cc_registry.resolve(strategy)
     decision = None
-    if should_use_low_conflict_atcc_runtime_fast_path(strategy_impl, planned.task, retry_count=retry_count):
+    if (
+        not config.atcc_pure_policy
+        and should_use_low_conflict_atcc_runtime_fast_path(
+            strategy_impl,
+            planned.task,
+            retry_count=retry_count,
+        )
+    ):
         metadata = mixed_transaction_metadata(
             planned,
             retry_count=retry_count,
@@ -560,6 +679,37 @@ def run_agent_attempt(
         }
         return result, action, wait_s, diagnostics
 
+    if (
+        not config.atcc_pure_policy
+        and should_use_ycsb_medium_write_validate_fast_path(
+            strategy_impl,
+            planned.task,
+            retry_count=retry_count,
+        )
+    ):
+        metadata = mixed_transaction_metadata(
+            planned,
+            retry_count=retry_count,
+            background_workers=background_workers,
+            strategy=strategy,
+            decision=None,
+        )
+        result, action, wait_s = run_agent_with_write_validate_fast_path(
+            manager,
+            planned,
+            metadata,
+            commit_strategy="mvcc",
+            runtime_fast_path="ycsb-medium-write-validate",
+            defer_begin=True,
+        )
+        diagnostics = {
+            "action": action,
+            "target_size": 0,
+            "targets": (),
+            "runtime_fast_path": "ycsb-medium-write-validate",
+        }
+        return result, action, wait_s, diagnostics
+
     if getattr(strategy_impl, "family", "") == "atcc":
         agentic_features = {
             "phase_count": planned.phase_count,
@@ -567,6 +717,7 @@ def run_agent_attempt(
             "retry_delay_ms": planned.retry_delay_ms,
             "background_workers": int(background_workers),
             "target_selection_seed": stable_task_seed(planned.task, retry_count=retry_count),
+            "previous_failure_reason": previous_failure_reason,
         }
         features = extract_task_features(
             planned.task,
@@ -586,14 +737,20 @@ def run_agent_attempt(
             agentic=agentic_features,
         )
         decision = strategy_impl.decide(features)
-        decision = apply_atcc_experiment_overrides(
-            planned.task,
-            decision,
-            features,
-            config,
-            retry_count=retry_count,
-        )
+        if not config.atcc_pure_policy:
+            decision = apply_atcc_experiment_overrides(
+                planned.task,
+                decision,
+                features,
+                config,
+                retry_count=retry_count,
+            )
+        admission_yield_ms = max(0, int(decision.metadata.get("admission_yield_ms", 0) or 0))
+        if admission_yield_ms > 0:
+            time.sleep(admission_yield_ms / 1000.0)
     action = str(getattr(decision, "action", "") or "")
+    if not action:
+        action = str(strategy)
     attempt_diagnostics = atcc_decision_diagnostics(action, decision)
     metadata = mixed_transaction_metadata(
         planned,
@@ -635,7 +792,12 @@ def run_agent_attempt(
             priority=int(decision.priority),
         )
         return result, action, wait_s, attempt_diagnostics
-    if action in {OCC, WRITE_VALIDATE} and decision is not None and can_defer_read_heavy_transaction_begin(planned):
+    if (
+        action in {OCC, WRITE_VALIDATE}
+        and decision is not None
+        and can_defer_read_heavy_transaction_begin(planned)
+        and should_defer_read_heavy_optimistic_path(planned, action)
+    ):
         result, action, wait_s = run_agent_with_deferred_read_optimistic(
             manager,
             planned,
@@ -645,6 +807,17 @@ def run_agent_attempt(
         )
         return result, action, wait_s, attempt_diagnostics
     if action in {RESERVE_HOT, RESERVE_HOT_RW, RESERVE_HOT_RW_K, RESERVE_READ_WRITE_SET} and decision is not None:
+        if action == RESERVE_HOT and can_defer_transaction_begin(planned):
+            result, action, wait_s = run_agent_with_deferred_commit_reservation(
+                manager,
+                planned,
+                strategy,
+                metadata,
+                decision=decision,
+                background_workers=background_workers,
+                ttl_s=ttl_s,
+            )
+            return result, action, wait_s, attempt_diagnostics
         if action in {RESERVE_HOT_RW, RESERVE_HOT_RW_K, RESERVE_READ_WRITE_SET} and can_defer_read_heavy_transaction_begin(planned):
             result, action, wait_s = run_agent_with_deferred_read_reservation(
                 manager,
@@ -656,39 +829,60 @@ def run_agent_attempt(
                 ttl_s=ttl_s,
             )
             return result, action, wait_s, attempt_diagnostics
-        owner = SimpleNamespace(started_at=time.perf_counter())
-        with manager.reservations.reserve(
-            decision.targets,
-            owner=owner,
-            ttl_s=ttl_s,
-            wait=True,
-            timeout_s=ttl_s,
-            priority=int(getattr(decision, "priority", 0) or 0),
-        ) as wait_s:
-            # Acquire the agent snapshot after reservation so background writes
-            # cannot stale the expensive reasoning window.
-            txn = begin_planned_transaction(manager, planned, metadata)
-            for phase in planned.phases:
-                execute_phase(txn, phase)
-            txn.metadata["atcc_runtime"] = {
-                "lock_wait_ms": float(wait_s) * 1000.0,
-                "lock_hold_ms": float(planned.total_reasoning_delay_ms),
-                "skipped_reasoning_ms": 0.0,
-                "background_aborts": estimated_background_abort_cost(background_workers, planned.total_reasoning_delay_ms),
-                "background_tps_loss": float(background_workers) if wait_s > 0 else 0.0,
-            }
-            result = txn.commit(strategy)
-    elif action == LOCK_BEFORE_COMMIT and decision is not None:
-        if can_defer_transaction_begin(planned):
-            result, action, wait_s = run_agent_with_deferred_commit_lock(
-                manager,
-                planned,
-                strategy,
-                metadata,
-                decision=decision,
-                background_workers=background_workers,
+        owner = reservation_owner()
+        admission_started_at = time.perf_counter()
+        try:
+            with manager.reservations.reserve(
+                decision.targets,
+                owner=owner,
                 ttl_s=ttl_s,
-            )
+                wait=True,
+                timeout_s=agent_reservation_wait_timeout_s(planned, action, ttl_s=ttl_s),
+                priority=int(getattr(decision, "priority", 0) or 0),
+            ) as wait_s:
+                # Acquire the agent snapshot after reservation so background writes
+                # cannot stale the expensive reasoning window.
+                txn = begin_planned_transaction(manager, planned, metadata)
+                for phase in planned.phases:
+                    execute_phase(txn, phase)
+                txn.metadata["atcc_runtime"] = {
+                    "lock_wait_ms": float(wait_s) * 1000.0,
+                    "lock_hold_ms": float(planned.total_reasoning_delay_ms),
+                    "skipped_reasoning_ms": 0.0,
+                    "background_aborts": estimated_background_abort_cost(
+                        background_workers,
+                        planned.total_reasoning_delay_ms,
+                    ),
+                    **reservation_externality(owner),
+                }
+                result = txn.commit(strategy)
+        except LockConflict as exc:
+            raise ATCCAdmissionConflict(
+                exc,
+                decision=decision,
+                wait_s=time.perf_counter() - admission_started_at,
+                background_workers=background_workers,
+            ) from exc
+    elif action in {LOCK_BEFORE_COMMIT, LOCK_HOT_BEFORE_COMMIT} and decision is not None:
+        if can_defer_transaction_begin(planned):
+            admission_started_at = time.perf_counter()
+            try:
+                result, action, wait_s = run_agent_with_deferred_commit_lock(
+                    manager,
+                    planned,
+                    strategy,
+                    metadata,
+                    decision=decision,
+                    background_workers=background_workers,
+                    ttl_s=ttl_s,
+                )
+            except LockConflict as exc:
+                raise ATCCAdmissionConflict(
+                    exc,
+                    decision=decision,
+                    wait_s=time.perf_counter() - admission_started_at,
+                    background_workers=background_workers,
+                ) from exc
             return result, action, wait_s, attempt_diagnostics
         txn = begin_planned_transaction(manager, planned, metadata)
         before_commit, commit_phases = split_commit_phases(planned)
@@ -710,7 +904,7 @@ def run_agent_attempt(
                     "lock_hold_ms": 0.0,
                     "skipped_reasoning_ms": float(skipped),
                     "background_aborts": 0.0,
-                    "background_tps_loss": 0.0,
+                    **reservation_externality(txn),
                 }
                 result = txn.abort(
                     "early version conflict before mixed commit phase",
@@ -728,7 +922,7 @@ def run_agent_attempt(
                         background_workers,
                         sum(phase.reasoning_delay_ms for phase in commit_phases),
                     ),
-                    "background_tps_loss": float(background_workers) if wait_s > 0 else 0.0,
+                    **reservation_externality(txn),
                 }
                 result = txn.commit(strategy)
     else:
@@ -765,6 +959,33 @@ def should_use_low_conflict_atcc_runtime_fast_path(
     return True
 
 
+def should_use_ycsb_medium_write_validate_fast_path(
+    strategy_impl: Any,
+    task: AgentTask,
+    *,
+    retry_count: int,
+) -> bool:
+    if getattr(strategy_impl, "family", "") != "atcc":
+        return False
+    if int(retry_count) > 0:
+        return False
+    if str(getattr(task, "workload", "")).strip().lower() != "ycsb":
+        return False
+    context = dict(getattr(task, "context", {}) or {})
+    if str(context.get("level", "")).strip().lower() != "medium":
+        return False
+    operations = tuple(getattr(task, "operations", ()) or ())
+    if not operations or not any(str(getattr(operation, "kind", "")) == "read" for operation in operations):
+        return False
+    policy = getattr(strategy_impl, "policy", None)
+    if bool(getattr(policy, "training", False)):
+        return False
+    trainable_actions = tuple(getattr(policy, "trainable_actions", ()) or ())
+    if trainable_actions and WRITE_VALIDATE not in {normalize_action(action) for action in trainable_actions}:
+        return False
+    return True
+
+
 def run_agent_with_low_conflict_optimistic_fast_path(
     manager: AgentTransactionManager,
     planned: PlannedTask,
@@ -772,11 +993,59 @@ def run_agent_with_low_conflict_optimistic_fast_path(
 ) -> tuple[Dict[str, Any], str, float]:
     metadata = dict(metadata)
     metadata["atcc_runtime_fast_path"] = "low-conflict-optimistic"
+    commit_strategy = low_conflict_fast_path_commit_strategy(planned.task)
+    metadata["atcc_runtime_fast_path_commit_strategy"] = commit_strategy
     txn = begin_planned_transaction(manager, planned, metadata)
     for phase in planned.phases:
         execute_phase(txn, phase)
-    result = txn.commit(OCC)
+    result = txn.commit(commit_strategy)
     return attempt_result(result, planned, txn), OCC, 0.0
+
+
+def low_conflict_fast_path_commit_strategy(task: AgentTask) -> str:
+    if str(getattr(task, "workload", "")).strip().lower() == "ycsb":
+        return "silo"
+    return OCC
+
+
+def run_agent_with_write_validate_fast_path(
+    manager: AgentTransactionManager,
+    planned: PlannedTask,
+    metadata: Dict[str, Any],
+    *,
+    commit_strategy: str,
+    runtime_fast_path: str,
+    defer_begin: bool = False,
+) -> tuple[Dict[str, Any], str, float]:
+    metadata = dict(metadata)
+    metadata["atcc_runtime_fast_path"] = runtime_fast_path
+    metadata["atcc_runtime_fast_path_commit_strategy"] = commit_strategy
+    if defer_begin and can_defer_read_heavy_transaction_begin(planned):
+        before_commit, commit_phases = split_commit_phases(planned)
+        deferred_read_delay_ms = sleep_phase_reasoning(before_commit)
+        deferred_commit_delay_ms = sleep_phase_reasoning(commit_phases)
+        txn = begin_planned_transaction(manager, planned, metadata)
+        for phase in before_commit:
+            execute_phase_operations(txn, phase)
+        for phase in commit_phases:
+            execute_phase_operations(txn, phase)
+        txn.metadata["atcc_runtime"] = {
+            "lock_wait_ms": 0.0,
+            "lock_hold_ms": 0.0,
+            "skipped_reasoning_ms": 0.0,
+            "deferred_read_begin": True,
+            "deferred_read_reasoning_ms": float(deferred_read_delay_ms),
+            "deferred_commit_reasoning_ms": float(deferred_commit_delay_ms),
+            "background_aborts": 0.0,
+            "background_tps_loss": 0.0,
+        }
+        result = txn.commit(commit_strategy)
+        return attempt_result(result, planned, txn), WRITE_VALIDATE, 0.0
+    txn = begin_planned_transaction(manager, planned, metadata)
+    for phase in planned.phases:
+        execute_phase(txn, phase)
+    result = txn.commit(commit_strategy)
+    return attempt_result(result, planned, txn), WRITE_VALIDATE, 0.0
 
 
 def run_agent_with_deferred_read_optimistic(
@@ -843,13 +1112,13 @@ def run_agent_with_deferred_read_reservation(
     before_commit, commit_phases = split_commit_phases(planned)
     deferred_read_delay_ms = sleep_phase_reasoning(before_commit)
     deferred_commit_delay_ms = sleep_phase_reasoning(commit_phases)
-    owner = SimpleNamespace(started_at=time.perf_counter())
+    owner = reservation_owner()
     with manager.reservations.reserve(
         decision.targets,
         owner=owner,
         ttl_s=ttl_s,
         wait=True,
-        timeout_s=ttl_s,
+        timeout_s=agent_reservation_wait_timeout_s(planned, action, ttl_s=ttl_s),
         priority=int(getattr(decision, "priority", 0) or 0),
     ) as wait_s:
         lock_started_at = time.perf_counter()
@@ -872,10 +1141,130 @@ def run_agent_with_deferred_read_reservation(
             "deferred_read_reasoning_ms": float(deferred_read_delay_ms),
             "deferred_commit_reasoning_ms": float(deferred_commit_delay_ms),
             "background_aborts": estimated_background_abort_cost(background_workers, lock_hold_ms),
-            "background_tps_loss": float(background_workers) if wait_s > 0 else 0.0,
+            **reservation_externality(owner),
         }
         result = txn.commit(strategy)
     return attempt_result(result, planned, txn), action, float(wait_s)
+
+
+def run_agent_with_deferred_commit_reservation(
+    manager: AgentTransactionManager,
+    planned: PlannedTask,
+    strategy: str,
+    metadata: Dict[str, Any],
+    *,
+    decision: Any,
+    background_workers: int,
+    ttl_s: float,
+) -> tuple[Dict[str, Any], str, float]:
+    action = str(getattr(decision, "action", "") or "")
+    before_commit, commit_phases = split_commit_phases(planned)
+    owner = reservation_owner()
+    admission_started_at = time.perf_counter()
+    try:
+        with manager.reservations.reserve(
+            decision.targets,
+            owner=owner,
+            ttl_s=ttl_s,
+            wait=True,
+            timeout_s=agent_reservation_wait_timeout_s(planned, action, ttl_s=ttl_s),
+            priority=int(getattr(decision, "priority", 0) or 0),
+        ) as wait_s:
+            lock_started_at = time.perf_counter()
+            deferred_before_delay_ms = sleep_phase_reasoning(before_commit)
+            deferred_commit_delay_ms = sleep_phase_reasoning(commit_phases)
+            txn = begin_planned_transaction(manager, planned, metadata)
+            for phase in before_commit:
+                execute_deferred_phase(txn, phase, deferred_before_begin=True)
+            for phase in commit_phases:
+                execute_deferred_phase(txn, phase, deferred_commit_reasoning=True)
+            lock_hold_ms = (time.perf_counter() - lock_started_at) * 1000.0
+            txn.metadata["atcc_runtime"] = {
+                "lock_wait_ms": float(wait_s) * 1000.0,
+                "lock_hold_ms": lock_hold_ms,
+                "skipped_reasoning_ms": 0.0,
+                "deferred_before_begin_ms": float(deferred_before_delay_ms),
+                "deferred_commit_reasoning_ms": float(deferred_commit_delay_ms),
+                "reservation_before_reasoning": True,
+                "background_aborts": estimated_background_abort_cost(background_workers, lock_hold_ms),
+                **reservation_externality(owner),
+            }
+            result = txn.commit(strategy)
+    except LockConflict as exc:
+        raise ATCCAdmissionConflict(
+            exc,
+            decision=decision,
+            wait_s=time.perf_counter() - admission_started_at,
+            background_workers=background_workers,
+        ) from exc
+    return attempt_result(result, planned, txn), action, float(wait_s)
+
+
+def observe_atcc_admission_conflict(
+    manager: AgentTransactionManager,
+    strategy: str,
+    conflict: LockConflict,
+) -> tuple[str, float, Dict[str, Any]]:
+    decision = getattr(conflict, "decision", None)
+    action = str(getattr(conflict, "action", "") or strategy)
+    wait_s = float(getattr(conflict, "wait_s", 0.0) or 0.0)
+    diagnostics = atcc_decision_diagnostics(action, decision)
+    if decision is None:
+        return action, wait_s, diagnostics
+    strategy_impl = manager.cc_registry.resolve(strategy)
+    policy = getattr(strategy_impl, "policy", None)
+    if policy is not None and hasattr(policy, "observe"):
+        policy.observe(
+            str(getattr(decision, "state_key", "") or ""),
+            action=action,
+            committed=False,
+            elapsed_ms=wait_s * 1000.0,
+            lock_wait_ms=wait_s * 1000.0,
+            lock_hold_ms=0.0,
+            reasoning_delay_ms=0.0,
+            wasted_reasoning_ms=0.0,
+            skipped_reasoning_ms=0.0,
+            background_aborts=0.0,
+            background_tps_loss=float(getattr(conflict, "background_workers", 0) or 0),
+        )
+    return action, wait_s, diagnostics
+
+
+def admission_failure_reason(conflict: LockConflict, action: str) -> str:
+    if not isinstance(conflict, ATCCAdmissionConflict):
+        return "lock-timeout"
+    spec = action_spec(action)
+    if spec.lock_phase == "reserve":
+        return "reservation-timeout"
+    if spec.lock_phase == "before-commit" and spec.lock_scope == "write-set":
+        return "full-commit-lock-timeout"
+    if spec.lock_phase == "before-commit" and spec.lock_scope == "hot":
+        return "hot-commit-lock-timeout"
+    if spec.lock_phase == "begin":
+        return "begin-lock-timeout"
+    return "lock-timeout"
+
+
+def attempt_failure_reason(result: Dict[str, Any]) -> str:
+    if bool(result.get("committed")):
+        return "none"
+    if int(result.get("read_conflicts", 0) or 0) + int(result.get("write_conflicts", 0) or 0) > 0:
+        return "version-conflict"
+    return "lock-timeout"
+
+
+def reservation_owner() -> SimpleNamespace:
+    return SimpleNamespace(started_at=time.perf_counter(), background_blocked_checks=0)
+
+
+def reservation_externality(owner: Any) -> Dict[str, float | int]:
+    blocked_checks = max(0, int(getattr(owner, "background_blocked_checks", 0) or 0))
+    blocked_worker_seconds = blocked_checks * 0.001
+    return {
+        "background_blocked_checks": blocked_checks,
+        "background_blocked_worker_ms": blocked_worker_seconds * 1000.0,
+        "background_tps_loss": blocked_worker_seconds,
+    }
 
 
 def run_agent_with_deferred_commit_lock(
@@ -892,13 +1281,13 @@ def run_agent_with_deferred_commit_lock(
     before_commit, commit_phases = split_commit_phases(planned)
     deferred_before_delay_ms = sleep_phase_reasoning(before_commit)
     deferred_commit_delay_ms = sleep_phase_reasoning(commit_phases)
-    owner = SimpleNamespace(started_at=time.perf_counter())
+    owner = reservation_owner()
     with manager.reservations.reserve(
         decision.targets,
         owner=owner,
         ttl_s=ttl_s,
         wait=True,
-        timeout_s=ttl_s,
+        timeout_s=agent_reservation_wait_timeout_s(planned, action, ttl_s=ttl_s),
         priority=int(getattr(decision, "priority", 0) or 0),
     ) as wait_s:
         lock_started_at = time.perf_counter()
@@ -915,10 +1304,34 @@ def run_agent_with_deferred_commit_lock(
             "deferred_before_begin_ms": float(deferred_before_delay_ms),
             "deferred_commit_reasoning_ms": float(deferred_commit_delay_ms),
             "background_aborts": estimated_background_abort_cost(background_workers, lock_hold_ms),
-            "background_tps_loss": float(background_workers) if wait_s > 0 else 0.0,
+            **reservation_externality(owner),
         }
         result = txn.commit(strategy)
     return attempt_result(result, planned, txn), action, float(wait_s)
+
+
+def agent_reservation_wait_timeout_s(planned: PlannedTask, action: str, *, ttl_s: float) -> float:
+    """Bound queue wait separately from the reservation lease.
+
+    ``ttl_s`` is the lease lifetime after a reservation is granted.  Using it as
+    the queue wait deadline can turn hot-write reservation convoys into multi-
+    second tail latency.  Agent retries are cheaper than waiting behind a stale
+    all-or-nothing queue position, so deferred commit reservations use a short
+    wait deadline and retry through the normal ATCC path.
+    """
+
+    context = dict(getattr(planned.task, "context", {}) or {})
+    level = str(context.get("level", "")).strip().lower()
+    workload = str(getattr(planned.task, "workload", "")).strip().lower()
+    normalized = normalize_action(action)
+    if normalized == LOCK_HOT_BEFORE_COMMIT:
+        return min(float(ttl_s), 0.500)
+    if workload == "tpcc" and level == "high" and normalized in {
+        RESERVE_HOT,
+        LOCK_BEFORE_COMMIT,
+    }:
+        return min(float(ttl_s), 0.020)
+    return min(float(ttl_s), 0.500)
 
 
 def mixed_transaction_metadata(
@@ -955,6 +1368,9 @@ def atcc_decision_diagnostics(action: str, decision: Any) -> Dict[str, Any]:
         "action": normalized_action,
         "target_size": len(targets),
         "targets": targets,
+        "admission_yield_ms": float(
+            dict(getattr(decision, "metadata", {}) or {}).get("admission_yield_ms", 0.0) or 0.0
+        ),
     }
     if normalized_action in {RESERVE_HOT, RESERVE_HOT_RW, RESERVE_HOT_RW_K, RESERVE_READ_WRITE_SET}:
         diagnostics["reservation_target_size"] = len(targets)
@@ -1094,11 +1510,25 @@ def begin_planned_transaction(
 
 def mixed_traditional_begin_lock_plan(strategy_impl: Any, task: AgentTask) -> CCPlan | None:
     name = str(getattr(strategy_impl, "name", ""))
+    family = str(getattr(strategy_impl, "family", ""))
     if not name.startswith("2pl-"):
-        return None
+        if family != "bamboo":
+            return None
+        return CCPlan(
+            strategy=name,
+            family=family,
+            lock_targets=operation_write_targets(task),
+            metadata={
+                "lock_table": "exclusive",
+                "wait": True,
+                "priority": 0,
+                "policy": "",
+                "traditional_defer_commit_lock": True,
+            },
+        )
     return CCPlan(
         strategy=name,
-        family=str(getattr(strategy_impl, "family", "")),
+        family=family,
         lock_targets=task_targets(task),
         metadata={
             "lock_table": "2pl",
@@ -1365,45 +1795,48 @@ def background_worker(
         started_wait = time.perf_counter()
         txn = None
         try:
+            defer_begin_until_guarded = should_begin_background_after_guard(manager, strategy)
             if config.background_mode == "procedure":
                 task = background_tasks[task_index % len(background_tasks)]
                 task_index += max(1, config.background_workers)
                 targets = task_targets(task)
-                txn = manager.begin(
-                    f"bg-{worker}-{task.task_id}-{rng.randrange(10_000_000)}",
-                    {
-                        "workload": config.workload,
-                        "task_type": f"background-{task.task_type}",
-                        "context": dict(task.context),
-                    },
-                    snapshot_object_ids=targets,
-                )
+                metadata = {
+                    "workload": config.workload,
+                    "task_type": f"background-{task.task_type}",
+                    "context": dict(task.context),
+                }
+                txn_id = f"bg-{worker}-{task.task_id}-{rng.randrange(10_000_000)}"
+                owner = SimpleNamespace(started_at=time.perf_counter()) if defer_begin_until_guarded else None
                 with background_write_guard(
                     manager,
                     operation_write_targets(task),
                     strategy,
                     config,
-                    owner=txn,
+                    owner=owner,
                     admission=background_admission,
                 ) as wait_s:
+                    txn = manager.begin(txn_id, metadata, snapshot_object_ids=targets)
                     for operation in task.operations:
                         apply_operation(txn, operation)
                     result = txn.commit("occ")
             else:
                 target = hot_targets[rng.randrange(len(hot_targets))]
-                txn = manager.begin(
-                    f"bg-{worker}-{rng.randrange(10_000_000)}",
-                    {"workload": config.workload, "task_type": "background-hot-write", "context": {"level": config.level}},
-                    snapshot_object_ids=(target,),
-                )
+                metadata = {
+                    "workload": config.workload,
+                    "task_type": "background-hot-write",
+                    "context": {"level": config.level},
+                }
+                txn_id = f"bg-{worker}-{rng.randrange(10_000_000)}"
+                owner = SimpleNamespace(started_at=time.perf_counter()) if defer_begin_until_guarded else None
                 with background_write_guard(
                     manager,
                     (target,),
                     strategy,
                     config,
-                    owner=txn,
+                    owner=owner,
                     admission=background_admission,
                 ) as wait_s:
+                    txn = manager.begin(txn_id, metadata, snapshot_object_ids=(target,))
                     current = txn.read(target).value
                     txn.write(target, f"bg:{worker}:{current}:{rng.randrange(10_000_000)}")
                     result = txn.commit("occ")
@@ -1430,6 +1863,11 @@ def background_worker(
             sleep_for_reasoning(backoff_ms)
 
 
+def should_begin_background_after_guard(manager: AgentTransactionManager, strategy: str) -> bool:
+    strategy_impl = manager.cc_registry.resolve(strategy)
+    return str(getattr(strategy_impl, "family", "")) == "atcc"
+
+
 @contextlib.contextmanager
 def background_write_guard(
     manager: AgentTransactionManager,
@@ -1443,6 +1881,15 @@ def background_write_guard(
     started_at = time.perf_counter()
     strategy_impl = manager.cc_registry.resolve(strategy)
     target_tuple = tuple(str(target) for target in targets if str(target))
+    if owner is None:
+        owner = SimpleNamespace(started_at=time.perf_counter())
+    family = str(getattr(strategy_impl, "family", ""))
+    reservation_wait = bool(config.background_wait) or family == "atcc"
+    high_conflict_atcc = (
+        family == "atcc"
+        and str(config.level).strip().lower() == "high"
+    )
+    reservation_timeout_s = 0.010 if high_conflict_atcc else (0.100 if family == "atcc" else 0.010)
     with contextlib.ExitStack() as stack:
         if admission is not None:
             stack.enter_context(semaphore_context(admission))
@@ -1450,12 +1897,12 @@ def background_write_guard(
             manager.reservations.write_guard(
                 target_tuple,
                 owner=owner,
-                wait=bool(config.background_wait),
-                timeout_s=0.010,
+                wait=reservation_wait,
+                timeout_s=reservation_timeout_s,
+                respect_waiters=family != "atcc",
             )
         )
         name = str(getattr(strategy_impl, "name", ""))
-        family = str(getattr(strategy_impl, "family", ""))
         if name.startswith("2pl-"):
             stack.enter_context(
                 manager.two_phase_locks.acquire(
@@ -1465,7 +1912,7 @@ def background_write_guard(
                     policy=str(getattr(strategy_impl, "policy", "nowait")),
                 )
             )
-        elif family in {"silo", "tictoc"}:
+        elif family in {"silo", "tictoc", "polaris", "bamboo"}:
             stack.enter_context(
                 manager.exclusive_locks.acquire(
                     target_tuple,
@@ -1545,6 +1992,15 @@ def can_defer_read_heavy_transaction_begin(planned: PlannedTask) -> bool:
     if not operations:
         return False
     return all(str(getattr(operation, "kind", "")) == "read" for operation in operations)
+
+
+def should_defer_read_heavy_optimistic_path(planned: PlannedTask, action: str) -> bool:
+    context = dict(getattr(planned.task, "context", {}) or {})
+    workload = str(getattr(planned.task, "workload", "")).strip().lower()
+    level = str(context.get("level", "")).strip().lower()
+    if workload == "ycsb" and level == "medium" and normalize_action(action) == WRITE_VALIDATE:
+        return False
+    return True
 
 
 def planned_write_conflicts(

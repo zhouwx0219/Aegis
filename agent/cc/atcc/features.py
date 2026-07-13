@@ -34,6 +34,7 @@ class ATCCFeatures:
     reservation_convoy_front_waiter_count: int = 0
     reservation_convoy_pressure: int = 0
     target_selection_seed: int = 0
+    previous_failure_reason: str = "none"
 
     @property
     def state_key(self) -> str:
@@ -41,6 +42,9 @@ class ATCCFeatures:
             f"workload={self.workload}|task={self.task_type}|level={self.level}|"
             f"contention={contention_bucket(self.hot_write_count, self.write_count)}|"
             f"hot_reads={hot_read_bucket(self.hot_read_count)}|"
+            f"client_mix={client_mix_bucket(self.background_workers)}|"
+            f"reservation={reservation_pressure_bucket(self)}|"
+            f"last_failure={failure_reason_bucket(self.previous_failure_reason)}|"
             f"agent_cost={agent_cost_bucket(self.reasoning_delay_ms)}|"
             f"read_set={read_set_bucket(self.read_count)}|"
             f"write_set={write_set_bucket(self.write_count)}|"
@@ -97,6 +101,7 @@ def extract_features(txn: Any) -> ATCCFeatures:
         reservation_convoy_front_waiter_count=int(agentic.get("reservation_convoy_front_waiter_count", 0) or 0),
         reservation_convoy_pressure=int(agentic.get("reservation_convoy_pressure", 0) or 0),
         target_selection_seed=int(agentic.get("target_selection_seed", 0) or 0),
+        previous_failure_reason=failure_reason_bucket(agentic.get("previous_failure_reason", "none")),
         hot_targets=hot_targets,
         hot_read_targets=hot_reads,
         write_targets=write_targets,
@@ -146,6 +151,7 @@ def extract_task_features(
         reservation_convoy_front_waiter_count=int(agentic.get("reservation_convoy_front_waiter_count", 0) or 0),
         reservation_convoy_pressure=int(agentic.get("reservation_convoy_pressure", 0) or 0),
         target_selection_seed=int(agentic.get("target_selection_seed", 0) or 0),
+        previous_failure_reason=failure_reason_bucket(agentic.get("previous_failure_reason", "none")),
         hot_targets=hot_targets,
         hot_read_targets=hot_reads,
         write_targets=write_targets,
@@ -167,6 +173,32 @@ def normalized_queue_lengths(value: Any) -> Dict[str, int]:
             continue
         rows[text] = max(0, count)
     return rows
+
+
+def reservation_pressure_bucket(features: ATCCFeatures) -> str:
+    """Bucket only reservation state visible when an action is selected."""
+
+    if bool(features.reservation_convoy_active) or int(features.reservation_convoy_pressure) > 0:
+        return "convoy"
+    if int(features.reservation_waiter_count_current) > 0 or features.reservation_max_queue_length > 0:
+        return "queued"
+    if features.reservation_owner_targets or features.reservation_writer_targets:
+        return "occupied"
+    return "clear"
+
+
+def failure_reason_bucket(value: Any) -> str:
+    normalized = str(value or "none").strip().lower().replace("_", "-")
+    if normalized in {
+        "reservation-timeout",
+        "full-commit-lock-timeout",
+        "hot-commit-lock-timeout",
+        "begin-lock-timeout",
+        "lock-timeout",
+        "version-conflict",
+    }:
+        return normalized
+    return "none"
 
 
 def hot_write_targets(txn: Any) -> Tuple[str, ...]:
@@ -229,6 +261,8 @@ def hot_task_read_targets(task: Any, *, operations: Sequence[Any] | None = None)
 def is_hot_object_id(object_id: str, context: Dict[str, Any]) -> bool:
     text = str(object_id)
     if "next_order_id" in text:
+        return True
+    if text.startswith("tpcc:warehouse:") and text.endswith(":ytd"):
         return True
     if text.endswith(":orders"):
         return True
@@ -294,6 +328,10 @@ def hot_read_bucket(hot_read_count: int) -> str:
     if count <= 2:
         return "some"
     return "many"
+
+
+def client_mix_bucket(background_workers: int) -> str:
+    return "mixed" if int(background_workers) > 0 else "all_agent"
 
 
 def retry_stage(retry_count: int) -> str:

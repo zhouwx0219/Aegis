@@ -215,6 +215,7 @@ class ReservationTable:
     def __init__(self):
         self._condition = threading.Condition(threading.RLock())
         self._owners: Dict[str, Tuple[int, float]] = {}
+        self._reservation_owner_objects: Dict[int, Any] = {}
         self._writers: Dict[str, Dict[int, int]] = {}
         self._waiters: Dict[str, List[Tuple[int, float, int, int]]] = {}
         self._next_sequence = 0
@@ -301,6 +302,7 @@ class ReservationTable:
                 self._remove_waiter_locked(target_tuple, waiter)
                 for target in target_tuple:
                     self._owners[target] = (owner_id, deadline)
+                self._reservation_owner_objects[owner_id] = owner
                 self._condition.notify_all()
                 self._reservation_front_queue_wait_s += front_queue_wait_s
                 self._reservation_all_or_nothing_not_front_wait_s += not_front_wait_s
@@ -322,6 +324,8 @@ class ReservationTable:
                 current = self._owners.get(str(target))
                 if current is not None and current[0] == int(owner_id):
                     self._owners.pop(str(target), None)
+            if not any(current[0] == int(owner_id) for current in self._owners.values()):
+                self._reservation_owner_objects.pop(int(owner_id), None)
             self._condition.notify_all()
 
     def wait_for_write(
@@ -347,6 +351,7 @@ class ReservationTable:
                     self._background_writer_waiter_blocked_targets += len(waiter_blocked)
                 if reservation_blocked:
                     self._background_writer_reservation_blocked_checks += 1
+                    self._record_background_blocked_owners_locked(reservation_blocked)
                 if not blocked:
                     return time.perf_counter() - started_at
                 if not wait or time.perf_counter() - started_at >= float(timeout_s):
@@ -361,6 +366,7 @@ class ReservationTable:
         owner: Any,
         wait: bool = True,
         timeout_s: float = 0.050,
+        respect_waiters: bool = True,
     ):
         target_tuple = tuple(sorted(set(str(target) for target in targets if str(target))))
         owner_id = id(owner)
@@ -369,6 +375,7 @@ class ReservationTable:
             owner_id=owner_id,
             wait=wait,
             timeout_s=timeout_s,
+            respect_waiters=respect_waiters,
         )
         try:
             yield wait_s
@@ -382,6 +389,7 @@ class ReservationTable:
         owner_id: int,
         wait: bool,
         timeout_s: float,
+        respect_waiters: bool,
     ) -> float:
         target_tuple = tuple(targets)
         started_at = time.perf_counter()
@@ -389,7 +397,11 @@ class ReservationTable:
             while True:
                 self._purge_expired_locked()
                 reservation_blocked = self._blocked_reservations_locked(target_tuple, owner_id)
-                waiter_blocked = self._blocked_waiters_locked(target_tuple, owner_id)
+                waiter_blocked = (
+                    self._blocked_waiters_locked(target_tuple, owner_id)
+                    if bool(respect_waiters)
+                    else []
+                )
                 blocked = list(reservation_blocked)
                 blocked.extend(waiter_blocked)
                 if waiter_blocked:
@@ -397,6 +409,7 @@ class ReservationTable:
                     self._background_writer_waiter_blocked_targets += len(waiter_blocked)
                 if reservation_blocked:
                     self._background_writer_reservation_blocked_checks += 1
+                    self._record_background_blocked_owners_locked(reservation_blocked)
                 if not blocked:
                     for target in target_tuple:
                         owners = self._writers.setdefault(target, {})
@@ -457,6 +470,23 @@ class ReservationTable:
             if any(int(waiter[3]) != int(owner_id) for waiter in queue):
                 blocked.append(str(target))
         return blocked
+
+    def _record_background_blocked_owners_locked(self, targets: Iterable[str]) -> None:
+        owner_ids = {
+            int(current[0])
+            for target in targets
+            for current in (self._owners.get(str(target)),)
+            if current is not None
+        }
+        for owner_id in owner_ids:
+            owner = self._reservation_owner_objects.get(owner_id)
+            if owner is None:
+                continue
+            try:
+                current = int(getattr(owner, "background_blocked_checks", 0) or 0)
+                setattr(owner, "background_blocked_checks", current + 1)
+            except (AttributeError, TypeError, ValueError):
+                continue
 
     def _purge_expired_locked(self) -> None:
         now = time.perf_counter()

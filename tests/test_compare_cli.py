@@ -10,27 +10,109 @@ from types import SimpleNamespace
 
 from agent.cc import ConcurrencyControlRegistry, LockConflict, ReservationTable
 from agent.benchmarks.mixed import (
+    ATCCAdmissionConflict,
     MixedBenchmarkConfig,
+    admission_failure_reason,
     apply_atcc_experiment_overrides,
     can_defer_transaction_begin,
     can_defer_read_heavy_transaction_begin,
     mixed_transaction_metadata,
+    observe_atcc_admission_conflict,
+    run_agent_with_deferred_commit_reservation,
     run_agent_with_deferred_commit_lock,
     run_agent_with_deferred_read_optimistic,
     run_agent_with_deferred_read_reservation,
     run_agent_attempt,
+    run_mixed_benchmark,
 )
-from agent.benchmarks.phases import PlannedPhase, PlannedTask
+from agent.benchmarks.phases import PlannedPhase, PlannedTask, ReasoningProfile, plan_task_phases
 from agent.cli import compare, matrix, mixed, train_atcc
 from agent.cc.atcc.common import ATCCDecision
+from agent.cc.atcc.actions import LOCK_HOT_BEFORE_COMMIT, action_spec
 from agent.cc.atcc.dynamic import DynamicATCC
-from agent.cc.atcc.features import ATCCFeatures
+from agent.cc.atcc.features import ATCCFeatures, extract_task_features
 from agent.cc.atcc.policy import ATCCActionStats, ATCCPolicyTable, ATCCPolicyRow
+from agent.cc.atcc.reward import ATCCRewardConfig
 from agent.runtime import AgentTransactionManager
 from agent.workloads import AgentOperation, AgentTask, build_workload
 
 
 class CompareCliTests(unittest.TestCase):
+    def test_transaction_manager_can_disable_trace_materialization(self):
+        manager = AgentTransactionManager(record_traces=False)
+        manager.register_object("row", "0", kind="row")
+        txn = manager.begin("no-trace")
+        txn.write("row", "1")
+
+        result = txn.commit("occ")
+
+        self.assertTrue(result.committed)
+        self.assertEqual([], manager.traces())
+        self.assertEqual("1", manager.value_of("row"))
+
+    def test_agentic_reasoning_cost_is_independent_of_conflict_level(self):
+        profile = ReasoningProfile("agentic", 2.0)
+        low_values = [
+            profile.delay_ms(level="low", phase=phase, task_id="low-task", attempt=0)
+            for phase in ("explore", "refine", "commit")
+        ]
+        high_values = [
+            profile.delay_ms(level="high", phase=phase, task_id="high-task", attempt=0)
+            for phase in ("explore", "refine", "commit")
+        ]
+
+        self.assertGreaterEqual(sum(low_values), 120)
+        self.assertGreaterEqual(sum(high_values), 120)
+        self.assertLessEqual(max(low_values), 100)
+        self.assertLessEqual(max(high_values), 100)
+
+    def test_reservation_attributes_background_blocking_to_owner(self):
+        reservations = ReservationTable()
+        owner = SimpleNamespace(started_at=time.perf_counter(), background_blocked_checks=0)
+
+        with reservations.reserve(("hot",), owner=owner, wait=False):
+            with self.assertRaises(LockConflict):
+                with reservations.write_guard(("hot",), owner=SimpleNamespace(), wait=False):
+                    pass
+
+        self.assertEqual(1, owner.background_blocked_checks)
+
+    def test_atcc_reward_penalizes_measured_background_loss(self):
+        config = ATCCRewardConfig(background_tps_loss_weight=5.0)
+        without_blocking = config.reward(
+            committed=True,
+            elapsed_ms=100.0,
+            lock_wait_ms=0.0,
+            wasted_reasoning_ms=0.0,
+            background_tps_loss=0.0,
+        )
+        with_blocking = config.reward(
+            committed=True,
+            elapsed_ms=100.0,
+            lock_wait_ms=0.0,
+            wasted_reasoning_ms=0.0,
+            background_tps_loss=2.0,
+        )
+
+        self.assertEqual(10.0, without_blocking - with_blocking)
+
+    def test_atcc_admission_failure_reason_uses_selected_lock_phase_and_scope(self):
+        cause = LockConflict("timeout", ("hot",))
+        cases = (
+            ("reserve-hot", "reservation-timeout"),
+            ("lock-before-commit", "full-commit-lock-timeout"),
+            ("lock-hot-before-commit", "hot-commit-lock-timeout"),
+            ("lock-write-set", "begin-lock-timeout"),
+        )
+        for action, expected in cases:
+            conflict = ATCCAdmissionConflict(
+                cause,
+                decision=ATCCDecision(action=action, targets=("hot",)),
+                wait_s=0.01,
+                background_workers=8,
+            )
+            self.assertEqual(expected, admission_failure_reason(conflict, action))
+
     def test_reservation_waiter_blocks_later_background_writer(self):
         reservations = ReservationTable()
         first_writer = SimpleNamespace()
@@ -110,6 +192,8 @@ class CompareCliTests(unittest.TestCase):
             "mvcc",
             "silo",
             "tictoc",
+            "bamboo",
+            "polaris",
             "dynamic-atcc",
         ]
 
@@ -118,6 +202,41 @@ class CompareCliTests(unittest.TestCase):
             self.assertEqual(name, registry.resolve(name).name)
         with self.assertRaises(ValueError):
             registry.resolve("semantic")
+
+    def test_runtime_polaris_uses_retry_priority(self):
+        manager = AgentTransactionManager()
+        manager.register_object("row", "0", kind="row")
+        txn = manager.begin(
+            "polaris-priority",
+            {"retry_count": 2, "context": {"retry_count": 2}},
+            snapshot_object_ids=("row",),
+        )
+        txn.write("row", "1")
+
+        plan = manager.cc_registry.resolve("polaris").plan(txn)
+
+        self.assertEqual("polaris", plan.strategy)
+        self.assertEqual("polaris", plan.family)
+        self.assertEqual(("row",), plan.lock_targets)
+        self.assertEqual("exclusive", plan.metadata["lock_table"])
+        self.assertGreater(plan.metadata["priority"], 0)
+
+    def test_runtime_bamboo_uses_short_write_set_lock(self):
+        manager = AgentTransactionManager()
+        for object_id in ("read", "write"):
+            manager.register_object(object_id, "0", kind="row")
+        txn = manager.begin("bamboo-plan", snapshot_object_ids=("read", "write"))
+        txn.read("read")
+        txn.write("write", "1")
+
+        plan = manager.cc_registry.resolve("bamboo").plan(txn)
+
+        self.assertEqual("bamboo", plan.strategy)
+        self.assertEqual("bamboo", plan.family)
+        self.assertEqual(("write",), plan.lock_targets)
+        self.assertTrue(plan.validate_reads)
+        self.assertTrue(plan.validate_writes)
+        self.assertTrue(plan.metadata["bamboo_early_retire"])
 
     def test_compare_cli_emits_report(self):
         stdout = io.StringIO()
@@ -632,8 +751,10 @@ class CompareCliTests(unittest.TestCase):
                     "write-validate",
                     "reserve-hot",
                     "reserve-hot-rw",
+                    "reserve-hot-rw-k",
                     "reserve-read-write-set",
                     "lock-before-commit",
+                    "lock-hot-before-commit",
                     "retry-protect",
                 ],
                 artifact["trainable_actions"],
@@ -687,8 +808,8 @@ class CompareCliTests(unittest.TestCase):
             {"policy", "runtime-hot-read-protect"},
         )
 
-    def test_dynamic_atcc_keeps_full_set_until_reservation_convoy(self):
-        atcc = DynamicATCC(policy=ATCCPolicyTable(min_visits=5))
+    def test_dynamic_atcc_bounds_full_set_after_reservation_convoy(self):
+        atcc = DynamicATCC(policy=ATCCPolicyTable(min_visits=5), hot_rw_k_target_limit=1)
         features = ATCCFeatures(
             workload="ycsb",
             task_type="read-update",
@@ -726,6 +847,8 @@ class CompareCliTests(unittest.TestCase):
         self.assertTrue(no_convoy_decision.metadata["background_pressure_background_high"])
         self.assertTrue(no_convoy_decision.metadata["background_pressure_queue_high"])
         self.assertFalse(no_convoy_decision.metadata["reservation_convoy_active"])
+        self.assertFalse(no_convoy_decision.metadata["bp_mode_entered"])
+        self.assertEqual(0, no_convoy_decision.metadata["bp_mode_windows"])
 
         features = dataclasses.replace(
             features,
@@ -738,7 +861,7 @@ class CompareCliTests(unittest.TestCase):
 
         self.assertEqual("reserve-hot-rw-k", decision.action)
         self.assertEqual("hot-rw-k", decision.lock_scope)
-        self.assertEqual(3, len(decision.targets))
+        self.assertEqual(1, len(decision.targets))
         self.assertTrue(
             set(decision.targets).issubset(
                 {
@@ -751,7 +874,7 @@ class CompareCliTests(unittest.TestCase):
         )
         self.assertEqual("reserve-read-write-set", decision.metadata["pre_override_action"])
         self.assertTrue(decision.metadata["post_policy_override"])
-        self.assertEqual(3, decision.metadata["post_policy_override_target_limit"])
+        self.assertEqual(1, decision.metadata["post_policy_override_target_limit"])
         self.assertIn("post-policy-background-pressure", decision.metadata["selected_action_source"])
         self.assertEqual("hot-set-reservation-k", decision.metadata["execution_path"])
         self.assertTrue(decision.metadata["bp_mode_active"])
@@ -768,7 +891,7 @@ class CompareCliTests(unittest.TestCase):
         self.assertEqual(2, retry_decision.metadata["bp_mode_windows"])
         recovered_features = dataclasses.replace(
             features,
-            background_workers=5,
+            background_workers=0,
             reservation_queue_lengths={},
             reservation_waiter_count_current=0,
             reservation_convoy_active=False,
@@ -841,6 +964,208 @@ class CompareCliTests(unittest.TestCase):
         self.assertTrue(decision.metadata["background_pressure_queue_high"])
         self.assertEqual(4, decision.metadata["reservation_queue_pressure"])
         self.assertTrue(decision.metadata["reservation_convoy_active"])
+
+    def test_dynamic_atcc_trained_hot_commit_lock_uses_hot_scope(self):
+        policy = ATCCPolicyTable(min_visits=1)
+        features = ATCCFeatures(
+            workload="tpcc",
+            task_type="new_order",
+            level="high",
+            read_count=0,
+            write_count=6,
+            hot_write_count=2,
+            retry_count=0,
+            hot_targets=("district-hot", "stock-hot"),
+            write_targets=("district-hot", "stock-hot", "order-row"),
+            background_workers=8,
+        )
+        row = policy.rows.setdefault(features.state_key, ATCCPolicyRow(action=LOCK_HOT_BEFORE_COMMIT))
+        row.visits = 3
+        row.actions[LOCK_HOT_BEFORE_COMMIT] = ATCCActionStats(visits=3, commits=3, avg_reward=10.0)
+
+        decision = DynamicATCC(policy=policy).decide(features)
+
+        self.assertEqual(LOCK_HOT_BEFORE_COMMIT, decision.action)
+        self.assertEqual("hot", decision.lock_scope)
+        self.assertEqual("before-commit", decision.lock_phase)
+        self.assertEqual(set(features.hot_targets), set(decision.targets))
+        self.assertTrue(action_spec(decision.action).locks_before_commit)
+
+    def test_deferred_commit_admission_conflict_retains_selected_action(self):
+        manager = AgentTransactionManager()
+        hot_target = "tpcc:warehouse:0:district:0:next_order_id"
+        manager.register_object(hot_target, "0", kind="row")
+        task = AgentTask(
+            task_id="commit-admission-conflict",
+            workload="tpcc",
+            task_type="payment",
+            operations=(AgentOperation.write(hot_target, "1"),),
+            context={"level": "high"},
+        )
+        planned = plan_task_phases(task, attempt=0, profile=ReasoningProfile("agentic", 0.0))
+        strategy = manager.cc_registry.resolve("dynamic-atcc")
+        features = extract_task_features(
+            task,
+            retry_count=0,
+            agentic={
+                "phase_count": planned.phase_count,
+                "reasoning_delay_ms": planned.total_reasoning_delay_ms,
+                "retry_delay_ms": planned.retry_delay_ms,
+                "background_workers": 1,
+                "reservation_owner_targets": (hot_target,),
+            },
+        )
+        strategy.policy.min_visits = 1
+        row = strategy.policy.rows.setdefault(
+            features.state_key,
+            ATCCPolicyRow(action=LOCK_HOT_BEFORE_COMMIT),
+        )
+        row.visits = 1
+        row.actions[LOCK_HOT_BEFORE_COMMIT] = ATCCActionStats(visits=1, commits=1, avg_reward=1.0)
+
+        with manager.reservations.reserve((hot_target,), owner=object(), wait=False):
+            with self.assertRaises(ATCCAdmissionConflict) as raised:
+                run_agent_attempt(
+                    manager,
+                    planned,
+                    "dynamic-atcc",
+                    ttl_s=0.001,
+                    jitter_ms=0,
+                    retry_count=0,
+                    background_workers=1,
+                    config=MixedBenchmarkConfig(),
+                )
+
+        self.assertIn(raised.exception.action, {"lock-before-commit", LOCK_HOT_BEFORE_COMMIT})
+        self.assertNotEqual("dynamic-atcc", raised.exception.action)
+        self.assertEqual(raised.exception.action, raised.exception.decision.action)
+
+    def test_dynamic_atcc_shrinks_full_commit_lock_under_convoy_pressure(self):
+        policy = ATCCPolicyTable(min_visits=1)
+        features = ATCCFeatures(
+            workload="tpcc",
+            task_type="new_order",
+            level="high",
+            read_count=0,
+            write_count=6,
+            hot_write_count=2,
+            retry_count=0,
+            hot_targets=("district-hot",),
+            write_targets=("district-hot", "order-row", "stock-row", "history-row"),
+            background_workers=8,
+            reservation_queue_lengths={"district-hot": 4, "order-row": 2},
+            reservation_waiter_count_current=4,
+            reservation_convoy_active=True,
+            reservation_convoy_queue_target_count=2,
+            reservation_convoy_front_waiter_count=2,
+            reservation_convoy_pressure=2,
+        )
+        row = policy.rows.setdefault(features.state_key, ATCCPolicyRow(action="lock-before-commit"))
+        row.visits = 3
+        row.actions["lock-before-commit"] = ATCCActionStats(visits=3, commits=3, avg_reward=10.0)
+
+        decision = DynamicATCC(policy=policy).decide(features)
+
+        self.assertEqual(LOCK_HOT_BEFORE_COMMIT, decision.action)
+        self.assertEqual(features.hot_targets, decision.targets)
+        self.assertTrue(decision.metadata["post_policy_override"])
+
+    def test_atcc_state_key_separates_all_agent_and_mixed_clients(self):
+        features = ATCCFeatures(
+            workload="ycsb",
+            task_type="read-update",
+            level="high",
+            read_count=6,
+            write_count=4,
+            hot_write_count=2,
+            retry_count=0,
+            background_workers=0,
+        )
+
+        self.assertIn("client_mix=all_agent", features.state_key)
+        mixed = dataclasses.replace(features, background_workers=8)
+        self.assertIn("client_mix=mixed", mixed.state_key)
+        self.assertNotEqual(features.state_key, mixed.state_key)
+
+    def test_atcc_state_key_separates_live_reservation_pressure(self):
+        clear = ATCCFeatures(
+            workload="tpcc",
+            task_type="new_order",
+            level="high",
+            read_count=0,
+            write_count=6,
+            hot_write_count=2,
+            retry_count=0,
+            hot_targets=("district-hot", "stock-hot"),
+            write_targets=("district-hot", "stock-hot", "order-row"),
+            background_workers=8,
+        )
+        occupied = dataclasses.replace(clear, reservation_owner_targets=("district-hot",))
+        queued = dataclasses.replace(
+            occupied,
+            reservation_queue_lengths={"district-hot": 2},
+            reservation_waiter_count_current=2,
+        )
+        convoy = dataclasses.replace(
+            queued,
+            reservation_convoy_active=True,
+            reservation_convoy_pressure=2,
+        )
+
+        self.assertIn("reservation=clear", clear.state_key)
+        self.assertIn("reservation=occupied", occupied.state_key)
+        self.assertIn("reservation=queued", queued.state_key)
+        self.assertIn("reservation=convoy", convoy.state_key)
+        self.assertEqual(4, len({clear.state_key, occupied.state_key, queued.state_key, convoy.state_key}))
+
+    def test_atcc_state_key_separates_previous_failure_reason(self):
+        first = ATCCFeatures(
+            workload="tpcc",
+            task_type="payment",
+            level="high",
+            read_count=0,
+            write_count=3,
+            hot_write_count=2,
+            retry_count=1,
+        )
+        reservation = dataclasses.replace(first, previous_failure_reason="reservation-timeout")
+        version = dataclasses.replace(first, previous_failure_reason="version-conflict")
+        lock = dataclasses.replace(first, previous_failure_reason="full-commit-lock-timeout")
+
+        self.assertIn("last_failure=none", first.state_key)
+        self.assertIn("last_failure=reservation-timeout", reservation.state_key)
+        self.assertIn("last_failure=version-conflict", version.state_key)
+        self.assertIn("last_failure=full-commit-lock-timeout", lock.state_key)
+        self.assertEqual(4, len({first.state_key, reservation.state_key, version.state_key, lock.state_key}))
+
+    def test_dynamic_atcc_trusts_trained_optimistic_retry_after_admission_timeout(self):
+        policy = ATCCPolicyTable(min_visits=2)
+        features = ATCCFeatures(
+            workload="tpcc",
+            task_type="payment",
+            level="high",
+            read_count=0,
+            write_count=3,
+            hot_write_count=2,
+            retry_count=1,
+            hot_targets=("warehouse-hot", "district-hot"),
+            write_targets=("warehouse-hot", "district-hot", "history-row"),
+            background_workers=8,
+            previous_failure_reason="reservation-timeout",
+        )
+        row = policy.rows.setdefault(features.state_key, ATCCPolicyRow(action="write-validate"))
+        row.visits = 10
+        row.actions["write-validate"] = ATCCActionStats(
+            visits=10,
+            commits=9,
+            aborts=1,
+            avg_reward=20.0,
+        )
+
+        decision = DynamicATCC(policy=policy).decide(features)
+
+        self.assertEqual("write-validate", decision.action)
+        self.assertEqual("policy-trained", decision.metadata["selected_action_source"])
 
     def test_mixed_atcc_experiment_overrides_apply_guardrail_and_full_fallback(self):
         task = AgentTask(
@@ -986,6 +1311,75 @@ class CompareCliTests(unittest.TestCase):
         self.assertEqual("read-write-set", decision.lock_scope)
         self.assertEqual("policy", decision.metadata["selected_action_source"])
         self.assertFalse(decision.metadata["runtime_guards_enabled"])
+
+    def test_dynamic_atcc_pure_policy_uses_only_learned_priority(self):
+        policy = ATCCPolicyTable(min_visits=1, low_conflict_occ_guard=False)
+        atcc = DynamicATCC(policy=policy, runtime_guards_enabled=False)
+        features = ATCCFeatures(
+            workload="tpcc",
+            task_type="new_order",
+            level="high",
+            read_count=4,
+            write_count=8,
+            hot_write_count=4,
+            retry_count=3,
+            hot_targets=("tpcc:district:0:0:next_order_id",),
+            write_targets=("tpcc:district:0:0:next_order_id",),
+            reasoning_delay_ms=500,
+        )
+        row = policy.rows.setdefault(features.state_key, ATCCPolicyRow(action="lock-before-commit"))
+        row.visits = 1
+        row.priority = 2
+
+        decision = atcc.decide(features)
+
+        self.assertEqual(2, decision.priority)
+        self.assertEqual("policy-row", decision.metadata["priority_reason"])
+
+    def test_atcc_policy_learns_and_round_trips_admission_yield(self):
+        policy = ATCCPolicyTable(
+            min_visits=1,
+            low_conflict_occ_guard=False,
+            sparse_state_risk_prior=False,
+            admission_yield_candidates_ms=(0, 2),
+        )
+        state_key = "workload=ycsb|level=high|client_mix=mixed"
+        for yield_ms, elapsed_ms in ((0, 80.0), (2, 20.0)):
+            policy.observe(
+                state_key,
+                action="occ",
+                committed=True,
+                elapsed_ms=elapsed_ms,
+                admission_yield_ms=yield_ms,
+            )
+
+        self.assertEqual(2, policy.admission_yield_for(state_key))
+        restored = ATCCPolicyTable.from_dict(policy.to_dict())
+        self.assertEqual(2, restored.admission_yield_for(state_key))
+
+    def test_mixed_pure_policy_does_not_use_low_conflict_fast_path(self):
+        policy = ATCCPolicyTable(min_visits=1, low_conflict_occ_guard=False)
+        policy.set_mode("eval")
+        result = run_mixed_benchmark(
+            MixedBenchmarkConfig(
+                workload="ycsb",
+                level="low",
+                cc="dynamic-atcc",
+                duration_s=0.05,
+                clients=2,
+                agent_ratio=1.0,
+                reasoning_profile="none",
+                retry_until_commit=True,
+                max_attempts_per_task=2,
+                policy=policy,
+                policy_mode="eval",
+                atcc_pure_policy=True,
+            )
+        )
+
+        row = result["cc_results"][0]
+        actions = row["action_counts"]
+        self.assertNotIn("low-conflict-optimistic", actions)
 
     def test_dynamic_atcc_write_validate_skips_read_validation_only(self):
         manager = AgentTransactionManager()
@@ -1156,6 +1550,93 @@ class CompareCliTests(unittest.TestCase):
         self.assertEqual(1.0, runtime["deferred_commit_reasoning_ms"])
         self.assertLess(runtime["background_aborts"], 0.1)
 
+    def test_mixed_deferred_commit_reservation_admits_before_reasoning(self):
+        manager = AgentTransactionManager()
+        manager.register_object("c", "0", kind="row")
+        task = AgentTask(
+            task_id="write-heavy",
+            workload="tpcc",
+            task_type="new_order",
+            operations=(AgentOperation.write("c", "1"),),
+            context={"level": "high"},
+        )
+        planned = PlannedTask(
+            task=task,
+            phases=(
+                PlannedPhase("plan", (), reasoning_delay_ms=50),
+                PlannedPhase("commit", task.operations, reasoning_delay_ms=50),
+            ),
+        )
+        decision = dataclasses.make_dataclass(
+            "ReservationDecision",
+            [
+                ("action", str),
+                ("targets", tuple),
+                ("priority", int),
+                ("state_key", str),
+                ("reason", str),
+                ("lock_scope", str),
+                ("lock_phase", str),
+                ("metadata", dict),
+            ],
+        )("reserve-hot", ("c",), 0, "test-state", "test", "hot", "reserve", {})
+
+        self.assertTrue(can_defer_transaction_begin(planned))
+        writer = SimpleNamespace()
+        started = time.perf_counter()
+        with manager.reservations.write_guard(("c",), owner=writer, wait=False):
+            with self.assertRaises(ATCCAdmissionConflict) as raised:
+                run_agent_with_deferred_commit_reservation(
+                    manager,
+                    planned,
+                    "dynamic-atcc",
+                    mixed_transaction_metadata(
+                        planned,
+                        retry_count=0,
+                        background_workers=1,
+                        strategy="dynamic-atcc",
+                        decision=decision,
+                    ),
+                    decision=decision,
+                    background_workers=1,
+                    ttl_s=0.001,
+                )
+        action, wait_s, diagnostics = observe_atcc_admission_conflict(
+            manager,
+            "dynamic-atcc",
+            raised.exception,
+        )
+        self.assertEqual("reserve-hot", action)
+        self.assertGreaterEqual(wait_s, 0.0)
+        self.assertEqual("reserve-hot", diagnostics["action"])
+        row = manager.cc_registry.resolve("dynamic-atcc").policy.rows["test-state"]
+        self.assertEqual(1, row.aborts)
+        self.assertEqual(1, row.actions["reserve-hot"].aborts)
+        self.assertLess((time.perf_counter() - started) * 1000.0, 50.0)
+
+        result, action, _wait_s = run_agent_with_deferred_commit_reservation(
+            manager,
+            planned,
+            "dynamic-atcc",
+            mixed_transaction_metadata(
+                planned,
+                retry_count=0,
+                background_workers=1,
+                strategy="dynamic-atcc",
+                decision=decision,
+            ),
+            decision=decision,
+            background_workers=1,
+            ttl_s=1.0,
+        )
+
+        self.assertTrue(result["committed"])
+        self.assertEqual("reserve-hot", action)
+        runtime = manager.traces()[-1]["metadata"]["atcc_runtime"]
+        self.assertTrue(runtime["reservation_before_reasoning"])
+        self.assertEqual(50.0, runtime["deferred_before_begin_ms"])
+        self.assertEqual(50.0, runtime["deferred_commit_reasoning_ms"])
+
     def test_mixed_deferred_read_optimistic_replays_reads_after_begin(self):
         manager = AgentTransactionManager()
         for object_id in ("a", "b", "c"):
@@ -1221,7 +1702,7 @@ class CompareCliTests(unittest.TestCase):
             manager.register_object(object_id, "0", kind="row")
         task = AgentTask(
             task_id="low-fast-path",
-            workload="ycsb",
+            workload="tpcc",
             task_type="read-update",
             operations=(
                 AgentOperation.read("a"),
@@ -1275,6 +1756,94 @@ class CompareCliTests(unittest.TestCase):
         self.assertEqual("low-conflict-optimistic", retry_trace["metadata"]["atcc_runtime_fast_path"])
         self.assertNotIn("atcc_preplan", retry_trace["metadata"])
 
+    def test_mixed_ycsb_low_conflict_uses_optimistic_silo_fast_path(self):
+        manager = AgentTransactionManager()
+        for object_id in ("a", "b"):
+            manager.register_object(object_id, "0", kind="row")
+        task = AgentTask(
+            task_id="ycsb-low-optimistic",
+            workload="ycsb",
+            task_type="read-update",
+            operations=(
+                AgentOperation.read("a"),
+                AgentOperation.write("b", "1"),
+            ),
+            context={"level": "low"},
+        )
+        planned = PlannedTask(
+            task=task,
+            phases=(
+                PlannedPhase("explore", (task.operations[0],), reasoning_delay_ms=0),
+                PlannedPhase("commit", (task.operations[1],), reasoning_delay_ms=0),
+            ),
+        )
+
+        result, action, wait_s, diagnostics = run_agent_attempt(
+            manager,
+            planned,
+            "dynamic-atcc",
+            ttl_s=1.0,
+            jitter_ms=0,
+            retry_count=0,
+            background_workers=0,
+            config=MixedBenchmarkConfig(),
+        )
+
+        self.assertTrue(result["committed"])
+        self.assertEqual("occ", action)
+        self.assertEqual(0.0, wait_s)
+        self.assertEqual("low-conflict-optimistic", diagnostics["runtime_fast_path"])
+        trace = manager.traces()[-1]
+        self.assertEqual("silo", trace["result"]["strategy"])
+        self.assertEqual("low-conflict-optimistic", trace["metadata"]["atcc_runtime_fast_path"])
+        self.assertEqual("silo", trace["metadata"]["atcc_runtime_fast_path_commit_strategy"])
+        self.assertNotIn("atcc_preplan", trace["metadata"])
+
+    def test_mixed_ycsb_medium_uses_write_validate_mvcc_fast_path(self):
+        manager = AgentTransactionManager()
+        for object_id in ("a", "b", "c"):
+            manager.register_object(object_id, "0", kind="row")
+        task = AgentTask(
+            task_id="ycsb-medium-write-validate",
+            workload="ycsb",
+            task_type="read-update",
+            operations=(
+                AgentOperation.read("a"),
+                AgentOperation.read("b"),
+                AgentOperation.write("c", "1"),
+            ),
+            context={"level": "medium"},
+        )
+        planned = PlannedTask(
+            task=task,
+            phases=(
+                PlannedPhase("explore", (task.operations[0], task.operations[1]), reasoning_delay_ms=0),
+                PlannedPhase("commit", (task.operations[2],), reasoning_delay_ms=0),
+            ),
+        )
+
+        result, action, wait_s, diagnostics = run_agent_attempt(
+            manager,
+            planned,
+            "dynamic-atcc",
+            ttl_s=1.0,
+            jitter_ms=0,
+            retry_count=0,
+            background_workers=0,
+            config=MixedBenchmarkConfig(),
+        )
+
+        self.assertTrue(result["committed"])
+        self.assertEqual("write-validate", action)
+        self.assertEqual(0.0, wait_s)
+        self.assertEqual("ycsb-medium-write-validate", diagnostics["runtime_fast_path"])
+        trace = manager.traces()[-1]
+        self.assertEqual("mvcc", trace["result"]["strategy"])
+        self.assertEqual("ycsb-medium-write-validate", trace["metadata"]["atcc_runtime_fast_path"])
+        self.assertEqual("mvcc", trace["metadata"]["atcc_runtime_fast_path_commit_strategy"])
+        self.assertTrue(trace["metadata"]["atcc_runtime"]["deferred_read_begin"])
+        self.assertNotIn("atcc_preplan", trace["metadata"])
+
     def test_low_conflict_policy_guard_keeps_occ(self):
         policy = ATCCPolicyTable(min_visits=2)
         state_key = "workload=tpcc|task=new_order|level=low|contention=hot|agent_cost=short|write_set=large|retry=first"
@@ -1294,7 +1863,7 @@ class CompareCliTests(unittest.TestCase):
             workload="tpcc",
             task_type="payment",
             level="low",
-            read_count=0,
+            read_count=2,
             write_count=3,
             hot_write_count=1,
             retry_count=0,
@@ -1325,11 +1894,12 @@ class CompareCliTests(unittest.TestCase):
             workload="tpcc",
             task_type="new_order",
             level="high",
-            read_count=0,
+            read_count=2,
             write_count=6,
             hot_write_count=3,
             retry_count=0,
             hot_targets=("tpcc:district:0:0:next_order_id",),
+            read_targets=("tpcc:warehouse:0:tax", "tpcc:item:1"),
             hot_read_targets=(),
             write_targets=("tpcc:district:0:0:next_order_id", "tpcc:district:0:0:orders"),
             phase_count=3,
@@ -1347,7 +1917,7 @@ class CompareCliTests(unittest.TestCase):
         self.assertGreater(decision.priority, 0)
         self.assertEqual("runtime-risk-deferred-protect", decision.metadata["selected_action_source"])
 
-    def test_dynamic_atcc_prefers_deferred_protection_for_medium_hot_writes(self):
+    def test_dynamic_atcc_bounds_tpcc_medium_hot_writes_before_retry(self):
         policy = ATCCPolicyTable(min_visits=1)
         atcc = DynamicATCC(policy=policy)
         features = ATCCFeatures(
@@ -1370,8 +1940,74 @@ class CompareCliTests(unittest.TestCase):
 
         decision = atcc.decide(features)
 
-        self.assertEqual("lock-before-commit", decision.action)
-        self.assertEqual("runtime-hot-write-deferred-protect", decision.metadata["selected_action_source"])
+        self.assertEqual("reserve-hot-rw-k", decision.action)
+        self.assertEqual(("tpcc:district:0:0:next_order_id",), decision.targets)
+        self.assertEqual("runtime-tpcc-medium-write-set-protect", decision.metadata["selected_action_source"])
+
+        retry_decision = atcc.decide(dataclasses.replace(features, retry_count=1))
+        self.assertEqual("lock-before-commit", retry_decision.action)
+        self.assertEqual("runtime-tpcc-medium-retry-write-set-protect", retry_decision.metadata["selected_action_source"])
+
+    def test_dynamic_atcc_uses_hot_reservation_for_tpcc_medium_payment(self):
+        policy = ATCCPolicyTable(min_visits=1)
+        atcc = DynamicATCC(policy=policy)
+        features = ATCCFeatures(
+            workload="tpcc",
+            task_type="payment",
+            level="medium",
+            read_count=0,
+            write_count=3,
+            hot_write_count=2,
+            retry_count=0,
+            hot_targets=("tpcc:warehouse:0:ytd", "tpcc:district:0:0:orders"),
+            hot_read_targets=(),
+            write_targets=(
+                "tpcc:warehouse:0:ytd",
+                "tpcc:customer:0:0:1:balance",
+                "tpcc:district:0:0:orders",
+            ),
+            phase_count=2,
+            reasoning_delay_ms=25,
+        )
+        row = policy.rows.setdefault(features.state_key, ATCCPolicyRow(action="occ"))
+        row.visits = 3
+        row.actions["occ"] = ATCCActionStats(visits=3, commits=1, aborts=2, avg_reward=-10.0)
+
+        decision = atcc.decide(features)
+
+        self.assertEqual("reserve-hot", decision.action)
+        self.assertEqual(("tpcc:warehouse:0:ytd", "tpcc:district:0:0:orders"), decision.targets)
+        self.assertEqual("runtime-tpcc-medium-write-set-protect", decision.metadata["selected_action_source"])
+
+    def test_dynamic_atcc_protects_tpcc_medium_mixed_read_write_hot_writes(self):
+        policy = ATCCPolicyTable(min_visits=1)
+        atcc = DynamicATCC(policy=policy)
+        features = ATCCFeatures(
+            workload="tpcc",
+            task_type="new_order",
+            level="medium",
+            read_count=6,
+            write_count=4,
+            hot_write_count=2,
+            retry_count=0,
+            hot_targets=("tpcc:district:0:0:next_order_id",),
+            hot_read_targets=("tpcc:stock:0:1",),
+            write_targets=("tpcc:district:0:0:next_order_id", "tpcc:stock:0:1"),
+            read_targets=("tpcc:warehouse:0:tax", "tpcc:item:1"),
+            phase_count=3,
+            reasoning_delay_ms=110,
+        )
+        row = policy.rows.setdefault(features.state_key, ATCCPolicyRow(action="occ"))
+        row.visits = 3
+        row.actions["occ"] = ATCCActionStats(visits=3, commits=1, aborts=2, avg_reward=-10.0)
+
+        decision = atcc.decide(features)
+
+        self.assertEqual("reserve-hot-rw", decision.action)
+        self.assertEqual(
+            "runtime-tpcc-medium-write-set-protect",
+            decision.metadata["selected_action_source"],
+        )
 
     def test_dynamic_atcc_retry_upgrades_priority_and_protection(self):
         atcc = DynamicATCC(policy=ATCCPolicyTable(min_visits=5))
@@ -1430,6 +2066,39 @@ class CompareCliTests(unittest.TestCase):
         self.assertIn("2pl-nowait", row["action_counts"])
         self.assertIn("agent_guard_wait_ms", row)
         self.assertIn("background_guard_wait_ms", row)
+
+    def test_mixed_runtime_bamboo_and_polaris_are_internal_traditional_ccs(self):
+        stdout = io.StringIO()
+        status = mixed.main(
+            [
+                "--workload",
+                "tpcc",
+                "--level",
+                "medium",
+                "--cc",
+                "bamboo,polaris",
+                "--duration",
+                "0.2",
+                "--agents",
+                "1",
+                "--background",
+                "1",
+                "--reasoning-profile",
+                "light",
+                "--reasoning-scale",
+                "0.1",
+            ],
+            stdout=stdout,
+        )
+
+        self.assertEqual(0, status)
+        report = json.loads(stdout.getvalue())
+        rows = {row["cc"]: row for row in report["cc_results"]}
+        self.assertEqual({"bamboo", "polaris"}, set(rows))
+        self.assertIn("bamboo", rows["bamboo"]["action_counts"])
+        self.assertIn("polaris", rows["polaris"]["action_counts"])
+        self.assertIn("agent_guard_wait_ms", rows["bamboo"])
+        self.assertIn("agent_guard_wait_ms", rows["polaris"])
 
     def test_matrix_cli_emits_speedup_summary(self):
         stdout = io.StringIO()

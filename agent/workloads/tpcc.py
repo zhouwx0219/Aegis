@@ -47,6 +47,15 @@ def tpcc_config(level: str, profile: str = "small") -> TPCCConfig:
     return configs[level]
 
 
+def with_warehouses(config: TPCCConfig, warehouses: int | None = None) -> TPCCConfig:
+    if warehouses is None:
+        return config
+    value = int(warehouses)
+    if value <= 0:
+        raise ValueError("TPC-C warehouse override must be positive")
+    return dataclasses.replace(config, warehouses=value)
+
+
 def small_tpcc_configs() -> dict[str, TPCCConfig]:
     return {
         "low": TPCCConfig(

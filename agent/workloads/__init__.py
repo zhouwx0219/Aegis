@@ -11,7 +11,7 @@ from .base import (
     prepare_task_transaction,
     register_workload,
 )
-from .tpcc import TPCCConfig, TPCCWorkload, tpcc_config
+from .tpcc import TPCCConfig, TPCCWorkload, tpcc_config, with_warehouses
 from .ycsb import YCSBConfig, YCSBWorkload, ycsb_config
 
 
@@ -21,13 +21,14 @@ def build_workload(
     profile: str = "small",
     *,
     ycsb_zipf_theta: float | None = None,
+    tpcc_warehouses: int | None = None,
 ) -> AgentWorkload:
     family = str(family).strip().lower()
     profile = str(profile).strip().lower() or "small"
     if family == "ycsb":
         return YCSBWorkload(ycsb_config(level, profile, zipf_theta=ycsb_zipf_theta))
     if family in {"tpcc", "tpc-c"}:
-        return TPCCWorkload(tpcc_config(level, profile))
+        return TPCCWorkload(with_warehouses(tpcc_config(level, profile), tpcc_warehouses))
     raise ValueError(f"unsupported workload: {family}")
 
 
@@ -45,6 +46,7 @@ __all__ = [
     "TPCCConfig",
     "TPCCWorkload",
     "tpcc_config",
+    "with_warehouses",
     "YCSBConfig",
     "YCSBWorkload",
     "ycsb_config",

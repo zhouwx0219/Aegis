@@ -11,8 +11,10 @@ from agent.cc.atcc import (
 )
 from agent.cc.base import ConcurrencyControl
 from agent.cc.traditional import (
+    BambooConcurrencyControl,
     MvccConcurrencyControl,
     OccConcurrencyControl,
+    PolarisConcurrencyControl,
     SiloConcurrencyControl,
     TicTocConcurrencyControl,
     TwoPhaseLockingConcurrencyControl,
@@ -38,6 +40,8 @@ class ConcurrencyControlRegistry:
             MvccConcurrencyControl(),
             SiloConcurrencyControl(),
             TicTocConcurrencyControl(),
+            BambooConcurrencyControl(),
+            PolarisConcurrencyControl(),
             DynamicATCC(policy=policy, **atcc_kwargs),
             DynamicATCC(
                 name="static-atcc",
@@ -107,6 +111,8 @@ class ConcurrencyControlRegistry:
                 "mvcc",
                 "silo",
                 "tictoc",
+                "bamboo",
+                "polaris",
                 "dynamic-atcc",
             ]
         names = []

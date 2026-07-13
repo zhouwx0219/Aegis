@@ -83,6 +83,55 @@ class TicTocConcurrencyControl(ConcurrencyControl):
         )
 
 
+class PolarisConcurrencyControl(ConcurrencyControl):
+    name = "polaris"
+    family = "polaris"
+    description = "Polaris/SILO_PRIO-style write locking with retry priority and full validation."
+
+    def plan(self, txn: Any) -> CCPlan:
+        priority = polaris_priority(txn)
+        return CCPlan(
+            strategy=self.name,
+            family=self.family,
+            lock_targets=unique_targets(getattr(txn, "write_set", {}).keys()),
+            validate_reads=True,
+            validate_writes=True,
+            metadata={
+                "lock_table": "exclusive",
+                "wait": True,
+                "priority": priority,
+                "polaris_priority": priority,
+            },
+        )
+
+
+class BambooConcurrencyControl(ConcurrencyControl):
+    name = "bamboo"
+    family = "bamboo"
+    description = "Bamboo-style early-retire baseline approximated with short write-set locks and full validation."
+
+    def plan(self, txn: Any) -> CCPlan:
+        return CCPlan(
+            strategy=self.name,
+            family=self.family,
+            lock_targets=unique_targets(getattr(txn, "write_set", {}).keys()),
+            validate_reads=True,
+            validate_writes=True,
+            metadata={
+                "lock_table": "exclusive",
+                "wait": True,
+                "bamboo_early_retire": True,
+            },
+        )
+
+
+def polaris_priority(txn: Any) -> int:
+    metadata = dict(getattr(txn, "metadata", {}) or {})
+    context = dict(metadata.get("context", {}) or {})
+    retry_count = int(metadata.get("retry_count", context.get("retry_count", 0)) or 0)
+    return max(0, min(9, retry_count * 3))
+
+
 def lock_conflict_result(exc: LockConflict) -> ValidationResult:
     return ValidationResult(False, exc.reason, exc.targets)
 

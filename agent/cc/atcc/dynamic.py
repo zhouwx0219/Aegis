@@ -8,6 +8,7 @@ from typing import Any, Optional
 
 from agent.cc.atcc.actions import (
     LOCK_BEFORE_COMMIT,
+    LOCK_HOT_BEFORE_COMMIT,
     LOCK_WRITE_SET,
     OCC,
     RESERVE_HOT,
@@ -66,6 +67,7 @@ class DynamicATCC(ConcurrencyControl):
         self._bp_mode_windows = 0
 
     def decide(self, features: ATCCFeatures) -> ATCCDecision:
+        target_limit = self.hot_rw_k_target_limit
         state_key = self.state_key_for(features)
         if self.decision_mode == "static":
             policy_action = static_threshold_action(features)
@@ -91,10 +93,12 @@ class DynamicATCC(ConcurrencyControl):
         spec = action_spec(action, retry_count=features.retry_count)
         if spec.lock_scope == "hot":
             targets = features.hot_targets
+            if should_bound_hot_reservation_targets(features, targets):
+                targets = tuple(hot_rw_k_targets(features, limit=hot_reservation_target_limit(features)))
         elif spec.lock_scope == "hot-rw":
             targets = tuple(sorted(set(features.hot_targets) | set(features.hot_read_targets)))
         elif spec.lock_scope == "hot-rw-k":
-            targets = hot_rw_k_targets(features, limit=self.hot_rw_k_target_limit)
+            targets = hot_rw_k_targets(features, limit=target_limit)
         elif spec.lock_scope == "read-write-set":
             targets = tuple(sorted(set(features.read_targets) | set(features.write_targets)))
         elif spec.lock_scope == "write-set":
@@ -111,6 +115,9 @@ class DynamicATCC(ConcurrencyControl):
             priority, priority_reason = self._priority_for(features, state_key=state_key)
         else:
             priority, priority_reason = 0, "priority-disabled"
+        admission_yield_ms = self.policy.admission_yield_for(state_key)
+        if int(features.background_workers) <= 0:
+            admission_yield_ms = 0
         if lock_scope == "none" or not targets:
             priority = 0
             priority_reason = "not-locking"
@@ -131,7 +138,7 @@ class DynamicATCC(ConcurrencyControl):
                 "post_policy_override": bool(override_reason),
                 "post_policy_override_reason": override_reason,
                 "post_policy_override_target_limit": (
-                    self.hot_rw_k_target_limit if normalize_action(action) == RESERVE_HOT_RW_K else 0
+                    target_limit if normalize_action(action) == RESERVE_HOT_RW_K else 0
                 ),
                 "background_pressure_high": bool(bp_mode["pressure_high"]),
                 "background_pressure_background_high": bool(bp_mode["background_high"]),
@@ -150,6 +157,7 @@ class DynamicATCC(ConcurrencyControl):
                 "bp_mode_windows": int(bp_mode["windows"]),
                 "bp_mode_min_windows": self.bp_min_windows,
                 "priority_reason": priority_reason,
+                "admission_yield_ms": int(admission_yield_ms),
                 "decision_mode": self.decision_mode,
                 "priority_enabled": self.priority_enabled,
                 "runtime_guards_enabled": self.runtime_guards_enabled,
@@ -178,11 +186,28 @@ class DynamicATCC(ConcurrencyControl):
         bp_mode: dict[str, object],
     ) -> tuple[str, str, str]:
         normalized = normalize_action(action)
+        available = {normalize_action(item) for item in self.policy.trainable_actions}
+        if (
+            normalized == LOCK_BEFORE_COMMIT
+            and not self.policy.training
+            and bool(bp_mode["active"])
+            and LOCK_HOT_BEFORE_COMMIT in available
+        ):
+            reason = (
+                "bp_mode_active_before_commit_scope;"
+                f"background_workers={int(features.background_workers)};"
+                f"queue_pressure={int(bp_mode['queue_pressure'])};"
+                f"convoy_pressure={int(bp_mode['convoy_pressure'])}"
+            )
+            return (
+                LOCK_HOT_BEFORE_COMMIT,
+                f"{action_source}+post-policy-background-pressure",
+                reason,
+            )
         if normalized != RESERVE_READ_WRITE_SET:
             return normalized, action_source, ""
         if self.policy.training:
             return normalized, action_source, ""
-        available = {normalize_action(item) for item in self.policy.trainable_actions}
         if normalize_action(RESERVE_HOT_RW) not in available:
             return normalized, action_source, ""
         if bool(bp_mode["active"]):
@@ -326,7 +351,10 @@ class DynamicATCC(ConcurrencyControl):
             state_key,
             action=str(getattr(plan, "metadata", {}).get("atcc_action", "occ") or "occ"),
             committed=committed,
-            elapsed_ms=float(getattr(result, "elapsed_s", 0.0) or 0.0) * 1000.0,
+            elapsed_ms=(
+                float(getattr(result, "elapsed_s", 0.0) or 0.0) * 1000.0
+                + float(feature_metadata.get("admission_yield_ms", 0) or 0)
+            ),
             lock_wait_ms=(
                 float(getattr(result, "lock_wait_s", 0.0) or 0.0) * 1000.0
                 + float(atcc_runtime.get("lock_wait_ms", 0.0) or 0.0)
@@ -337,6 +365,7 @@ class DynamicATCC(ConcurrencyControl):
             skipped_reasoning_ms=skipped_reasoning_ms,
             background_aborts=float(atcc_runtime.get("background_aborts", 0.0) or 0.0),
             background_tps_loss=float(atcc_runtime.get("background_tps_loss", 0.0) or 0.0),
+            admission_yield_ms=int(feature_metadata.get("admission_yield_ms", 0) or 0),
         )
 
     def _paper_like_action(self, action: str, features: ATCCFeatures) -> tuple[str, str]:
@@ -349,10 +378,27 @@ class DynamicATCC(ConcurrencyControl):
         read_stale_risk = read_stale_risk_score(features)
         read_sensitive = read_stale_risk >= 3
         level = str(features.level).strip().lower()
+        if (
+            int(features.background_workers) > 0
+            and self._trusted_policy_action(features, normalized, risk=risk, retrying=retrying)
+        ):
+            return normalized, "policy-trained"
         if level == "low" and normalize_action(WRITE_VALIDATE) in available:
             if normalized != WRITE_VALIDATE:
                 return WRITE_VALIDATE, "runtime-low-conflict-write-validate"
             return normalized, "policy"
+        if (
+            not retrying
+            and level == "medium"
+            and str(features.workload).strip().lower() == "tpcc"
+            and features.hot_write_count > 0
+            and features.write_count > 0
+        ):
+            for candidate in tpcc_medium_protection_candidates(features, retrying=False):
+                if atcc_candidate_available(candidate, available):
+                    if normalized != candidate:
+                        return candidate, "runtime-tpcc-medium-write-set-protect"
+                    return normalized, "policy"
         if (
             read_sensitive
             and not retrying
@@ -363,8 +409,6 @@ class DynamicATCC(ConcurrencyControl):
             if normalized != candidate:
                 return candidate, "runtime-medium-read-write-validate"
             return normalized, "policy"
-        if self._trusted_policy_action(features, normalized, risk=risk, retrying=retrying):
-            return normalized, "policy-trusted"
         if read_sensitive and risk >= 4:
             severe_read_risk = read_stale_risk >= 5 and level == "high"
             candidates = (RESERVE_READ_WRITE_SET, RESERVE_HOT_RW) if severe_read_risk else (
@@ -403,6 +447,18 @@ class DynamicATCC(ConcurrencyControl):
             RESERVE_HOT_RW,
         }:
             return LOCK_BEFORE_COMMIT, "runtime-risk-deferred-protect"
+        if (
+            retrying
+            and level == "medium"
+            and str(features.workload).strip().lower() == "tpcc"
+            and features.hot_write_count > 0
+            and features.write_count > 0
+        ):
+            for candidate in tpcc_medium_protection_candidates(features, retrying=True):
+                if atcc_candidate_available(candidate, available):
+                    if normalized != candidate:
+                        return candidate, "runtime-tpcc-medium-retry-write-set-protect"
+                    return normalized, "policy"
         if retrying and risk >= 4:
             candidates = (
                 (RESERVE_HOT, LOCK_BEFORE_COMMIT, RESERVE_HOT_RW, RETRY_PROTECT, LOCK_WRITE_SET)
@@ -446,34 +502,43 @@ class DynamicATCC(ConcurrencyControl):
             return False
         abort_rate = stats.aborts / stats.visits if stats.visits else 0.0
         level = str(features.level).strip().lower()
+        admission_retry = (
+            retrying
+            and str(features.previous_failure_reason).strip().lower() == "reservation-timeout"
+        )
         if (
             level == "medium"
             and features.read_count <= 0
             and features.hot_write_count > 0
             and risk >= 5
-            and normalized != LOCK_BEFORE_COMMIT
+            and normalized not in {
+                LOCK_BEFORE_COMMIT,
+                LOCK_HOT_BEFORE_COMMIT,
+                RESERVE_HOT,
+                RESERVE_HOT_RW_K,
+            }
         ):
             return False
         if normalized == OCC:
             safe_abort_rate = float(getattr(self.policy, "low_conflict_safe_abort_rate", 0.5) or 0.5)
-            if retrying and risk >= 6:
+            if retrying and risk >= 6 and not admission_retry:
                 return False
-            return stats.commits > 0 and abort_rate <= safe_abort_rate and stats.avg_reward >= 0.0
+            return stats.commits > 0 and abort_rate <= safe_abort_rate
         if normalized == WRITE_VALIDATE:
-            if level == "high" and retrying and risk >= 6:
+            if level == "high" and retrying and risk >= 6 and not admission_retry:
                 return False
-            return stats.commits > 0 and stats.avg_reward >= 0.0
+            return stats.commits > 0 and (not admission_retry or abort_rate <= 0.5)
         if normalized == RESERVE_READ_WRITE_SET and level != "high":
             return False
         if normalized == RESERVE_HOT and level == "high" and features.read_count <= 0:
             return False
-        if normalized != LOCK_BEFORE_COMMIT and stats.avg_reward < 0.0:
-            return False
-        return stats.commits > 0 and stats.avg_reward >= row.avg_reward - 1.0
+        return stats.commits > 0
 
     def _priority_for(self, features: ATCCFeatures, *, state_key: str) -> tuple[int, str]:
         row = self.policy.rows.get(str(state_key))
         row_priority = int(getattr(row, "priority", 0) or 0) if isinstance(row, ATCCPolicyRow) else 0
+        if not self.runtime_guards_enabled:
+            return row_priority, "policy-row" if row_priority > 0 else "policy-default"
         expected_cost = expected_abort_cost_ms(features)
         cost_priority = priority_from_cost(expected_cost) if expected_cost > 0 else 0
         retry_priority = min(9, int(features.retry_count) * 3)
@@ -516,6 +581,49 @@ def static_threshold_action(features: ATCCFeatures) -> str:
     if features.write_count > 0:
         return WRITE_VALIDATE
     return OCC
+
+
+def tpcc_medium_protection_candidates(features: ATCCFeatures, *, retrying: bool) -> tuple[str, ...]:
+    """Choose a TPC-C medium protection shape from the transaction footprint."""
+
+    task_type = str(features.task_type).strip().lower()
+    read_sensitive = read_stale_risk_score(features) >= 3
+    write_count = int(features.write_count)
+    hot_writes = int(features.hot_write_count)
+    if read_sensitive:
+        return (RESERVE_HOT_RW, LOCK_BEFORE_COMMIT, RESERVE_READ_WRITE_SET, LOCK_WRITE_SET)
+    if task_type == "payment" or (write_count <= 3 and hot_writes <= 2):
+        if retrying:
+            return (RETRY_PROTECT, RESERVE_HOT, LOCK_BEFORE_COMMIT, LOCK_WRITE_SET)
+        return (RESERVE_HOT, LOCK_BEFORE_COMMIT, LOCK_WRITE_SET)
+    if retrying:
+        return (LOCK_BEFORE_COMMIT, RETRY_PROTECT, RESERVE_HOT_RW_K, RESERVE_HOT_RW, LOCK_WRITE_SET)
+    return (RESERVE_HOT_RW_K, RESERVE_HOT, LOCK_BEFORE_COMMIT, RESERVE_HOT_RW, LOCK_WRITE_SET)
+
+
+def should_bound_hot_reservation_targets(features: ATCCFeatures, targets: Any) -> bool:
+    if len(tuple(targets or ())) <= 1:
+        return False
+    if str(features.workload).strip().lower() != "tpcc":
+        return False
+    if str(features.level).strip().lower() != "high":
+        return False
+    if int(features.background_workers) <= 0:
+        return False
+    if int(features.read_count) > 0:
+        return False
+    return True
+
+
+def hot_reservation_target_limit(features: ATCCFeatures) -> int:
+    return 2
+
+
+def atcc_candidate_available(candidate: str, available: set[str]) -> bool:
+    normalized = normalize_action(candidate)
+    if normalized == RESERVE_HOT_RW_K:
+        return bool({RESERVE_HOT_RW, RESERVE_READ_WRITE_SET} & set(available))
+    return normalized in available
 
 
 def expected_abort_cost_ms(features: ATCCFeatures) -> float:
@@ -582,9 +690,12 @@ def read_stale_risk_score(features: ATCCFeatures) -> int:
 
 def hot_rw_k_targets(features: ATCCFeatures, *, limit: int) -> tuple[str, ...]:
     cap = max(1, int(limit))
-    writes = unique_ordered(features.hot_targets)
-    reads = unique_ordered(target for target in features.hot_read_targets if str(target) not in set(writes))
-    ordered = unique_ordered(tuple(writes) + tuple(reads))
+    writes = sorted(unique_ordered(features.hot_targets), key=hot_target_rank_key)
+    reads = sorted(
+        unique_ordered(target for target in features.hot_read_targets if str(target) not in set(writes)),
+        key=hot_target_rank_key,
+    )
+    ordered = sorted(unique_ordered(tuple(writes) + tuple(reads)), key=hot_target_rank_key)
     pressure_aware = (
         bool(int(features.target_selection_seed))
         or any(int(features.reservation_queue_lengths.get(target, 0) or 0) > 0 for target in ordered)
@@ -635,7 +746,7 @@ def unique_ordered(values: Any) -> list[str]:
     return ordered
 
 
-def target_pressure_key(features: ATCCFeatures, target: str, *, kind_rank: int) -> tuple[int, int, int, int]:
+def target_pressure_key(features: ATCCFeatures, target: str, *, kind_rank: int) -> tuple[int, int, int, int, int]:
     text = str(target)
     queue_length = int(features.reservation_queue_lengths.get(text, 0) or 0)
     active_owner = 1 if text in set(features.reservation_owner_targets) else 0
@@ -643,9 +754,32 @@ def target_pressure_key(features: ATCCFeatures, target: str, *, kind_rank: int) 
     return (
         active_owner + active_writer,
         queue_length,
+        hot_target_domain_rank(text),
         int(kind_rank),
         stable_target_rank(int(features.target_selection_seed), text),
     )
+
+
+def hot_target_rank_key(target: str) -> tuple[int, str]:
+    text = str(target)
+    return (hot_target_domain_rank(text), text)
+
+
+def hot_target_domain_rank(target: str) -> int:
+    text = str(target)
+    if "next_order_id" in text:
+        return 0
+    if text.endswith(":orders"):
+        return 1
+    if text.startswith("tpcc:warehouse:") and text.endswith(":ytd"):
+        return 2
+    if ":stock:" in text and text.endswith(":quantity"):
+        return 3
+    if ":stock:" in text:
+        return 4
+    if ":record:" in text:
+        return 5
+    return 6
 
 
 def stable_target_rank(seed: int, target: str) -> int:

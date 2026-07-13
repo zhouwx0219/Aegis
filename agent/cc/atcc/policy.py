@@ -10,6 +10,7 @@ from typing import Dict, Mapping
 
 from agent.cc.atcc.actions import (
     LOCK_BEFORE_COMMIT,
+    LOCK_HOT_BEFORE_COMMIT,
     LOCK_HOT,
     LOCK_WRITE_SET,
     OCC,
@@ -97,11 +98,13 @@ class ATCCActionStats:
 class ATCCPolicyRow:
     action: str = OCC
     priority: int = 0
+    admission_yield_ms: int = 0
     visits: int = 0
     aborts: int = 0
     commits: int = 0
     avg_reward: float = 0.0
     actions: Dict[str, ATCCActionStats] = dataclasses.field(default_factory=dict)
+    admission_yields: Dict[str, ATCCActionStats] = dataclasses.field(default_factory=dict)
 
     # Legacy aggregate fields kept for old tests/artifact readability.
     occ_visits: int = 0
@@ -120,6 +123,7 @@ class ATCCPolicyRow:
         return {
             "action": normalize_action(self.action),
             "priority": int(self.priority),
+            "admission_yield_ms": int(self.admission_yield_ms),
             "visits": int(self.visits),
             "aborts": int(self.aborts),
             "commits": int(self.commits),
@@ -127,6 +131,10 @@ class ATCCPolicyRow:
             "actions": {
                 action: stats.to_dict()
                 for action, stats in sorted(self.actions.items())
+            },
+            "admission_yields": {
+                key: stats.to_dict()
+                for key, stats in sorted(self.admission_yields.items(), key=lambda item: int(item[0]))
             },
             "occ_visits": int(self.occ_visits),
             "occ_aborts": int(self.occ_aborts),
@@ -144,14 +152,20 @@ class ATCCPolicyRow:
             normalize_action(key): ATCCActionStats.from_dict(value if isinstance(value, Mapping) else {})
             for key, value in dict(data.get("actions", {}) or {}).items()
         }
+        yield_stats = {
+            str(max(0, int(key))): ATCCActionStats.from_dict(value if isinstance(value, Mapping) else {})
+            for key, value in dict(data.get("admission_yields", {}) or {}).items()
+        }
         row = cls(
             action=normalize_action(str(data.get("action", OCC) or OCC)),
             priority=int(data.get("priority", 0) or 0),
+            admission_yield_ms=max(0, int(data.get("admission_yield_ms", 0) or 0)),
             visits=int(data.get("visits", 0) or 0),
             aborts=int(data.get("aborts", 0) or 0),
             commits=int(data.get("commits", 0) or 0),
             avg_reward=float(data.get("avg_reward", 0.0) or 0.0),
             actions=action_stats,
+            admission_yields=yield_stats,
             occ_visits=int(data.get("occ_visits", 0) or 0),
             occ_aborts=int(data.get("occ_aborts", 0) or 0),
             protect_visits=int(data.get("protect_visits", 0) or 0),
@@ -179,6 +193,7 @@ class ATCCPolicyTable:
     reward_config: ATCCRewardConfig = dataclasses.field(default_factory=ATCCRewardConfig)
     trainable_actions: tuple[str, ...] = TRAINABLE_ACTIONS
     exploration_coefficient: float = 1.5
+    admission_yield_candidates_ms: tuple[int, ...] = (0, 1, 2, 5)
     frozen: bool = False
     training: bool = False
 
@@ -210,6 +225,28 @@ class ATCCPolicyTable:
             return self._sparse_state_action(state_key)
         return normalize_action(row.action)
 
+    def admission_yield_for(self, state_key: str) -> int:
+        row = self.rows.get(str(state_key))
+        if row is None:
+            return 0
+        if self.training:
+            for candidate in self.admission_yield_candidates_ms:
+                if row.admission_yields.get(str(candidate), ATCCActionStats()).visits < self.min_visits:
+                    return int(candidate)
+            total_visits = max(1, sum(stats.visits for stats in row.admission_yields.values()))
+            return max(
+                self.admission_yield_candidates_ms,
+                key=lambda candidate: (
+                    row.admission_yields.get(str(candidate), ATCCActionStats()).avg_reward
+                    + self.exploration_coefficient
+                    * math.sqrt(
+                        math.log(total_visits + 1)
+                        / max(1, row.admission_yields.get(str(candidate), ATCCActionStats()).visits)
+                    )
+                ),
+            )
+        return max(0, int(row.admission_yield_ms))
+
     def observe(
         self,
         state_key: str,
@@ -224,6 +261,7 @@ class ATCCPolicyTable:
         skipped_reasoning_ms: float = 0.0,
         background_aborts: float = 0.0,
         background_tps_loss: float = 0.0,
+        admission_yield_ms: int = 0,
     ) -> None:
         if self.frozen:
             return
@@ -252,6 +290,20 @@ class ATCCPolicyTable:
         )
         stats = row.stats_for(normalized_action)
         stats.observe(
+            committed=bool(committed),
+            elapsed_ms=float(elapsed_ms),
+            lock_wait_ms=float(lock_wait_ms),
+            lock_hold_ms=float(lock_hold_ms),
+            reasoning_delay_ms=float(reasoning_delay_ms),
+            wasted_reasoning_ms=wasted,
+            skipped_reasoning_ms=float(skipped_reasoning_ms),
+            reward=reward,
+        )
+        yield_stats = row.admission_yields.setdefault(
+            str(max(0, int(admission_yield_ms))),
+            ATCCActionStats(),
+        )
+        yield_stats.observe(
             committed=bool(committed),
             elapsed_ms=float(elapsed_ms),
             lock_wait_ms=float(lock_wait_ms),
@@ -297,6 +349,7 @@ class ATCCPolicyTable:
         if self._should_keep_low_conflict_occ(state_key, occ_stats):
             row.action = OCC
             row.priority = 0
+            self._refresh_admission_yield(row)
             return
         if eligible:
             best_action, best_stats = max(
@@ -305,6 +358,7 @@ class ATCCPolicyTable:
             )
             row.action = normalize_action(best_action)
             row.priority = priority_from_stats(best_stats)
+            self._refresh_admission_yield(row)
             return
 
         if occ_stats and occ_stats.visits >= max(1, min(self.min_visits, 2)):
@@ -318,9 +372,25 @@ class ATCCPolicyTable:
             ):
                 row.action = LOCK_BEFORE_COMMIT
                 row.priority = priority_from_cost(expected_abort_cost)
+                self._refresh_admission_yield(row)
                 return
         row.action = normalize_action(self.default_action)
         row.priority = 0
+        self._refresh_admission_yield(row)
+
+    def _refresh_admission_yield(self, row: ATCCPolicyRow) -> None:
+        eligible = [
+            (int(candidate), stats)
+            for candidate, stats in row.admission_yields.items()
+            if stats.visits >= self.min_visits
+        ]
+        if not eligible:
+            row.admission_yield_ms = 0
+            return
+        row.admission_yield_ms = max(
+            eligible,
+            key=lambda item: (item[1].avg_reward, item[1].commits, -item[0]),
+        )[0]
 
     def _should_keep_low_conflict_occ(
         self,
@@ -442,6 +512,7 @@ class ATCCPolicyTable:
             "reward_config": self.reward_config.to_dict(),
             "trainable_actions": list(self.trainable_actions),
             "exploration_coefficient": float(self.exploration_coefficient),
+            "admission_yield_candidates_ms": list(self.admission_yield_candidates_ms),
             "rows": {key: row.to_dict() for key, row in sorted(self.rows.items())},
         }
 
@@ -468,6 +539,10 @@ class ATCCPolicyTable:
                 for action in data.get("trainable_actions", TRAINABLE_ACTIONS)
             ),
             exploration_coefficient=float(data.get("exploration_coefficient", 1.5) or 1.5),
+            admission_yield_candidates_ms=tuple(
+                max(0, int(value))
+                for value in data.get("admission_yield_candidates_ms", (0, 1, 2, 5))
+            ),
         )
         for state_key, row in policy.rows.items():
             policy._refresh_decision(state_key, row)
@@ -514,6 +589,7 @@ def action_uses_protection(action: str) -> bool:
         RESERVE_READ_WRITE_SET,
         LOCK_WRITE_SET,
         LOCK_BEFORE_COMMIT,
+        LOCK_HOT_BEFORE_COMMIT,
         "retry-protect",
     }
 

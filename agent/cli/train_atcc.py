@@ -60,8 +60,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lock-wait-weight", type=float, default=0.5)
     parser.add_argument("--latency-weight", type=float, default=0.1)
     parser.add_argument("--lock-hold-weight", type=float, default=0.05)
-    parser.add_argument("--background-abort-weight", type=float, default=2.0)
-    parser.add_argument("--background-tps-loss-weight", type=float, default=0.1)
+    parser.add_argument("--background-abort-weight", type=float, default=15.0)
+    parser.add_argument("--background-tps-loss-weight", type=float, default=5.0)
     parser.add_argument("--ucb-c", type=float, default=1.5)
     parser.add_argument(
         "--actions",
@@ -120,8 +120,8 @@ def train_policy(
     lock_wait_weight: float = 0.5,
     latency_weight: float = 0.1,
     lock_hold_weight: float = 0.05,
-    background_abort_weight: float = 2.0,
-    background_tps_loss_weight: float = 0.1,
+    background_abort_weight: float = 15.0,
+    background_tps_loss_weight: float = 5.0,
     ucb_c: float = 1.5,
     reasoning_profile: str = "agentic",
     reasoning_scale: float = 1.0,
@@ -305,8 +305,8 @@ def train_policy_matrix(
     lock_wait_weight: float = 0.5,
     latency_weight: float = 0.1,
     lock_hold_weight: float = 0.05,
-    background_abort_weight: float = 2.0,
-    background_tps_loss_weight: float = 0.1,
+    background_abort_weight: float = 15.0,
+    background_tps_loss_weight: float = 5.0,
     ucb_c: float = 1.5,
     reasoning_profile: str = "agentic",
     reasoning_scale: float = 1.0,

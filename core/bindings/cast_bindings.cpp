@@ -46,10 +46,14 @@ PYBIND11_MODULE(cast_core, m) {
       .def_readwrite("condition", &intent::WriteIntent::condition);
 
   py::class_<storage::VersionedKVStore>(m, "VersionedKVStore")
-      .def("get", &storage::VersionedKVStore::Get)
-      .def("get_version", &storage::VersionedKVStore::GetVersion)
-      .def("put", &storage::VersionedKVStore::Put)
-      .def("put_if_version", &storage::VersionedKVStore::PutIfVersion)
+      .def("get", &storage::VersionedKVStore::Get,
+           py::call_guard<py::gil_scoped_release>())
+      .def("get_version", &storage::VersionedKVStore::GetVersion,
+           py::call_guard<py::gil_scoped_release>())
+      .def("put", &storage::VersionedKVStore::Put,
+           py::call_guard<py::gil_scoped_release>())
+      .def("put_if_version", &storage::VersionedKVStore::PutIfVersion,
+           py::call_guard<py::gil_scoped_release>())
       .def(
           "batch_put_if_version",
           [](storage::VersionedKVStore& store,
@@ -65,9 +69,11 @@ PYBIND11_MODULE(cast_core, m) {
             for (const auto& write : writes) {
               write_ops.push_back({write.first, write.second});
             }
+            py::gil_scoped_release release;
             return store.BatchPutIfVersion(version_checks, write_ops);
           })
-      .def("delete_if_version", &storage::VersionedKVStore::DeleteIfVersion)
+      .def("delete_if_version", &storage::VersionedKVStore::DeleteIfVersion,
+           py::call_guard<py::gil_scoped_release>())
       .def_property_readonly("backend_name", [](const storage::VersionedKVStore& store) {
         return std::string(store.BackendName());
       });

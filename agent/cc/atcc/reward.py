@@ -14,8 +14,8 @@ class ATCCRewardConfig:
     lock_wait_weight: float = 0.5
     latency_weight: float = 0.1
     lock_hold_weight: float = 0.05
-    background_abort_weight: float = 2.0
-    background_tps_loss_weight: float = 0.1
+    background_abort_weight: float = 15.0
+    background_tps_loss_weight: float = 5.0
 
     def reward(
         self,
@@ -52,6 +52,6 @@ class ATCCRewardConfig:
             lock_wait_weight=float(row.get("lock_wait_weight", 0.5) or 0.5),
             latency_weight=float(row.get("latency_weight", 0.1) or 0.1),
             lock_hold_weight=float(row.get("lock_hold_weight", 0.05) or 0.05),
-            background_abort_weight=float(row.get("background_abort_weight", 2.0) or 2.0),
-            background_tps_loss_weight=float(row.get("background_tps_loss_weight", 0.1) or 0.1),
+            background_abort_weight=float(row.get("background_abort_weight", 15.0) or 15.0),
+            background_tps_loss_weight=float(row.get("background_tps_loss_weight", 5.0) or 5.0),
         )
