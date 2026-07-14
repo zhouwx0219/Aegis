@@ -109,6 +109,10 @@ FIELDS = [
     "agent_reservation_wait_ms_mean",
     "background_reservation_wait_ms_total",
     "background_reservation_wait_ms_mean",
+    "background_begin_ms_mean",
+    "background_apply_ms_mean",
+    "background_commit_wall_ms_mean",
+    "background_row_ms_mean",
     "reservation_guard_wait_ms_total",
     "total_reasoning_delay_ms",
     "wasted_reasoning_ms",
@@ -135,6 +139,17 @@ FIELDS = [
     "paper_priority_reorders",
     "paper_background_fast_publishes",
     "paper_background_fast_publish_failures",
+    "paper_background_publisher_queue_events",
+    "paper_background_publisher_queue_wait_ms",
+    "paper_background_publisher_queue_timeouts",
+    "paper_background_admission_queue_events",
+    "paper_background_admission_queue_wait_ms",
+    "paper_background_admission_queue_timeouts",
+    "paper_commit_admission_conflicts",
+    "paper_commit_admission_conflict_objects",
+    "paper_agent_blind_write_rebases",
+    "paper_occ_native_fast_publishes",
+    "paper_occ_native_fast_publish_failures",
     "paper_background_publish_fallbacks",
     "paper_background_publish_fallback_active_writer",
     "paper_background_publish_fallback_version_mismatch",
@@ -151,6 +166,18 @@ FIELDS = [
     "paper_version_pinned_transactions",
     "paper_version_private_transactions",
     "paper_version_commit_table_entries",
+    "paper_version_native_publish_attempts",
+    "paper_version_native_publishes",
+    "paper_version_native_publish_pin_fallbacks",
+    "paper_version_native_publish_disjoint_pin_bypasses",
+    "paper_version_read_only_bypasses",
+    "paper_version_background_version_change_events",
+    "paper_version_background_changed_objects",
+    "paper_version_version_risk_read_locks",
+    "paper_version_object_boundary_acquires",
+    "paper_version_object_boundary_waits",
+    "paper_version_pinned_read_guard_acquires",
+    "paper_version_pinned_read_guard_conflicts",
     "paper_retry_validation_conflicts",
     "paper_retry_mask_escalations",
     "paper_retry_full_observed_escalations",
@@ -187,6 +214,29 @@ FIELDS = [
     "agent_avg_tokens",
     "agent_total_tokens",
     "error",
+]
+
+COMMIT_TIMING_PHASES = (
+    "interceptor",
+    "hotness",
+    "policy",
+    "lock",
+    "validate",
+    "install",
+    "publish",
+    "gc",
+)
+FIELDS[-1:-1] = [
+    "paper_commit_timing_transactions",
+    "paper_commit_timing_agent_transactions",
+    "paper_commit_timing_background_transactions",
+    "paper_commit_timing_samples",
+    "paper_commit_timing_agent_samples",
+    "paper_commit_timing_background_samples",
+] + [
+    f"paper_commit_timing_{role}{phase}_ms_mean"
+    for role in ("", "agent_", "background_")
+    for phase in COMMIT_TIMING_PHASES
 ]
 
 
@@ -332,6 +382,7 @@ def run_trace(
         record_traces=False,
         paper_policy=compiled_policy,
         collect_trajectories=trajectory_output is not None or paper_exploration_seed is not None,
+        low_conflict_occ_guard=cc == "paper-atcc",
     )
     all_rows = list(rows)
     if warmup_rows:
@@ -707,47 +758,99 @@ def run_background_row(
     lock: threading.Lock,
     counters: MixedCounters,
 ) -> None:
+    row_started = time.perf_counter()
     task = row["_task"]
     wait_s = 0.0
+    attempts_done = 0
+    aborts_done = 0
+    committed = False
+    begin_s = 0.0
+    apply_s = 0.0
+    commit_s = 0.0
+    paper_atcc = getattr(manager.cc_registry.resolve(cc), "family", "") == "paper-atcc"
+    write_targets = operation_write_targets(task)
+    if paper_atcc:
+        blocked = manager.atcc_locks.background_pre_admission_block(write_targets)
+        if blocked is not None:
+            manager.note_background_abort()
+            with lock:
+                counters.background_attempts += 1
+                counters.background_aborts += 1
+                counters.background_retries += 1
+                counters.background_row_s += time.perf_counter() - row_started
+            return
     try:
         owner = SimpleNamespace(started_at=time.perf_counter())
         with background_write_guard(
             manager,
-            operation_write_targets(task),
+            write_targets,
             cc,
             config,
             owner=owner,
         ) as waited:
             wait_s = float(waited)
-            metadata = {
-                "workload": row["workload"],
-                "task_type": f"background-{row['task_type']}",
-                "context": dict(row["_context"]),
-            }
-            if getattr(manager.cc_registry.resolve(cc), "family", "") == "paper-atcc":
-                metadata["paper_atcc_backend"] = True
-            txn = manager.begin(
-                f"bg-{row['trace_id']}-{row['worker_id']}-{row['sequence']}-{rng.randrange(10_000_000)}",
-                metadata,
-            )
-            for operation in task.operations:
-                apply_operation(txn, operation)
-            result = txn.commit("occ")
-        committed = bool(result.committed)
+            for fresh_attempt in range(1 if paper_atcc else 3):
+                metadata = {
+                    "workload": row["workload"],
+                    "task_type": f"background-{row['task_type']}",
+                    "context": dict(row["_context"]),
+                    "runtime_background": True,
+                    "planned_write_targets": sorted(write_targets),
+                }
+                if paper_atcc:
+                    metadata["paper_atcc_backend"] = True
+                phase_started = time.perf_counter()
+                txn = manager.begin(
+                    f"bg-{row['trace_id']}-{row['worker_id']}-{row['sequence']}-{fresh_attempt}-{rng.randrange(10_000_000)}",
+                    metadata,
+                )
+                begin_s += time.perf_counter() - phase_started
+                phase_started = time.perf_counter()
+                for operation in task.operations:
+                    apply_operation(txn, operation)
+                apply_s += time.perf_counter() - phase_started
+                phase_started = time.perf_counter()
+                result = txn.commit("occ")
+                commit_s += time.perf_counter() - phase_started
+                attempts_done += 1
+                committed = bool(result.committed)
+                if committed:
+                    break
+                aborts_done += 1
+                if paper_atcc:
+                    manager.note_background_abort()
+                if str(result.reason) not in {
+                    "background-publisher-busy",
+                    "background-admission-busy",
+                }:
+                    break
+                if paper_atcc:
+                    break
+                if not manager.atcc_locks.wait_for_background_admission(
+                    write_targets,
+                    timeout_s=0.002,
+                ):
+                    break
     except Exception:
         if "txn" in locals():
             manager.atcc_locks.release_all(txn.context)
+        if attempts_done == 0:
+            attempts_done = 1
+            aborts_done = 1
+            if paper_atcc:
+                manager.note_background_abort()
         committed = False
     with lock:
-        counters.background_attempts += 1
+        counters.background_attempts += attempts_done
         counters.background_reservation_wait_s += wait_s
         if committed:
             counters.background_commits += 1
-        else:
-            counters.background_aborts += 1
-            counters.background_retries += 1
-            if getattr(manager.cc_registry.resolve(cc), "family", "") == "paper-atcc":
-                manager.note_background_abort()
+        counters.background_aborts += aborts_done
+        counters.background_retries += aborts_done
+        counters.background_begin_s += begin_s
+        counters.background_apply_s += apply_s
+        counters.background_commit_s += commit_s
+        counters.background_row_s += time.perf_counter() - row_started
 
 
 def result_row(
@@ -773,6 +876,7 @@ def result_row(
     retry_diagnostics = manager.retry_protection_diagnostics()
     version_diagnostics = manager.version_manager.snapshot_diagnostics()
     hotness_diagnostics = manager.hotness_tracker.snapshot()
+    commit_timing = manager.commit_timing_diagnostics()
     guarded_conflict_checks = (
         int(diagnostics.get("reservation_owner_blocked_checks", 0) or 0)
         + int(diagnostics.get("reservation_writer_blocked_checks", 0) or 0)
@@ -835,6 +939,22 @@ def result_row(
         "background_reservation_wait_ms_mean": (
             background_wait_ms_total / counters.background_attempts if counters.background_attempts else 0.0
         ),
+        "background_begin_ms_mean": (
+            counters.background_begin_s * 1000.0 / counters.background_attempts
+            if counters.background_attempts else 0.0
+        ),
+        "background_apply_ms_mean": (
+            counters.background_apply_s * 1000.0 / counters.background_attempts
+            if counters.background_attempts else 0.0
+        ),
+        "background_commit_wall_ms_mean": (
+            counters.background_commit_s * 1000.0 / counters.background_attempts
+            if counters.background_attempts else 0.0
+        ),
+        "background_row_ms_mean": (
+            counters.background_row_s * 1000.0 / counters.background_attempts
+            if counters.background_attempts else 0.0
+        ),
         "reservation_guard_wait_ms_total": agent_wait_ms_total + background_wait_ms_total,
         "total_reasoning_delay_ms": int(counters.total_reasoning_ms),
         "wasted_reasoning_ms": counters.wasted_reasoning_ms,
@@ -871,6 +991,39 @@ def result_row(
         "paper_background_fast_publish_failures": paper_diagnostics.get(
             "background_fast_publish_failures", 0
         ),
+        "paper_background_publisher_queue_events": paper_diagnostics.get(
+            "background_publisher_queue_events", 0
+        ),
+        "paper_background_publisher_queue_wait_ms": paper_diagnostics.get(
+            "background_publisher_queue_wait_ms", 0.0
+        ),
+        "paper_background_publisher_queue_timeouts": paper_diagnostics.get(
+            "background_publisher_queue_timeouts", 0
+        ),
+        "paper_background_admission_queue_events": paper_diagnostics.get(
+            "background_admission_queue_events", 0
+        ),
+        "paper_background_admission_queue_wait_ms": paper_diagnostics.get(
+            "background_admission_queue_wait_ms", 0.0
+        ),
+        "paper_background_admission_queue_timeouts": paper_diagnostics.get(
+            "background_admission_queue_timeouts", 0
+        ),
+        "paper_commit_admission_conflicts": paper_diagnostics.get(
+            "commit_admission_conflicts", 0
+        ),
+        "paper_commit_admission_conflict_objects": paper_diagnostics.get(
+            "commit_admission_conflict_objects", 0
+        ),
+        "paper_agent_blind_write_rebases": paper_diagnostics.get(
+            "agent_blind_write_rebases", 0
+        ),
+        "paper_occ_native_fast_publishes": paper_diagnostics.get(
+            "occ_native_fast_publishes", 0
+        ),
+        "paper_occ_native_fast_publish_failures": paper_diagnostics.get(
+            "occ_native_fast_publish_failures", 0
+        ),
         "paper_background_publish_fallbacks": paper_diagnostics.get(
             "background_publish_fallbacks", 0
         ),
@@ -902,7 +1055,38 @@ def result_row(
                 "pinned_transactions",
                 "private_transactions",
                 "commit_table_entries",
+                "native_publish_attempts",
+                "native_publishes",
+                "native_publish_pin_fallbacks",
+                "native_publish_disjoint_pin_bypasses",
+                "read_only_bypasses",
+                "background_version_change_events",
+                "background_changed_objects",
+                "version_risk_read_locks",
+                "object_boundary_acquires",
+                "object_boundary_waits",
+                "pinned_read_guard_acquires",
+                "pinned_read_guard_conflicts",
             )
+        },
+        "paper_commit_timing_transactions": commit_timing.get("transactions", 0),
+        "paper_commit_timing_agent_transactions": commit_timing.get(
+            "agent_transactions", 0
+        ),
+        "paper_commit_timing_background_transactions": commit_timing.get(
+            "background_transactions", 0
+        ),
+        "paper_commit_timing_samples": commit_timing.get("samples", 0),
+        "paper_commit_timing_agent_samples": commit_timing.get("agent_samples", 0),
+        "paper_commit_timing_background_samples": commit_timing.get(
+            "background_samples", 0
+        ),
+        **{
+            f"paper_commit_timing_{role}{phase}_ms_mean": commit_timing.get(
+                f"{role}{phase}_ms_mean", 0.0
+            )
+            for role in ("", "agent_", "background_")
+            for phase in COMMIT_TIMING_PHASES
         },
         "paper_retry_validation_conflicts": retry_diagnostics.get(
             "validation_conflicts", 0

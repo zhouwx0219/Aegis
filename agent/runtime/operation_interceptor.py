@@ -40,6 +40,8 @@ class OperationInterceptor:
         self.state_collector = state_collector
 
     def _account_agent_interval(self, txn: Any) -> float:
+        if self._bypass_background_state(txn):
+            return 0.0
         now = time.monotonic_ns()
         interval_ms = max(
             0.0,
@@ -52,6 +54,8 @@ class OperationInterceptor:
         return interval_ms
 
     def _record(self, txn: Any, object_id: str, *, write: bool) -> None:
+        if self._bypass_background_state(txn):
+            return
         interval_ms = self._account_agent_interval(txn)
         if self.state_collector is not None:
             self.state_collector.record_operation(
@@ -76,6 +80,8 @@ class OperationInterceptor:
         elapsed_ms: float,
         blocked_before_ms: float,
     ) -> None:
+        if self._bypass_background_state(txn):
+            return
         blocked_delta = max(0.0, txn.context.blocked_time_ms - blocked_before_ms)
         txn.context.operation_cost_ms += max(0.0, float(elapsed_ms) - blocked_delta)
         txn.context.completed_operations += 1
@@ -123,3 +129,12 @@ class OperationInterceptor:
         self.hooks.on_finish(txn)
         if self.state_collector is not None:
             self.state_collector.discard(txn.context)
+
+    @staticmethod
+    def _bypass_background_state(txn: Any) -> bool:
+        metadata = getattr(txn, "metadata", {}) or {}
+        return bool(
+            getattr(txn.context, "is_background", False)
+            or metadata.get("runtime_background", False)
+            or metadata.get("_cold_occ_fast_task", False)
+        )

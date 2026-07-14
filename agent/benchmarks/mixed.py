@@ -200,6 +200,10 @@ class MixedCounters:
     agent_operation_counts: List[int] = dataclasses.field(default_factory=list)
     agent_task_reservation_waits_ms: List[float] = dataclasses.field(default_factory=list)
     background_retries: int = 0
+    background_begin_s: float = 0.0
+    background_apply_s: float = 0.0
+    background_commit_s: float = 0.0
+    background_row_s: float = 0.0
     action_counts: Dict[str, int] = dataclasses.field(default_factory=dict)
     admission_yield_ms_total: float = 0.0
     admission_yield_counts: Dict[str, int] = dataclasses.field(default_factory=dict)
@@ -1459,6 +1463,10 @@ def mixed_transaction_metadata(
         "context": dict(planned.task.context),
         "retry_count": int(retry_count),
         "planned_write_targets": list(operation_write_targets(planned.task)),
+        # Planned Agent tasks can defer category write protection to the
+        # all-or-nothing per-object commit admission.  Ad-hoc transactions
+        # without a declared access plan retain eager lock semantics.
+        "commit_admission_write_protection": str(strategy) == "paper-atcc",
         "agentic": {
             "phase_count": planned.phase_count,
             "reasoning_delay_ms": planned.total_reasoning_delay_ms,

@@ -22,21 +22,89 @@ class PaperATCCHooks(NoopTransactionHooks):
     def coordinated_backend(txn: Any) -> bool:
         return bool(txn.metadata.get("paper_atcc_backend", False))
 
+    def on_begin(self, txn: Any) -> None:
+        if not self.enabled(txn):
+            return
+        # Category write protection is a commit-admission decision.  Holding
+        # every planned write through multi-round Agent reasoning creates a
+        # background convoy; only an exact object learned from a failed retry
+        # is promoted early.
+        txn.metadata["_defer_policy_write_locks"] = bool(
+            txn.metadata.get("commit_admission_write_protection", False)
+        )
+        planned = tuple(
+            str(value)
+            for value in txn.metadata.get("_planned_snapshot_object_ids", ())
+        )
+        profiled_hot = self.manager.hotness_tracker.hot_targets(planned)
+        profiled_hot_ratio = len(profiled_hot) / len(set(planned)) if planned else 0.0
+        txn.metadata["_profiled_hot_ratio"] = profiled_hot_ratio
+        context = dict(txn.metadata.get("context", {}) or {})
+        ycsb_high = bool(
+            str(txn.metadata.get("workload", "")).strip().lower() == "ycsb"
+            and str(context.get("level", "")).strip().lower() == "high"
+        )
+        txn.metadata["_version_risk_exact_mode"] = ycsb_high
+        metrics = self.manager.paper_runtime_metrics()
+        planned_reads = set(planned) - set(txn.context.planned_write_targets)
+        version_risk_reads = (
+            self.manager.version_manager.top_background_changed(
+                planned_reads,
+                limit=2,
+                min_changes=2,
+                min_share=0.005,
+                min_total_changes=32,
+            )
+            if ycsb_high and txn.context.retry_count <= 1
+            else ()
+        )
+        txn.metadata["_version_risk_read_targets"] = version_risk_reads
+        if not self.manager.low_conflict_occ_guard:
+            txn.metadata["_cold_occ_fast_task"] = False
+            return
+        cold_profile = bool(
+            planned
+            and txn.context.retry_count <= 0
+            and not txn.context.retry_conflict_mask
+            and float(metrics.get("conflict_abort_rate", 0.0) or 0.0) < 0.30
+            and int(metrics.get("waiter_count", 0) or 0) == 0
+            and not version_risk_reads
+        )
+        txn.metadata["_cold_occ_fast_task"] = cold_profile
+
     def before_read(self, txn: Any, object_id: str) -> None:
         if not self.enabled(txn):
+            return
+        if txn.metadata.get("_cold_occ_fast_task", False):
             return
         hot = self.manager.is_hot(object_id)
         if hot:
             txn.context.hot_read_targets.add(str(object_id))
         key = str(object_id)
+        exact_mode = bool(txn.metadata.get("_version_risk_exact_mode", False))
+        exact_version_risk = key in set(
+            txn.metadata.get("_version_risk_read_targets", ())
+        )
         exact_write = key in txn.context.retry_conflict_write_targets
         exact_read = key in txn.context.retry_conflict_read_targets
         planned_write = key in txn.context.planned_write_targets
         profiled_hot = self.manager.hotness_tracker.is_profiled_hot(key)
         profiled_shared = self.manager.hotness_tracker.is_profiled_shared(key)
         if (
-            (profiled_hot or profiled_shared)
+            (
+                profiled_hot
+                or (
+                    profiled_shared
+                    and (
+                        not self.manager.low_conflict_occ_guard
+                        or hot
+                        or txn.context.retry_count > 0
+                        or txn.context.retry_conflict_mask
+                    )
+                )
+            )
             and txn.context.phase == TransactionPhase.EXPLORE
+            and not txn.metadata.get("_version_risk_exact_mode", False)
         ):
             guard_bit = (
                 LockClass.HOT_WRITE if planned_write and hot
@@ -49,8 +117,15 @@ class PaperATCCHooks(NoopTransactionHooks):
                     txn,
                     LockAction(txn.context.action.protected | guard_bit),
                 )
-        write_class_protected = txn.context.action.protects(hot=hot, write=True)
-        if exact_write or (planned_write and write_class_protected):
+        write_class_protected = bool(
+            not exact_mode
+            and txn.context.action.protects(hot=hot, write=True)
+        )
+        if exact_write or (
+            planned_write
+            and write_class_protected
+            and not txn.metadata.get("_defer_policy_write_locks", False)
+        ):
             self.manager.refresh_atcc_priority(txn)
             if key in txn.read_set:
                 snapshot = txn.snapshot[key]
@@ -69,7 +144,52 @@ class PaperATCCHooks(NoopTransactionHooks):
                 self.manager.atcc_locks.wlock(key, txn.context)
                 txn.refresh_unobserved_locked_snapshot(key)
             txn.context.policy_write_lock_targets.add(key)
-        elif exact_read or txn.context.action.protects(hot=hot, write=False):
+        elif exact_version_risk:
+            self.manager.refresh_atcc_priority(txn)
+            # Keep the old committed version through the long reasoning
+            # interval without holding an RLock. Commit installs a short read
+            # guard, so Agent writers remain serialized while background
+            # publishers can keep creating private versions.
+            self.manager.ensure_snapshot_epoch(txn)
+            snapshot = txn.snapshot[key]
+            if self.manager.version_manager.can_lock_pinned_version(
+                txn.context.snapshot_epoch,
+                key,
+                int(snapshot.version),
+                tid=txn.context.tid,
+            ):
+                txn.metadata.setdefault(
+                    "_version_risk_pinned_read_targets", set()
+                ).add(key)
+                self.manager.version_manager.note_version_risk_read_lock()
+                return
+            self.manager.atcc_locks.validate_and_rlock(
+                key,
+                txn.context,
+                snapshot.version,
+                lambda: (
+                    int(snapshot.version)
+                    if self.manager.version_manager.can_lock_pinned_version(
+                        txn.context.snapshot_epoch,
+                        key,
+                        int(snapshot.version),
+                        tid=txn.context.tid,
+                    )
+                    else int(
+                        self.manager.version_manager.read_committed(
+                            key
+                        ).version
+                    )
+                ),
+            )
+            txn.context.policy_read_lock_targets.add(key)
+        elif (
+            exact_read
+            or (
+                not exact_mode
+                and txn.context.action.protects(hot=hot, write=False)
+            )
+        ):
             self.manager.refresh_atcc_priority(txn)
             snapshot = txn.snapshot[key]
             self.manager.atcc_locks.validate_and_rlock(
@@ -100,23 +220,47 @@ class PaperATCCHooks(NoopTransactionHooks):
             return
         if not self.enabled(txn):
             return
+        if txn.metadata.get("_cold_occ_fast_task", False):
+            return
         hot = self.manager.is_hot(object_id)
         if hot:
             txn.context.hot_write_targets.add(str(object_id))
         key = str(object_id)
         exact_write = key in txn.context.retry_conflict_write_targets
         profiled_shared = self.manager.hotness_tracker.is_profiled_shared(key)
-        if profiled_shared and txn.context.phase in {
-            TransactionPhase.REFINE,
-            TransactionPhase.COMMIT,
-        }:
+        if (
+            profiled_shared
+            and (
+                not self.manager.low_conflict_occ_guard
+                or hot
+                or txn.context.retry_count > 0
+                or txn.context.retry_conflict_mask
+            )
+            and txn.context.phase in {
+                TransactionPhase.REFINE,
+                TransactionPhase.COMMIT,
+            }
+            and not txn.metadata.get("_version_risk_exact_mode", False)
+        ):
             guard_bit = LockClass.HOT_WRITE if hot else LockClass.COLD_WRITE
             if not (txn.context.action.protected & guard_bit):
                 self.manager.transition_atcc_action(
                     txn,
                     LockAction(txn.context.action.protected | guard_bit),
                 )
-        if exact_write or txn.context.action.protects(hot=hot, write=True):
+        exact_mode = bool(txn.metadata.get("_version_risk_exact_mode", False))
+        category_write_protected = bool(
+            not exact_mode
+            and txn.context.action.protects(hot=hot, write=True)
+        )
+        if (
+            category_write_protected
+            and txn.metadata.get("_defer_policy_write_locks", False)
+            and not exact_write
+        ):
+            txn.context.policy_write_lock_targets.add(key)
+            return
+        if exact_write or category_write_protected:
             self.manager.refresh_atcc_priority(txn)
             write_class = (
                 LockClass.HOT_WRITE if hot else LockClass.COLD_WRITE
@@ -154,14 +298,23 @@ class PaperATCCHooks(NoopTransactionHooks):
             txn.context.policy_write_lock_targets.add(key)
 
     def before_commit(self, txn: Any) -> None:
+        if txn.metadata.get("_cold_occ_fast_task", False):
+            return
         if self.enabled(txn):
             self.manager.interceptor.account_agent_interval(txn)
-            self._select_and_apply(txn, self._state(txn))
-        if self.enabled(txn) or self.coordinated_backend(txn):
+            if not txn.metadata.get("_version_risk_exact_mode", False):
+                self._select_and_apply(txn, self._state(txn))
+        if self.enabled(txn) or (
+            self.coordinated_backend(txn) and bool(txn.write_set)
+        ):
             self.manager.refresh_atcc_priority(txn)
 
     def on_phase_change(self, txn: Any, phase: TransactionPhase) -> None:
         if not self.enabled(txn):
+            return
+        if txn.metadata.get("_cold_occ_fast_task", False):
+            return
+        if txn.metadata.get("_version_risk_exact_mode", False):
             return
         initial_explore = (
             phase == TransactionPhase.EXPLORE
@@ -185,6 +338,7 @@ class PaperATCCHooks(NoopTransactionHooks):
         self._select_and_apply(txn, state)
 
     def _select_and_apply(self, txn: Any, state: Any) -> None:
+        policy_started = time.perf_counter()
         policy = self.manager.paper_policy.snapshot()
         distribution_sampler = getattr(policy, "select_with_distribution", None)
         behavior_action_probabilities = ()
@@ -200,8 +354,15 @@ class PaperATCCHooks(NoopTransactionHooks):
             else:
                 selected = policy.select(state)
                 behavior_probability = 1.0
+        if self._low_conflict_occ_guard(txn, state):
+            selected = LockAction(LockClass.NONE)
         selected = LockAction(selected.protected | txn.context.action.protected)
         selected = self._apply_protection_guard(txn, state, selected)
+        self.manager.add_commit_timing(
+            txn,
+            "policy",
+            (time.perf_counter() - policy_started) * 1000.0,
+        )
         if self.manager.collect_trajectories:
             self.manager.trajectory_collector.decision(
                 txn.context.tid,
@@ -242,8 +403,24 @@ class PaperATCCHooks(NoopTransactionHooks):
             return LockAction(guarded)
         return selected
 
+    def _low_conflict_occ_guard(self, txn: Any, state: Any) -> bool:
+        """Keep the zero-protection action while every observed risk signal is cold."""
+        return bool(
+            self.manager.low_conflict_occ_guard
+            and txn.context.action.protected == LockClass.NONE
+            and txn.context.retry_count <= 0
+            and not txn.context.retry_conflict_mask
+            and not txn.context.hot_read_targets
+            and not txn.context.hot_write_targets
+            and float(getattr(state, "global_conflict_abort_rate", 0.0) or 0.0)
+            <= 0.001
+            and int(getattr(state, "global_waiter_count", 0) or 0) == 0
+        )
+
     def on_finish(self, txn: Any) -> None:
         if not self.enabled(txn):
+            return
+        if txn.metadata.get("_cold_occ_fast_task", False):
             return
         if not self.manager.collect_trajectories:
             return
@@ -262,7 +439,13 @@ class PaperATCCHooks(NoopTransactionHooks):
         )
 
     def _state(self, txn: Any) -> Any:
+        hotness_started = time.perf_counter()
         self.manager.refresh_hot_targets(txn)
+        self.manager.add_commit_timing(
+            txn,
+            "hotness",
+            (time.perf_counter() - hotness_started) * 1000.0,
+        )
         state = self.manager.state_collector.snapshot(txn.context)
         metrics = self.manager.paper_runtime_metrics()
         return dataclasses.replace(

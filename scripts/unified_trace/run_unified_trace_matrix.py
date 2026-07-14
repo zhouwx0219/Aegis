@@ -244,6 +244,12 @@ def main() -> int:
     parser.add_argument("--agent-ratios", default=",".join(str(value) for value in AGENT_RATIOS))
     parser.add_argument("--seeds", default=",".join(str(value) for value in SEEDS))
     parser.add_argument("--transactions-per-worker", type=int, default=4)
+    parser.add_argument(
+        "--timed-trace-pool-size",
+        type=int,
+        default=8,
+        help="transactions per worker retained in a cycling timed trace",
+    )
     parser.add_argument("--background-trace-transactions-per-worker", type=int, default=128)
     parser.add_argument("--warmup-seconds", type=float, default=0.0)
     parser.add_argument("--measure-seconds", type=float, default=0.0)
@@ -271,6 +277,8 @@ def main() -> int:
 
     if args.transactions_per_worker <= 0:
         raise SystemExit("--transactions-per-worker must be positive")
+    if not 4 <= args.timed_trace_pool_size <= 8:
+        raise SystemExit("--timed-trace-pool-size must be between 4 and 8")
     if args.background_trace_transactions_per_worker <= 0:
         raise SystemExit("--background-trace-transactions-per-worker must be positive")
     if args.warmup_seconds < 0 or args.measure_seconds < 0:
@@ -308,7 +316,11 @@ def main() -> int:
         "run_id": run_id,
         "experiment_mode": experiment_mode(args.internal_runner),
         "measurement_note": measurement_note(
-            0 if float(args.measure_seconds) > 0 else args.transactions_per_worker,
+            (
+                args.timed_trace_pool_size
+                if float(args.measure_seconds) > 0
+                else args.transactions_per_worker
+            ),
             args.internal_runner,
             warmup_seconds=float(args.warmup_seconds),
             measure_seconds=float(args.measure_seconds),
@@ -322,6 +334,7 @@ def main() -> int:
         "agent_ratios": agent_ratios,
         "seeds": seeds,
         "transactions_per_worker": int(args.transactions_per_worker),
+        "timed_trace_pool_size": int(args.timed_trace_pool_size),
         "background_trace_transactions_per_worker": int(
             args.background_trace_transactions_per_worker
         ),
@@ -332,7 +345,7 @@ def main() -> int:
         "atcc_policy_control": "policy_lock_action_only",
         "atcc_priority_control": "transaction_manager_formula",
         "performance_guards_enabled": False,
-        "atcc_runtime_fast_paths_enabled": False,
+        "atcc_runtime_fast_paths_enabled": True,
         "sparse_state_risk_prior": False,
         "safety_guards_enabled": True,
         "external_systems": split_csv(args.external_systems),
@@ -377,17 +390,13 @@ def main() -> int:
         warmup_trace_csv = traces_dir / f"{trace_id}.warmup.csv"
         internal_csv = runs_dir / f"{trace_id}.internal.csv"
         external_csv = runs_dir / f"{trace_id}.external.csv"
-        measure_tpw = trace_transactions_per_worker(
-            config["variant"],
-            seconds=float(args.measure_seconds),
-            fallback=int(args.transactions_per_worker),
+        measure_tpw = (
+            int(args.timed_trace_pool_size)
+            if float(args.measure_seconds) > 0
+            else int(args.transactions_per_worker)
         )
         warmup_tpw = (
-            trace_transactions_per_worker(
-                config["variant"],
-                seconds=float(args.warmup_seconds),
-                fallback=int(args.transactions_per_worker),
-            )
+            int(args.timed_trace_pool_size)
             if float(args.warmup_seconds) > 0
             else 0
         )
