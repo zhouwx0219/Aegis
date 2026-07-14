@@ -57,6 +57,23 @@ def validate_versions(
     validate_reads: bool,
     validate_writes: bool,
 ) -> ValidationResult:
+    checks = []
+    if validate_reads:
+        checks.extend(
+            (str(object_id), int(read.version))
+            for object_id, read in getattr(txn, "read_set", {}).items()
+        )
+    if validate_writes:
+        checks.extend(
+            (str(object_id), int(write.base_version))
+            for object_id, write in getattr(txn, "write_set", {}).items()
+        )
+
+    batch_validate = getattr(store, "batch_validate_versions", None)
+    if batch_validate is not None and batch_validate(checks):
+        return ValidationResult(True)
+
+    # Preserve exact conflict attribution only on the uncommon failed batch.
     conflicts = set()
     if validate_reads:
         for object_id, read in getattr(txn, "read_set", {}).items():

@@ -55,6 +55,18 @@ PYBIND11_MODULE(cast_core, m) {
       .def("put_if_version", &storage::VersionedKVStore::PutIfVersion,
            py::call_guard<py::gil_scoped_release>())
       .def(
+          "batch_validate_versions",
+          [](const storage::VersionedKVStore& store,
+             const std::vector<std::pair<std::string, std::uint64_t>>& checks) {
+            std::vector<storage::VersionCheck> version_checks;
+            version_checks.reserve(checks.size());
+            for (const auto& check : checks) {
+              version_checks.push_back({check.first, check.second});
+            }
+            py::gil_scoped_release release;
+            return store.ValidateVersions(version_checks);
+          })
+      .def(
           "batch_put_if_version",
           [](storage::VersionedKVStore& store,
              const std::vector<std::pair<std::string, std::uint64_t>>& checks,

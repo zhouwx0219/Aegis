@@ -187,7 +187,7 @@ visible to the CC layer.
 Default strategy expansion for `--cc all`:
 
 ```text
-occ, 2pl-nowait, 2pl-wait-die, mvcc, silo, tictoc, dynamic-atcc
+occ, 2pl-nowait, 2pl-wait-die, mvcc, silo, tictoc, bamboo, polaris, paper-atcc
 ```
 
 Additional explicit ATCC ablation strategies:
@@ -200,6 +200,41 @@ trained-atcc-priority   trained policy table with runtime priority
 ```
 
 ## ATCC Mechanism
+
+### Paper-aligned runtime
+
+`paper-atcc` is the implementation corresponding to the current Aegis paper.
+It is separate from the legacy `dynamic-atcc` benchmark strategy. Paper ATCC
+starts each transaction in OCC, invokes a compiled phase policy through the
+operation interceptor, and monotonically expands a four-bit lock action over
+hot/cold reads/writes. Action changes retroactively validate prior reads before
+acquiring read/write locks. Lock conflicts use dynamic-priority Wound-Wait;
+commit acquires the remaining write set, validates optimistic reads, enters a
+non-preemptible committing state, flushes Undo records, atomically installs
+buffered writes, publishes COMMIT, and releases locks.
+
+Train a compiled policy from runtime trajectories:
+
+```bash
+python3 scripts/train_paper_atcc.py \
+  --trajectory results/paper_trajectory.json \
+  --output results/paper_policy.json \
+  --report results/paper_train_report.json \
+  --generation 2
+```
+
+Run fixed-trace evaluation with the paper runtime:
+
+```bash
+python3 scripts/unified_trace/run_unified_trace_matrix.py \
+  --output-dir results/paper_main \
+  --paper-policy results/paper_policy.json \
+  --internal-cc occ,2pl-nowait,2pl-wait-die,mvcc,silo,tictoc,bamboo,polaris,paper-atcc
+```
+
+`dynamic-atcc`, reservations, runtime performance overrides, and learned
+admission yield are retained only for legacy reproduction and are not part of
+the paper-aligned mechanism.
 
 `dynamic-atcc` chooses one action per agent transaction from the policy/action
 space below:

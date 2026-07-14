@@ -78,6 +78,7 @@ def prepare_task_transaction(
     task: AgentTask,
     *,
     runtime_context: Optional[Mapping[str, Any]] = None,
+    cc: str = "occ",
 ) -> AgentTransaction:
     context = {**dict(task.context), **dict(runtime_context or {})}
     txn = manager.begin(
@@ -87,8 +88,14 @@ def prepare_task_transaction(
             "task_type": task.task_type,
             "context": context,
             "retry_count": int(context.get("retry_count", 0) or 0),
+            "cc": str(cc),
+            "planned_write_targets": [
+                operation.object_id
+                for operation in task.operations
+                if operation.kind == "write"
+            ],
         },
-        snapshot_object_ids=tuple(operation.object_id for operation in task.operations),
+        strategy=str(cc),
     )
     populate_task_transaction(txn, task)
     return txn
@@ -101,7 +108,7 @@ def execute_task(
     cc: str = "occ",
     runtime_context: Optional[Mapping[str, Any]] = None,
 ) -> TransactionResult:
-    txn = prepare_task_transaction(manager, task, runtime_context=runtime_context)
+    txn = prepare_task_transaction(manager, task, runtime_context=runtime_context, cc=cc)
     return txn.commit(strategy=cc)
 
 

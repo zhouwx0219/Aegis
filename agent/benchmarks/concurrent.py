@@ -333,7 +333,10 @@ def execute_planned_task(txn: Any, planned: PlannedTask) -> None:
 
 
 def execute_phase(txn: Any, phase: PlannedPhase) -> None:
-    for operation in phase.operations:
+    sleep_for_reasoning(phase.reasoning_delay_ms)
+    delays = tuple(phase.operation_delays_ms or ())
+    for index, operation in enumerate(phase.operations):
+        sleep_for_reasoning(delays[index] if index < len(delays) else 0)
         apply_operation(txn, operation)
     txn._event(
         "phase",
@@ -343,7 +346,6 @@ def execute_phase(txn: Any, phase: PlannedPhase) -> None:
             "reasoning_delay_ms": int(phase.reasoning_delay_ms),
         },
     )
-    sleep_for_reasoning(phase.reasoning_delay_ms)
 
 
 def decision_locks_before_commit(prelock: Dict[str, Any]) -> bool:
@@ -381,7 +383,7 @@ def execute_with_commit_phase_lock(
             lock_started_at = time.perf_counter()
             conflicts = planned_write_conflicts(manager, txn, planned)
             if conflicts:
-                skipped = sum(phase.reasoning_delay_ms for phase in commit_phases)
+                skipped = sum(phase.total_reasoning_delay_ms for phase in commit_phases)
                 txn.metadata["atcc_runtime"] = {
                     "lock_wait_ms": lock_wait_s * 1000.0,
                     "lock_hold_ms": (time.perf_counter() - lock_started_at) * 1000.0,
@@ -468,6 +470,8 @@ def execute_deferred_commit_phase_lock(
     before_commit, commit_phases = split_commit_phases(planned)
     for phase in before_commit:
         sleep_for_reasoning(phase.reasoning_delay_ms)
+        for operation_delay_ms in phase.operation_delays_ms:
+            sleep_for_reasoning(operation_delay_ms)
     if commit_barrier is not None:
         commit_barrier.wait()
     wait_started_at = time.perf_counter()

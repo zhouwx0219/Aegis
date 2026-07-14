@@ -42,6 +42,17 @@ class WriteRecord:
     metadata: Dict[str, Any] = dataclasses.field(default_factory=dict)
 
 
+@dataclasses.dataclass(frozen=True)
+class ConflictDetail:
+    """Structured feedback used to protect the conflicting class on retry."""
+
+    object_id: str
+    access_kind: str
+    hot: bool
+    protection_class: str
+    protection_bit: int
+
+
 @dataclasses.dataclass
 class TransactionResult:
     task_id: str
@@ -54,10 +65,15 @@ class TransactionResult:
     read_count: int
     write_count: int
     conflict_object_ids: Tuple[str, ...] = ()
+    conflict_details: Tuple[ConflictDetail, ...] = ()
+    retry_protection_mask: int = 0
     lock_wait_s: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         row = dataclasses.asdict(self)
         row["state"] = self.state.value
         row["conflict_object_ids"] = list(self.conflict_object_ids)
+        row["conflict_details"] = [
+            dataclasses.asdict(detail) for detail in self.conflict_details
+        ]
         return row

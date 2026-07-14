@@ -33,7 +33,7 @@ AGENT_RATIOS = (1.0, 0.8)
 SEEDS = (920104, 920105, 920106)
 TRAINING_CLIENTS = (24, 40)
 TRAINING_SEEDS = (810104, 810105, 810106)
-INTERNAL_CCS = "occ,2pl-nowait,2pl-wait-die,mvcc,silo,tictoc,bamboo,polaris,dynamic-atcc"
+INTERNAL_CCS = "occ,2pl-nowait,2pl-wait-die,mvcc,silo,tictoc,bamboo,polaris,paper-atcc"
 EXTERNAL_SYSTEMS = "bamboo,polaris"
 
 VARIANTS: dict[str, dict[str, str]] = {
@@ -154,10 +154,57 @@ SUMMARY_FIELDS = [
     "conflict_abort_count_mean",
     "reservation_admission_abort_count_mean",
     "lock_timeout_abort_count_mean",
+    "lock_preempted_abort_count_mean",
     "full_commit_lock_timeout_abort_count_mean",
     "hot_commit_lock_timeout_abort_count_mean",
     "begin_lock_timeout_abort_count_mean",
     "version_validation_abort_count_mean",
+    "paper_read_lock_acquires_mean",
+    "paper_write_lock_acquires_mean",
+    "paper_lock_wait_events_mean",
+    "paper_lock_wait_ms_mean",
+    "paper_agent_lock_wait_events_mean",
+    "paper_agent_lock_wait_ms_mean",
+    "paper_background_lock_wait_events_mean",
+    "paper_background_lock_wait_ms_mean",
+    "paper_wounds_mean",
+    "paper_background_fast_publishes_mean",
+    "paper_background_fast_publish_failures_mean",
+    "paper_background_publish_fallbacks_mean",
+    "paper_background_publish_fallback_active_writer_mean",
+    "paper_background_publish_fallback_version_mismatch_mean",
+    "paper_background_publish_fallback_commit_latch_mean",
+    "paper_background_publish_fallback_missing_private_version_mean",
+    "paper_background_publish_fallback_multi_object_atomicity_mean",
+    "paper_background_publish_fallback_unsupported_operation_mean",
+    "paper_version_private_prepares_mean",
+    "paper_version_private_discards_mean",
+    "paper_version_atomic_publishes_mean",
+    "paper_version_published_objects_mean",
+    "paper_version_gc_versions_mean",
+    "paper_version_history_versions_mean",
+    "paper_version_pinned_transactions_mean",
+    "paper_version_private_transactions_mean",
+    "paper_version_commit_table_entries_mean",
+    "paper_retry_validation_conflicts_mean",
+    "paper_retry_mask_escalations_mean",
+    "paper_retry_full_observed_escalations_mean",
+    "paper_retry_inherited_attempts_mean",
+    "paper_retry_tracked_tasks_mean",
+    "paper_retry_validation_conflicts_first_attempt_mean",
+    "paper_retry_validation_conflicts_retry_attempt_mean",
+    "paper_retry_conflict_hot_read_mean",
+    "paper_retry_conflict_cold_read_mean",
+    "paper_retry_conflict_hot_write_mean",
+    "paper_retry_conflict_cold_write_mean",
+    "paper_retry_conflict_read_before_write_mean",
+    "paper_retry_conflict_blind_write_mean",
+    "paper_retry_conflict_object_warehouse_mean",
+    "paper_retry_conflict_object_district_mean",
+    "paper_retry_conflict_object_stock_mean",
+    "paper_retry_conflict_object_customer_mean",
+    "paper_retry_conflict_object_other_mean",
+    "paper_hotness_hot_objects_mean",
     "agent_avg_tokens_mean",
     "agent_total_tokens_mean",
     "version_conflict_count_mean",
@@ -173,6 +220,15 @@ SUMMARY_FIELDS = [
     "atcc_total_tps_speedup",
     "atcc_agent_tps_speedup",
     "atcc_abort_rate_delta",
+    "best_traditional_cc",
+    "best_traditional_agent_tps_mean",
+    "best_traditional_total_tps_mean",
+    "best_traditional_p99_latency_ms_mean",
+    "atcc_vs_best_traditional_agent_tps_speedup",
+    "atcc_vs_best_traditional_total_tps_speedup",
+    "atcc_vs_best_traditional_completion_rate_delta",
+    "atcc_vs_best_traditional_abort_rate_delta",
+    "atcc_vs_best_traditional_p99_reduction",
     "status",
     "errors",
 ]
@@ -188,6 +244,7 @@ def main() -> int:
     parser.add_argument("--agent-ratios", default=",".join(str(value) for value in AGENT_RATIOS))
     parser.add_argument("--seeds", default=",".join(str(value) for value in SEEDS))
     parser.add_argument("--transactions-per-worker", type=int, default=4)
+    parser.add_argument("--background-trace-transactions-per-worker", type=int, default=128)
     parser.add_argument("--warmup-seconds", type=float, default=0.0)
     parser.add_argument("--measure-seconds", type=float, default=0.0)
     parser.add_argument("--no-cycle-trace", action="store_false", dest="cycle_trace")
@@ -195,13 +252,15 @@ def main() -> int:
     parser.add_argument("--external-systems", default=EXTERNAL_SYSTEMS)
     parser.add_argument("--internal-runner", choices=("fair", "simple"), default="fair")
     parser.add_argument("--reasoning-profile", default="agentic")
-    parser.add_argument("--reasoning-scale", type=float, default=2.0)
+    parser.add_argument("--reasoning-scale", type=float, default=1.0)
     parser.add_argument("--max-attempts", type=int, default=5)
     parser.add_argument("--external-timeout", type=float, default=120.0)
     parser.add_argument("--budget-seconds", type=float, default=18000.0)
     parser.add_argument("--reserve-seconds", type=float, default=300.0)
     parser.add_argument("--skip-training", action="store_true")
     parser.add_argument("--policy", type=Path, default=None)
+    parser.add_argument("--paper-policy", type=Path, default=None)
+    parser.add_argument("--trajectory-dir", type=Path, default=None)
     parser.add_argument("--training-episodes", type=int, default=3)
     parser.add_argument("--training-duration", type=float, default=2.0)
     parser.add_argument("--training-clients", default=",".join(str(value) for value in TRAINING_CLIENTS))
@@ -212,6 +271,8 @@ def main() -> int:
 
     if args.transactions_per_worker <= 0:
         raise SystemExit("--transactions-per-worker must be positive")
+    if args.background_trace_transactions_per_worker <= 0:
+        raise SystemExit("--background-trace-transactions-per-worker must be positive")
     if args.warmup_seconds < 0 or args.measure_seconds < 0:
         raise SystemExit("--warmup-seconds/--measure-seconds must be non-negative")
 
@@ -223,6 +284,9 @@ def main() -> int:
     logs_dir = output_dir / "logs"
     for directory in (output_dir, traces_dir, runs_dir, logs_dir):
         directory.mkdir(parents=True, exist_ok=True)
+    trajectory_dir = args.trajectory_dir.resolve() if args.trajectory_dir else None
+    if trajectory_dir is not None:
+        trajectory_dir.mkdir(parents=True, exist_ok=True)
 
     policy_path = (args.policy or output_dir / f"{run_id}.policy.json").resolve()
     train_report_path = output_dir / f"{run_id}.train_report.json"
@@ -237,6 +301,8 @@ def main() -> int:
     seeds = [int(value) for value in split_csv(args.seeds)]
     training_clients = [int(value) for value in split_csv(args.training_clients)]
     training_seeds = [int(value) for value in split_csv(args.training_seeds)]
+    internal_ccs = split_csv(args.internal_cc)
+    needs_legacy_policy = "dynamic-atcc" in internal_ccs
 
     manifest = {
         "run_id": run_id,
@@ -249,16 +315,22 @@ def main() -> int:
         ),
         "output_dir": str(output_dir),
         "policy": str(policy_path),
+        "paper_policy": str(args.paper_policy.resolve()) if args.paper_policy else "",
+        "trajectory_dir": str(trajectory_dir) if trajectory_dir else "",
         "variants": variants,
         "clients": clients,
         "agent_ratios": agent_ratios,
         "seeds": seeds,
         "transactions_per_worker": int(args.transactions_per_worker),
+        "background_trace_transactions_per_worker": int(
+            args.background_trace_transactions_per_worker
+        ),
         "warmup_seconds": float(args.warmup_seconds),
         "measure_seconds": float(args.measure_seconds),
         "cycle_trace": bool(args.cycle_trace),
-        "internal_cc": split_csv(args.internal_cc),
-        "atcc_policy_control": "policy_action_and_priority",
+        "internal_cc": internal_ccs,
+        "atcc_policy_control": "policy_lock_action_only",
+        "atcc_priority_control": "transaction_manager_formula",
         "performance_guards_enabled": False,
         "atcc_runtime_fast_paths_enabled": False,
         "sparse_state_risk_prior": False,
@@ -274,7 +346,7 @@ def main() -> int:
     }
     write_json(manifest_path, manifest)
 
-    if not args.skip_training and not policy_path.exists():
+    if needs_legacy_policy and not args.skip_training and not policy_path.exists():
         run_training(
             policy_path=policy_path,
             train_report_path=train_report_path,
@@ -287,8 +359,10 @@ def main() -> int:
             reasoning_scale=args.reasoning_scale,
             logs_dir=logs_dir,
         )
-    elif not policy_path.exists():
+    elif needs_legacy_policy and not policy_path.exists():
         raise SystemExit(f"missing policy with --skip-training: {policy_path}")
+    if "paper-atcc" in internal_ccs and args.paper_policy is None:
+        raise SystemExit("paper-atcc requires --paper-policy")
 
     matrix = list(iter_matrix(variants, clients, agent_ratios, seeds))
     write_progress_header(progress_csv)
@@ -340,6 +414,8 @@ def main() -> int:
                         str(config["repeat"]),
                         "--transactions-per-worker",
                         str(warmup_tpw),
+                        "--background-trace-transactions-per-worker",
+                        str(max(warmup_tpw, args.background_trace_transactions_per_worker)),
                         "--reasoning-profile",
                         args.reasoning_profile,
                         "--reasoning-scale",
@@ -368,6 +444,8 @@ def main() -> int:
                         str(config["repeat"]),
                         "--transactions-per-worker",
                         str(measure_tpw),
+                        "--background-trace-transactions-per-worker",
+                        str(max(measure_tpw, args.background_trace_transactions_per_worker)),
                         "--reasoning-profile",
                         args.reasoning_profile,
                         "--reasoning-scale",
@@ -385,11 +463,17 @@ def main() -> int:
                     str(internal_csv),
                     "--cc",
                     args.internal_cc,
-                    "--policy",
-                    str(policy_path),
                     "--max-attempts",
                     str(args.max_attempts),
                 ]
+                if needs_legacy_policy:
+                    internal_cmd.extend(["--policy", str(policy_path)])
+                if args.paper_policy is not None:
+                    internal_cmd.extend(["--paper-policy", str(args.paper_policy.resolve())])
+                if trajectory_dir is not None and "paper-atcc" in internal_ccs:
+                    internal_cmd.extend(
+                        ["--trajectory-output", str(trajectory_dir / f"{trace_id}.json")]
+                    )
                 if str(args.internal_runner).strip().lower() == "fair":
                     if warmup_tpw > 0:
                         internal_cmd.extend(
@@ -443,6 +527,7 @@ def main() -> int:
         run_id=run_id,
         output_dir=output_dir,
         policy_path=policy_path,
+        paper_policy_path=args.paper_policy.resolve() if args.paper_policy else None,
         transactions_per_worker=args.transactions_per_worker,
         warmup_seconds=float(args.warmup_seconds),
         measure_seconds=float(args.measure_seconds),
@@ -593,7 +678,8 @@ def run_training(
         "tokens_per_operation": 2703,
         "max_attempts_per_task": 5,
         "background_mode": "procedure",
-        "atcc_policy_control": "policy_action_and_priority",
+        "atcc_policy_control": "policy_lock_action_only",
+        "atcc_priority_control": "transaction_manager_formula",
         "performance_guards_enabled": False,
         "atcc_runtime_fast_paths_enabled": False,
         "sparse_state_risk_prior": False,
@@ -626,6 +712,7 @@ def build_raw_rows(
     run_id: str,
     output_dir: Path,
     policy_path: Path,
+    paper_policy_path: Path | None,
     transactions_per_worker: int,
     warmup_seconds: float,
     measure_seconds: float,
@@ -663,7 +750,7 @@ def build_raw_rows(
                     "client_mix": client_mix(row.get("agent_ratio", "")),
                     "cc_label": cc_label,
                     "cc_family": "atcc" if cc_label == "ATCC" else "traditional",
-                    "policy": str(policy_path) if cc_label == "ATCC" else "",
+                    "policy": str(paper_policy_path or policy_path) if cc_label == "ATCC" else "",
                     "policy_mode": "eval" if cc_label == "ATCC" else "",
                     "ycsb_zipf_theta": variant.get("ycsb_zipf_theta", ""),
                     "tpcc_warehouses": variant.get("tpcc_warehouses", ""),
@@ -746,10 +833,57 @@ def summarize(rows: list[dict[str, Any]], *, run_id: str) -> list[dict[str, Any]
             "conflict_abort_count",
             "reservation_admission_abort_count",
             "lock_timeout_abort_count",
+            "lock_preempted_abort_count",
             "full_commit_lock_timeout_abort_count",
             "hot_commit_lock_timeout_abort_count",
             "begin_lock_timeout_abort_count",
             "version_validation_abort_count",
+            "paper_read_lock_acquires",
+            "paper_write_lock_acquires",
+            "paper_lock_wait_events",
+            "paper_lock_wait_ms",
+            "paper_agent_lock_wait_events",
+            "paper_agent_lock_wait_ms",
+            "paper_background_lock_wait_events",
+            "paper_background_lock_wait_ms",
+            "paper_wounds",
+            "paper_background_fast_publishes",
+            "paper_background_fast_publish_failures",
+            "paper_background_publish_fallbacks",
+            "paper_background_publish_fallback_active_writer",
+            "paper_background_publish_fallback_version_mismatch",
+            "paper_background_publish_fallback_commit_latch",
+            "paper_background_publish_fallback_missing_private_version",
+            "paper_background_publish_fallback_multi_object_atomicity",
+            "paper_background_publish_fallback_unsupported_operation",
+            "paper_version_private_prepares",
+            "paper_version_private_discards",
+            "paper_version_atomic_publishes",
+            "paper_version_published_objects",
+            "paper_version_gc_versions",
+            "paper_version_history_versions",
+            "paper_version_pinned_transactions",
+            "paper_version_private_transactions",
+            "paper_version_commit_table_entries",
+            "paper_retry_validation_conflicts",
+            "paper_retry_mask_escalations",
+            "paper_retry_full_observed_escalations",
+            "paper_retry_inherited_attempts",
+            "paper_retry_tracked_tasks",
+            "paper_retry_validation_conflicts_first_attempt",
+            "paper_retry_validation_conflicts_retry_attempt",
+            "paper_retry_conflict_hot_read",
+            "paper_retry_conflict_cold_read",
+            "paper_retry_conflict_hot_write",
+            "paper_retry_conflict_cold_write",
+            "paper_retry_conflict_read_before_write",
+            "paper_retry_conflict_blind_write",
+            "paper_retry_conflict_object_warehouse",
+            "paper_retry_conflict_object_district",
+            "paper_retry_conflict_object_stock",
+            "paper_retry_conflict_object_customer",
+            "paper_retry_conflict_object_other",
+            "paper_hotness_hot_objects",
             "agent_reservation_wait_ms_total",
             "agent_reservation_wait_ms_mean",
             "background_reservation_wait_ms_total",
@@ -779,10 +913,53 @@ def summarize(rows: list[dict[str, Any]], *, run_id: str) -> list[dict[str, Any]
                 "conflict_abort_count",
                 "reservation_admission_abort_count",
                 "lock_timeout_abort_count",
+                "lock_preempted_abort_count",
                 "full_commit_lock_timeout_abort_count",
                 "hot_commit_lock_timeout_abort_count",
                 "begin_lock_timeout_abort_count",
                 "version_validation_abort_count",
+                "paper_read_lock_acquires",
+                "paper_write_lock_acquires",
+                "paper_lock_wait_events",
+                "paper_lock_wait_ms",
+                "paper_wounds",
+                "paper_background_fast_publishes",
+                "paper_background_fast_publish_failures",
+                "paper_background_publish_fallbacks",
+                "paper_background_publish_fallback_active_writer",
+                "paper_background_publish_fallback_version_mismatch",
+                "paper_background_publish_fallback_commit_latch",
+                "paper_background_publish_fallback_missing_private_version",
+                "paper_background_publish_fallback_multi_object_atomicity",
+                "paper_background_publish_fallback_unsupported_operation",
+                "paper_version_private_prepares",
+                "paper_version_private_discards",
+                "paper_version_atomic_publishes",
+                "paper_version_published_objects",
+                "paper_version_gc_versions",
+                "paper_version_history_versions",
+                "paper_version_pinned_transactions",
+                "paper_version_private_transactions",
+                "paper_version_commit_table_entries",
+                "paper_retry_validation_conflicts",
+                "paper_retry_mask_escalations",
+                "paper_retry_full_observed_escalations",
+                "paper_retry_inherited_attempts",
+                "paper_retry_tracked_tasks",
+                "paper_retry_validation_conflicts_first_attempt",
+                "paper_retry_validation_conflicts_retry_attempt",
+                "paper_retry_conflict_hot_read",
+                "paper_retry_conflict_cold_read",
+                "paper_retry_conflict_hot_write",
+                "paper_retry_conflict_cold_write",
+                "paper_retry_conflict_read_before_write",
+                "paper_retry_conflict_blind_write",
+                "paper_retry_conflict_object_warehouse",
+                "paper_retry_conflict_object_district",
+                "paper_retry_conflict_object_stock",
+                "paper_retry_conflict_object_customer",
+                "paper_retry_conflict_object_other",
+                "paper_hotness_hot_objects",
                 "agent_avg_tokens",
                 "agent_total_tokens",
             }:
@@ -820,6 +997,88 @@ def summarize(rows: list[dict[str, Any]], *, run_id: str) -> list[dict[str, Any]
         this_abort = parse_float(row.get("agent_attempt_abort_rate_mean"))
         row["atcc_abort_rate_delta"] = (
             fmt(atcc_abort - this_abort) if atcc_abort is not None and this_abort is not None else ""
+        )
+
+    traditional_by_config: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    for row in summaries:
+        if row.get("cc_family") != "traditional" or row.get("status") == "error":
+            continue
+        key = (
+            row.get("workload_variant", ""),
+            row.get("client_mix", ""),
+            str(row.get("clients", "")),
+            str(row.get("agent_ratio", "")),
+        )
+        current = traditional_by_config.get(key)
+        score = (
+            parse_float(row.get("agent_tps_mean")) or 0.0,
+            parse_float(row.get("total_tps_mean")) or 0.0,
+            str(row.get("cc", "")),
+        )
+        current_score = (
+            parse_float(current.get("agent_tps_mean")) or 0.0,
+            parse_float(current.get("total_tps_mean")) or 0.0,
+            str(current.get("cc", "")),
+        ) if current is not None else None
+        if current_score is None or score > current_score:
+            traditional_by_config[key] = row
+
+    for row in summaries:
+        for field in (
+            "best_traditional_cc",
+            "best_traditional_agent_tps_mean",
+            "best_traditional_total_tps_mean",
+            "best_traditional_p99_latency_ms_mean",
+            "atcc_vs_best_traditional_agent_tps_speedup",
+            "atcc_vs_best_traditional_total_tps_speedup",
+            "atcc_vs_best_traditional_completion_rate_delta",
+            "atcc_vs_best_traditional_abort_rate_delta",
+            "atcc_vs_best_traditional_p99_reduction",
+        ):
+            row[field] = ""
+        if row.get("cc_label") != "ATCC":
+            continue
+        key = (
+            row.get("workload_variant", ""),
+            row.get("client_mix", ""),
+            str(row.get("clients", "")),
+            str(row.get("agent_ratio", "")),
+        )
+        baseline = traditional_by_config.get(key)
+        if baseline is None:
+            continue
+        row["best_traditional_cc"] = baseline.get("cc", "")
+        row["best_traditional_agent_tps_mean"] = baseline.get("agent_tps_mean", "")
+        row["best_traditional_total_tps_mean"] = baseline.get("total_tps_mean", "")
+        row["best_traditional_p99_latency_ms_mean"] = baseline.get(
+            "agent_p99_latency_ms_mean", ""
+        )
+        row["atcc_vs_best_traditional_agent_tps_speedup"] = ratio(
+            row.get("agent_tps_mean"), baseline.get("agent_tps_mean")
+        )
+        row["atcc_vs_best_traditional_total_tps_speedup"] = ratio(
+            row.get("total_tps_mean"), baseline.get("total_tps_mean")
+        )
+        atcc_completion = parse_float(row.get("agent_task_completion_rate_mean"))
+        baseline_completion = parse_float(baseline.get("agent_task_completion_rate_mean"))
+        row["atcc_vs_best_traditional_completion_rate_delta"] = (
+            fmt(atcc_completion - baseline_completion)
+            if atcc_completion is not None and baseline_completion is not None
+            else ""
+        )
+        atcc_abort = parse_float(row.get("agent_attempt_abort_rate_mean"))
+        baseline_abort = parse_float(baseline.get("agent_attempt_abort_rate_mean"))
+        row["atcc_vs_best_traditional_abort_rate_delta"] = (
+            fmt(atcc_abort - baseline_abort)
+            if atcc_abort is not None and baseline_abort is not None
+            else ""
+        )
+        atcc_p99 = parse_float(row.get("agent_p99_latency_ms_mean"))
+        baseline_p99 = parse_float(baseline.get("agent_p99_latency_ms_mean"))
+        row["atcc_vs_best_traditional_p99_reduction"] = (
+            fmt((baseline_p99 - atcc_p99) / baseline_p99)
+            if atcc_p99 is not None and atcc_p99 > 0 and baseline_p99 is not None and baseline_p99 > 0
+            else ""
         )
     return [{field: row.get(field, "") for field in SUMMARY_FIELDS} for row in summaries]
 
@@ -880,7 +1139,7 @@ def optional_int(value: object) -> int | None:
 def label_for(row: dict[str, Any]) -> str:
     system = str(row.get("system", "")).lower()
     cc = str(row.get("cc", "")).lower()
-    if cc == "dynamic-atcc":
+    if cc in {"dynamic-atcc", "paper-atcc"}:
         return "ATCC"
     if cc == "occ":
         return "OCC"
@@ -1029,13 +1288,15 @@ def measurement_note(
             "steady-state fixed trace source replay with CAST-DAS paper agent runtime; "
             f"warmup={float(warmup_seconds):g}s measure={float(measure_seconds):g}s; "
             f"{length_note}; "
-            "ATCC preplan/reservation/deferred paths enabled; no outcome oracle"
+            "paper ATCC phase hooks, monotonic lock actions, retroactive validation, "
+            "dynamic-priority Wound-Wait, deferred writes, and unified commit enabled; no outcome oracle"
         )
     if str(internal_runner).strip().lower() == "fair":
         return (
-            "fixed transaction-count replay with CAST-DAS paper agent runtime; "
-            f"{int(transactions_per_worker)} transactions per worker; "
-            "ATCC preplan/reservation/deferred paths enabled"
+            "fixed agent transaction-count replay with CAST-DAS paper agent runtime; "
+            f"{int(transactions_per_worker)} transactions per agent worker; "
+            "mixed-workload background workers continuously cycle their fixed trace until all agent workers finish; "
+            "paper ATCC operation/phase runtime enabled"
         )
     return (
         "fixed transaction-count replay under 5h budget; "

@@ -14,6 +14,21 @@ class OccConcurrencyControl(ConcurrencyControl):
     description = "Strict OCC validation over read and write versions."
 
 
+class PaperATCCConcurrencyControl(ConcurrencyControl):
+    name = "paper-atcc"
+    family = "paper-atcc"
+    description = "Phase-aware operation-level ATCC with runtime-owned locking and unified commit."
+
+    def plan(self, txn: Any) -> CCPlan:
+        return CCPlan(
+            strategy=self.name,
+            family=self.family,
+            validate_reads=True,
+            validate_writes=True,
+            metadata={"paper_atcc": True},
+        )
+
+
 class TwoPhaseLockingConcurrencyControl(ConcurrencyControl):
     family = "pessimistic"
 
@@ -40,14 +55,15 @@ class TwoPhaseLockingConcurrencyControl(ConcurrencyControl):
 class MvccConcurrencyControl(ConcurrencyControl):
     name = "mvcc"
     family = "mvcc"
-    description = "Snapshot-style validation that rejects write-write conflicts."
+    description = "Serializable MVCC fallback with full observed-version validation."
 
     def plan(self, txn: Any) -> CCPlan:
         return CCPlan(
             strategy=self.name,
             family=self.family,
-            validate_reads=False,
+            validate_reads=True,
             validate_writes=True,
+            metadata={"isolation": "serializable", "adapter": "cast-das-versioned-kv"},
         )
 
 
@@ -70,16 +86,21 @@ class SiloConcurrencyControl(ConcurrencyControl):
 class TicTocConcurrencyControl(ConcurrencyControl):
     name = "tictoc"
     family = "tictoc"
-    description = "TicToc-style write locking with write-version validation."
+    description = "Serializable TicToc adapter with write locking and full validation."
 
     def plan(self, txn: Any) -> CCPlan:
         return CCPlan(
             strategy=self.name,
             family=self.family,
             lock_targets=unique_targets(getattr(txn, "write_set", {}).keys()),
-            validate_reads=False,
+            validate_reads=True,
             validate_writes=True,
-            metadata={"lock_table": "exclusive", "wait": True},
+            metadata={
+                "lock_table": "exclusive",
+                "wait": True,
+                "isolation": "serializable",
+                "adapter": "cast-das-versioned-kv",
+            },
         )
 
 

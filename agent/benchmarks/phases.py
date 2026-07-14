@@ -35,8 +35,10 @@ class ReasoningProfile:
     def retry_delay_ms(self, *, level: str, task_id: str, attempt: int) -> int:
         if self.name in {"none", "off", "disabled"} or attempt <= 0:
             return 0
-        reasoning_level = "high" if self.name in {"agentic", "heavy", "long"} else level
-        low, high = retry_delay_range_ms(reasoning_level)
+        if self.name in {"agentic", "heavy", "long"}:
+            low, high = (500, 5000)
+        else:
+            low, high = retry_delay_range_ms(level)
         low = int(max(0, round(low * self.scale)))
         high = int(max(low, round(high * self.scale)))
         return deterministic_int(
@@ -45,12 +47,50 @@ class ReasoningProfile:
             "|".join((self.name, level, "retry", task_id, str(attempt))),
         )
 
+    def operation_delay_ms(
+        self,
+        *,
+        level: str,
+        phase: str,
+        task_id: str,
+        attempt: int,
+        operation_index: int,
+    ) -> int:
+        if self.name in {"none", "off", "disabled"}:
+            return 0
+        low, high = (1, 20)
+        if self.name in {"light", "short"}:
+            low, high = (1, 10)
+        elif self.name in {"heavy", "long"}:
+            low, high = (2, 40)
+        low = int(max(0, round(low * self.scale)))
+        high = int(max(low, round(high * self.scale)))
+        return deterministic_int(
+            low,
+            high,
+            "|".join(
+                (
+                    self.name,
+                    str(level),
+                    str(phase),
+                    str(task_id),
+                    str(attempt),
+                    str(operation_index),
+                )
+            ),
+        )
+
 
 @dataclasses.dataclass(frozen=True)
 class PlannedPhase:
     name: str
     operations: Tuple[AgentOperation, ...]
     reasoning_delay_ms: int = 0
+    operation_delays_ms: Tuple[int, ...] = ()
+
+    @property
+    def total_reasoning_delay_ms(self) -> int:
+        return int(self.reasoning_delay_ms) + sum(int(value) for value in self.operation_delays_ms)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -61,7 +101,9 @@ class PlannedTask:
 
     @property
     def total_reasoning_delay_ms(self) -> int:
-        return int(self.retry_delay_ms) + sum(phase.reasoning_delay_ms for phase in self.phases)
+        return int(self.retry_delay_ms) + sum(
+            phase.total_reasoning_delay_ms for phase in self.phases
+        )
 
     @property
     def phase_count(self) -> int:
@@ -74,33 +116,79 @@ def plan_task_phases(
     attempt: int,
     profile: ReasoningProfile,
 ) -> PlannedTask:
-    level = str(dict(task.context).get("level", "low"))
     context = dict(task.context)
+    level = str(context.get("level", "low"))
+    operations_by_phase = phase_operations(task)
+    operation_indexes = {id(operation): index for index, operation in enumerate(task.operations)}
+    paper_timing = str(context.get("profile", "small")).strip().lower() == "paper"
+    if paper_timing:
+        phases = tuple(
+            PlannedPhase(
+                phase,
+                operations,
+                0,
+                tuple(
+                    profile.operation_delay_ms(
+                        level=level,
+                        phase=phase,
+                        task_id=task.task_id,
+                        attempt=attempt,
+                        operation_index=operation_indexes[id(operation)],
+                    )
+                    for operation in operations
+                ),
+            )
+            for phase, operations in operations_by_phase
+        )
+    else:
+        phases = tuple(
+            PlannedPhase(
+                phase,
+                operations,
+                agent_delay_ms(
+                    profile,
+                    context,
+                    level=level,
+                    phase=phase,
+                    task_id=task.task_id,
+                    attempt=attempt,
+                )
+                + (side_effect_delay_ms(profile, context) if phase == "commit" else 0),
+            )
+            for phase, operations in operations_by_phase
+        )
+    return PlannedTask(
+        task=task,
+        phases=tuple(
+            phase
+            for phase in phases
+            if phase.operations or phase.total_reasoning_delay_ms > 0
+        ),
+        retry_delay_ms=profile.retry_delay_ms(level=level, task_id=task.task_id, attempt=attempt),
+    )
+
+
+def phase_operations(task: AgentTask) -> tuple[tuple[str, Tuple[AgentOperation, ...]], ...]:
+    tagged = {
+        phase: tuple(
+            operation
+            for operation in task.operations
+            if str(dict(operation.metadata).get("phase", "")).strip().lower() == phase
+        )
+        for phase in ("explore", "refine", "commit")
+    }
+    if any(tagged.values()):
+        if sum(len(values) for values in tagged.values()) != len(task.operations):
+            raise ValueError("phase-tagged tasks must tag every operation")
+        return tuple((phase, tagged[phase]) for phase in ("explore", "refine", "commit"))
+
     reads = tuple(operation for operation in task.operations if operation.kind == "read")
     writes = tuple(operation for operation in task.operations if operation.kind == "write")
     explore_reads, refine_reads = split_reads(reads)
-    phases = (
-        PlannedPhase(
-            "explore",
-            explore_reads,
-            agent_delay_ms(profile, context, level=level, phase="explore", task_id=task.task_id, attempt=attempt),
-        ),
-        PlannedPhase(
-            "refine",
-            refine_reads,
-            agent_delay_ms(profile, context, level=level, phase="refine", task_id=task.task_id, attempt=attempt),
-        ),
-        PlannedPhase(
-            "commit",
-            writes,
-            agent_delay_ms(profile, context, level=level, phase="commit", task_id=task.task_id, attempt=attempt)
-            + side_effect_delay_ms(profile, context),
-        ),
-    )
-    return PlannedTask(
-        task=task,
-        phases=tuple(phase for phase in phases if phase.operations or phase.reasoning_delay_ms > 0),
-        retry_delay_ms=profile.retry_delay_ms(level=level, task_id=task.task_id, attempt=attempt),
+    return (
+        ("explore", explore_reads),
+        ("refine", refine_reads),
+        ("commit", writes),
     )
 
 

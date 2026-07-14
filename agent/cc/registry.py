@@ -14,6 +14,7 @@ from agent.cc.traditional import (
     BambooConcurrencyControl,
     MvccConcurrencyControl,
     OccConcurrencyControl,
+    PaperATCCConcurrencyControl,
     PolarisConcurrencyControl,
     SiloConcurrencyControl,
     TicTocConcurrencyControl,
@@ -35,6 +36,7 @@ class ConcurrencyControlRegistry:
         atcc_kwargs = dict(atcc_options or {})
         for strategy in (
             OccConcurrencyControl(),
+            PaperATCCConcurrencyControl(),
             TwoPhaseLockingConcurrencyControl("2pl-nowait", "nowait"),
             TwoPhaseLockingConcurrencyControl("2pl-wait-die", "wait-die"),
             MvccConcurrencyControl(),
@@ -113,7 +115,7 @@ class ConcurrencyControlRegistry:
                 "tictoc",
                 "bamboo",
                 "polaris",
-                "dynamic-atcc",
+                "paper-atcc",
             ]
         names = []
         for item in raw:

@@ -5,6 +5,7 @@ import threading
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -33,11 +34,181 @@ from agent.cc.atcc.dynamic import DynamicATCC
 from agent.cc.atcc.features import ATCCFeatures, extract_task_features
 from agent.cc.atcc.policy import ATCCActionStats, ATCCPolicyTable, ATCCPolicyRow
 from agent.cc.atcc.reward import ATCCRewardConfig
+from scripts.train_paper_atcc_coordinated import (
+    behavior_probabilities,
+    behavior_probability,
+)
+from scripts.unified_trace.generate_castdas_trace import (
+    paper_trace_workload,
+    resolve_background_trace_length,
+)
+from scripts.unified_trace.run_castdas_trace_fair import (
+    FixedCountRunCoordinator,
+    continuous_background_rows,
+    run_rows,
+)
+from scripts.unified_trace.run_unified_trace_matrix import summarize as summarize_unified_trace
 from agent.runtime import AgentTransactionManager
+from agent.runtime import CompiledPhasePolicy, CompiledPolicyEntry, LockClass
 from agent.workloads import AgentOperation, AgentTask, build_workload
 
 
 class CompareCliTests(unittest.TestCase):
+    def test_unified_summary_compares_atcc_with_best_traditional_agent_tps(self):
+        common = {
+            "workload": "ycsb",
+            "workload_variant": "ycsb_high_z099",
+            "level": "high",
+            "client_mix": "agent80_backend20",
+            "clients": "16",
+            "agent_ratio": "0.8",
+            "source_system": "cast-das-trace-fair",
+            "system": "cast-das",
+            "status": "ok",
+        }
+        rows = [
+            {
+                **common,
+                "cc": "occ",
+                "cc_label": "OCC",
+                "cc_family": "traditional",
+                "agent_tps": "6",
+                "total_tps": "120",
+                "agent_p99_latency_ms": "80",
+                "agent_task_completion_rate": "0.7",
+                "agent_attempt_abort_rate": "0.3",
+            },
+            {
+                **common,
+                "cc": "silo",
+                "cc_label": "Silo",
+                "cc_family": "traditional",
+                "agent_tps": "8",
+                "total_tps": "100",
+                "agent_p99_latency_ms": "100",
+                "agent_task_completion_rate": "0.8",
+                "agent_attempt_abort_rate": "0.2",
+            },
+            {
+                **common,
+                "cc": "paper-atcc",
+                "cc_label": "ATCC",
+                "cc_family": "atcc",
+                "agent_tps": "10",
+                "total_tps": "90",
+                "agent_p99_latency_ms": "50",
+                "agent_task_completion_rate": "1.0",
+                "agent_attempt_abort_rate": "0.1",
+            },
+        ]
+
+        summary = summarize_unified_trace(rows, run_id="best-traditional")
+        atcc = next(row for row in summary if row["cc"] == "paper-atcc")
+
+        self.assertEqual("silo", atcc["best_traditional_cc"])
+        self.assertEqual("1.25", atcc["atcc_vs_best_traditional_agent_tps_speedup"])
+        self.assertEqual("0.9", atcc["atcc_vs_best_traditional_total_tps_speedup"])
+        self.assertEqual("0.2", atcc["atcc_vs_best_traditional_completion_rate_delta"])
+        self.assertEqual("-0.1", atcc["atcc_vs_best_traditional_abort_rate_delta"])
+        self.assertEqual("0.5", atcc["atcc_vs_best_traditional_p99_reduction"])
+
+    def test_background_trace_pool_is_independent_from_agent_task_count(self):
+        self.assertEqual(128, resolve_background_trace_length(1, 128))
+        self.assertEqual(4, resolve_background_trace_length(4, 0))
+
+    def test_fixed_count_background_cycles_until_every_agent_worker_finishes(self):
+        coordination = FixedCountRunCoordinator(2)
+        rows = [{"sequence": 0}, {"sequence": 1}]
+        selected = continuous_background_rows(rows, coordination)
+
+        self.assertEqual([0, 1, 0], [next(selected)["sequence"] for _ in range(3)])
+        coordination.agent_worker_done()
+        self.assertEqual(1, coordination.remaining_agent_workers)
+        self.assertEqual(1, next(selected)["sequence"])
+        coordination.agent_worker_done()
+
+        self.assertEqual(0, coordination.remaining_agent_workers)
+        with self.assertRaises(StopIteration):
+            next(selected)
+
+    def test_fixed_count_runner_treats_backend_rows_as_background(self):
+        rows = [
+            {"worker_id": 0, "sequence": 0, "client_type": "agent", "seed": 7},
+            {"worker_id": 1, "sequence": 0, "client_type": "backend", "seed": 7},
+        ]
+        config = MixedBenchmarkConfig(clients=2, agent_ratio=0.5)
+        background_calls = []
+
+        def run_agent(*_args):
+            time.sleep(0.01)
+
+        def run_backend(*_args):
+            background_calls.append(1)
+            time.sleep(0.001)
+
+        with mock.patch(
+            "scripts.unified_trace.run_castdas_trace_fair.run_agent_row", run_agent
+        ), mock.patch(
+            "scripts.unified_trace.run_castdas_trace_fair.run_background_row", run_backend
+        ):
+            run_rows(SimpleNamespace(), "occ", config, rows, 1)
+
+        self.assertGreater(len(background_calls), 1)
+
+    def test_fixed_trace_ycsb_uses_paper_scale_row_objects(self):
+        workload = paper_trace_workload(build_workload("ycsb", "high", "paper"))
+        tasks = workload.generate_tasks(8, seed=920104)
+
+        self.assertEqual(1_000_000, workload.config.record_count)
+        self.assertEqual(1, workload.config.field_count)
+        self.assertTrue(
+            all(operation.object_id.endswith(":field:0") for task in tasks for operation in task.operations)
+        )
+        self.assertTrue(
+            all(task.context["record_count"] == 1_000_000 for task in tasks)
+        )
+
+    def test_coordinated_operation_stay_has_exact_behavior_probability(self):
+        probabilities = behavior_probabilities(((0, 0), (0, 1), (1, 3)))
+
+        self.assertEqual(0.5, behavior_probability(probabilities, "commit", 0, 1))
+        self.assertEqual(1.0, behavior_probability(probabilities, "commit", 1, 1))
+
+    def test_registry_exposes_distinct_paper_atcc_runtime(self):
+        registry = ConcurrencyControlRegistry()
+        strategy = registry.resolve("paper-atcc")
+        self.assertEqual("paper-atcc", strategy.family)
+
+    def test_mixed_paper_atcc_uses_phase_policy_actions(self):
+        policy = CompiledPhasePolicy(
+            [
+                CompiledPolicyEntry(phase="refine", action=int(LockClass.COLD_READ)),
+                CompiledPolicyEntry(
+                    phase="commit",
+                    action=int(LockClass.COLD_READ | LockClass.COLD_WRITE),
+                ),
+            ],
+            generation=1,
+        )
+        report = run_mixed_benchmark(
+            MixedBenchmarkConfig(
+                workload="ycsb",
+                level="low",
+                cc="paper-atcc",
+                duration_s=0.05,
+                clients=2,
+                agent_ratio=1.0,
+                reasoning_profile="none",
+                retry_until_commit=True,
+                max_attempts_per_task=2,
+                paper_policy=policy,
+            )
+        )
+
+        row = report["cc_results"][0]
+        self.assertGreater(row["agent_attempts"], 0)
+        self.assertTrue(any(action.startswith("paper-action-") for action in row["action_counts"]))
+
     def test_transaction_manager_can_disable_trace_materialization(self):
         manager = AgentTransactionManager(record_traces=False)
         manager.register_object("row", "0", kind="row")
@@ -65,6 +236,48 @@ class CompareCliTests(unittest.TestCase):
         self.assertGreaterEqual(sum(high_values), 120)
         self.assertLessEqual(max(low_values), 100)
         self.assertLessEqual(max(high_values), 100)
+
+    def test_agent_phase_split_preserves_sampled_read_order(self):
+        reads = tuple(
+            AgentOperation.read(f"ycsb:record:{record}:field:0")
+            for record in (1, 50, 2, 40)
+        )
+        task = AgentTask(
+            task_id="phase-order",
+            workload="ycsb",
+            task_type="read-update",
+            operations=reads + (AgentOperation.write("ycsb:record:0:field:0", "1"),),
+            context={"level": "high", "zipf_theta": 0.99},
+        )
+
+        planned = plan_task_phases(
+            task,
+            attempt=0,
+            profile=ReasoningProfile("none", 1.0),
+        )
+        phases = {phase.name: phase for phase in planned.phases}
+        explore_ranks = [int(op.object_id.split(":")[2]) for op in phases["explore"].operations]
+        refine_ranks = [int(op.object_id.split(":")[2]) for op in phases["refine"].operations]
+
+        self.assertEqual([1, 50], explore_ranks)
+        self.assertEqual([2, 40], refine_ranks)
+
+    def test_paper_reasoning_uses_operation_and_retry_delays(self):
+        profile = ReasoningProfile("agentic", 1.0)
+
+        operation_delay = profile.operation_delay_ms(
+            level="high",
+            phase="refine",
+            task_id="task",
+            attempt=0,
+            operation_index=3,
+        )
+        retry_delay = profile.retry_delay_ms(level="high", task_id="task", attempt=1)
+
+        self.assertGreaterEqual(operation_delay, 1)
+        self.assertLessEqual(operation_delay, 20)
+        self.assertGreaterEqual(retry_delay, 500)
+        self.assertLessEqual(retry_delay, 5000)
 
     def test_reservation_attributes_background_blocking_to_owner(self):
         reservations = ReservationTable()
@@ -194,7 +407,7 @@ class CompareCliTests(unittest.TestCase):
             "tictoc",
             "bamboo",
             "polaris",
-            "dynamic-atcc",
+            "paper-atcc",
         ]
 
         self.assertEqual(expected, registry.expand("all"))
@@ -237,6 +450,24 @@ class CompareCliTests(unittest.TestCase):
         self.assertTrue(plan.validate_reads)
         self.assertTrue(plan.validate_writes)
         self.assertTrue(plan.metadata["bamboo_early_retire"])
+
+    def test_mvcc_and_tictoc_adapters_enforce_serializable_read_validation(self):
+        manager = AgentTransactionManager()
+        manager.register_object("read", "0", kind="row")
+        manager.register_object("write", "0", kind="row")
+
+        for strategy in ("mvcc", "tictoc"):
+            txn = manager.begin(f"{strategy}-stale")
+            txn.read("read")
+            txn.write("write", strategy)
+            updater = manager.begin(f"{strategy}-updater")
+            updater.write("read", f"changed-{strategy}")
+            self.assertTrue(updater.commit("occ").committed)
+
+            result = txn.commit(strategy)
+
+            self.assertFalse(result.committed)
+            self.assertIn("read", result.conflict_object_ids)
 
     def test_compare_cli_emits_report(self):
         stdout = io.StringIO()
@@ -328,6 +559,25 @@ class CompareCliTests(unittest.TestCase):
         self.assertIn("payment", {task.task_type for task in tpcc_tasks})
         self.assertIn("new_order", {task.task_type for task in tpcc_tasks})
         self.assertEqual({"payment", "new_order"}, {name for name, _weight in tpcc.config.transaction_mix})
+
+    def test_fixed_trace_tpcc_uses_standard_logical_scale_and_real_phases(self):
+        workload = paper_trace_workload(build_workload("tpcc", "high", "paper"))
+        tasks = workload.generate_tasks(32, seed=920104)
+
+        self.assertEqual(10, workload.config.districts_per_warehouse)
+        self.assertEqual(3_000, workload.config.customers_per_district)
+        self.assertEqual(100_000, workload.config.items)
+        self.assertTrue(workload.config.trace_mode)
+        self.assertTrue(any(operation.kind == "read" for task in tasks for operation in task.operations))
+        self.assertTrue(any(operation.kind == "write" for task in tasks for operation in task.operations))
+        self.assertEqual(
+            {"explore", "refine", "commit"},
+            {
+                str(operation.metadata.get("phase"))
+                for task in tasks
+                for operation in task.operations
+            },
+        )
 
     def test_ycsb_zipfian_override_switches_sampling_mode(self):
         default_medium = build_workload("ycsb", "medium", "paper")
@@ -710,7 +960,7 @@ class CompareCliTests(unittest.TestCase):
                     "--episodes",
                     "1",
                     "--duration",
-                    "0.2",
+                    "2.0",
                     "--clients",
                     "5",
                     "--agent-ratio",

@@ -237,6 +237,22 @@ bool Dbx1000VersionedKVStore::DeleteIfVersion(const std::string& key,
   return true;
 }
 
+bool Dbx1000VersionedKVStore::ValidateVersions(
+    const std::vector<VersionCheck>& checks) const {
+  const auto shards = LockShards(checks, {});
+  std::vector<std::unique_lock<std::mutex>> locks;
+  locks.reserve(shards.size());
+  for (std::size_t shard : shards) {
+    locks.emplace_back(impl_->shard_mutexes[shard]);
+  }
+  for (const auto& check : checks) {
+    if (impl_->Read(impl_->Find(check.key)).version != check.expected_version) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool Dbx1000VersionedKVStore::BatchPutIfVersion(
     const std::vector<VersionCheck>& checks,
     const std::vector<WriteOp>& writes) {

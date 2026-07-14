@@ -9,10 +9,32 @@ from typing import Any, Dict, Iterable, List, Tuple
 
 
 class LockConflict(RuntimeError):
-    def __init__(self, reason: str, targets: Iterable[str]):
+    def __init__(
+        self,
+        reason: str,
+        targets: Iterable[str],
+        *,
+        kind: str = "",
+    ):
         super().__init__(reason)
         self.reason = str(reason)
         self.targets = tuple(str(target) for target in targets)
+        self.kind = normalize_conflict_kind(kind or reason)
+
+
+def normalize_conflict_kind(value: str) -> str:
+    normalized = str(value).strip().lower()
+    if not normalized or normalized == "none":
+        return "none"
+    if "retroactive" in normalized or "version" in normalized or "atomic version" in normalized:
+        return "version-conflict"
+    if "wound" in normalized or "preempt" in normalized or "aborted while waiting" in normalized:
+        return "lock-preempted"
+    if "timeout" in normalized:
+        return "lock-timeout"
+    if "lock" in normalized or "reservation" in normalized:
+        return "lock-conflict"
+    return normalized
 
 
 class ExclusiveLockTable:

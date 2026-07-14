@@ -10,9 +10,9 @@ venv/
 *.dylib
 build/
 dist/
-
+tmp/
 .codex-tmp/
-
+results/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import dataclasses
 import json
 import random
 import sys
@@ -42,11 +43,13 @@ from agent.benchmarks.mixed import (  # noqa: E402
 )
 from agent.benchmarks.phases import PlannedPhase, PlannedTask, sleep_for_reasoning  # noqa: E402
 from agent.cc import LockConflict  # noqa: E402
+from agent.cc.atcc.ppo import DiscretePPOPolicy, EpsilonGreedyPolicy  # noqa: E402
 from agent.runtime import AgentTransactionManager  # noqa: E402
+from agent.runtime import CompiledPhasePolicy  # noqa: E402
 from agent.workloads import AgentOperation, AgentTask, apply_operation  # noqa: E402
 
 
-CCS = "occ,2pl-nowait,2pl-wait-die,mvcc,silo,tictoc,bamboo,polaris,dynamic-atcc"
+CCS = "occ,2pl-nowait,2pl-wait-die,mvcc,silo,tictoc,bamboo,polaris,paper-atcc"
 
 FIELDS = [
     "trace_id",
@@ -114,10 +117,67 @@ FIELDS = [
     "version_conflict_count",
     "reservation_admission_abort_count",
     "lock_timeout_abort_count",
+    "lock_preempted_abort_count",
     "full_commit_lock_timeout_abort_count",
     "hot_commit_lock_timeout_abort_count",
     "begin_lock_timeout_abort_count",
     "version_validation_abort_count",
+    "paper_read_lock_acquires",
+    "paper_write_lock_acquires",
+    "paper_lock_wait_events",
+    "paper_lock_wait_ms",
+    "paper_agent_lock_wait_events",
+    "paper_agent_lock_wait_ms",
+    "paper_background_lock_wait_events",
+    "paper_background_lock_wait_ms",
+    "paper_wounds",
+    "paper_lock_timeouts",
+    "paper_priority_reorders",
+    "paper_background_fast_publishes",
+    "paper_background_fast_publish_failures",
+    "paper_background_publish_fallbacks",
+    "paper_background_publish_fallback_active_writer",
+    "paper_background_publish_fallback_version_mismatch",
+    "paper_background_publish_fallback_commit_latch",
+    "paper_background_publish_fallback_missing_private_version",
+    "paper_background_publish_fallback_multi_object_atomicity",
+    "paper_background_publish_fallback_unsupported_operation",
+    "paper_version_private_prepares",
+    "paper_version_private_discards",
+    "paper_version_atomic_publishes",
+    "paper_version_published_objects",
+    "paper_version_gc_versions",
+    "paper_version_history_versions",
+    "paper_version_pinned_transactions",
+    "paper_version_private_transactions",
+    "paper_version_commit_table_entries",
+    "paper_retry_validation_conflicts",
+    "paper_retry_mask_escalations",
+    "paper_retry_full_observed_escalations",
+    "paper_retry_inherited_attempts",
+    "paper_retry_tracked_tasks",
+    "paper_retry_validation_conflicts_first_attempt",
+    "paper_retry_validation_conflicts_retry_attempt",
+    "paper_retry_conflict_hot_read",
+    "paper_retry_conflict_cold_read",
+    "paper_retry_conflict_hot_write",
+    "paper_retry_conflict_cold_write",
+    "paper_retry_conflict_read_before_write",
+    "paper_retry_conflict_blind_write",
+    "paper_retry_conflict_object_warehouse",
+    "paper_retry_conflict_object_district",
+    "paper_retry_conflict_object_stock",
+    "paper_retry_conflict_object_customer",
+    "paper_retry_conflict_object_other",
+    "paper_retry_conflict_objects",
+    "paper_lock_acquires_by_phase",
+    "paper_hotness_observed_objects",
+    "paper_hotness_total_accesses",
+    "paper_hotness_hot_objects",
+    "paper_hotness_validation_failures",
+    "paper_hotness_lock_wait_events",
+    "paper_hotness_lock_wait_ms",
+    "paper_hotness_wounds",
     "guarded_conflict_checks",
     "conflict_pressure_count",
     "conflict_abort_count",
@@ -137,6 +197,11 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--cc", default=CCS)
     parser.add_argument("--policy", type=Path, default=None)
+    parser.add_argument("--paper-policy", type=Path, default=None)
+    parser.add_argument("--trajectory-output", type=Path, default=None)
+    parser.add_argument("--paper-exploration-seed", type=int, default=None)
+    parser.add_argument("--paper-exploration-stay-probability", type=float, default=0.5)
+    parser.add_argument("--paper-exploration-epsilon", type=float, default=0.2)
     parser.add_argument("--policy-mode", choices=("eval", "train", "online"), default="eval")
     parser.add_argument("--max-attempts", type=int, default=5)
     parser.add_argument("--tokens-per-operation", type=int, default=2703)
@@ -158,6 +223,11 @@ def main() -> int:
                     warmup_rows=warmup_rows,
                     cc=cc,
                     policy=args.policy,
+                    paper_policy=args.paper_policy,
+                    trajectory_output=args.trajectory_output,
+                    paper_exploration_seed=args.paper_exploration_seed,
+                    paper_exploration_stay_probability=args.paper_exploration_stay_probability,
+                    paper_exploration_epsilon=args.paper_exploration_epsilon,
                     policy_mode=args.policy_mode,
                     max_attempts=args.max_attempts,
                     tokens_per_operation=args.tokens_per_operation,
@@ -200,6 +270,11 @@ def run_trace(
     warmup_rows: list[dict[str, Any]] | None = None,
     cc: str,
     policy: Path | None,
+    paper_policy: Path | None = None,
+    trajectory_output: Path | None = None,
+    paper_exploration_seed: int | None = None,
+    paper_exploration_stay_probability: float = 0.5,
+    paper_exploration_epsilon: float = 0.2,
     policy_mode: str = "eval",
     max_attempts: int,
     tokens_per_operation: int,
@@ -219,6 +294,7 @@ def run_trace(
         background_workers=int(float(sample["background_workers"])),
         policy=policy,
         policy_mode=str(policy_mode) if policy else "online",
+        paper_policy=paper_policy,
         atcc_pure_policy=True,
         background_mode="procedure",
         retry_until_commit=True,
@@ -229,12 +305,49 @@ def run_trace(
         background_retry_backoff_max_ms=3,
         tokens_per_operation=tokens_per_operation,
     ).normalized()
-    manager = AgentTransactionManager(cc_registry=registry_for(config), record_traces=False)
+    if paper_exploration_seed is not None:
+        if cc != "paper-atcc":
+            raise ValueError("paper exploration is only valid for paper-atcc")
+        if paper_policy is not None:
+            epsilon = float(paper_exploration_epsilon)
+            if not 0.0 <= epsilon <= 1.0:
+                raise ValueError("paper exploration epsilon must be in [0, 1]")
+            compiled_policy = EpsilonGreedyPolicy(
+                CompiledPhasePolicy.load(paper_policy),
+                seed=paper_exploration_seed,
+                epsilon=epsilon,
+            )
+        else:
+            stay_probability = float(paper_exploration_stay_probability)
+            if not 0.0 <= stay_probability <= 1.0:
+                raise ValueError("paper exploration stay probability must be in [0, 1]")
+            compiled_policy = DiscretePPOPolicy(
+                seed=paper_exploration_seed,
+                stay_probability=stay_probability,
+            )
+    else:
+        compiled_policy = CompiledPhasePolicy.load(paper_policy) if paper_policy is not None else None
+    manager = AgentTransactionManager(
+        cc_registry=registry_for(config),
+        record_traces=False,
+        paper_policy=compiled_policy,
+        collect_trajectories=trajectory_output is not None or paper_exploration_seed is not None,
+    )
     all_rows = list(rows)
     if warmup_rows:
         all_rows.extend(warmup_rows)
     for object_id in sorted(trace_object_ids(all_rows)):
         manager.register_object(object_id, "0", kind="row")
+    if cc == "paper-atcc":
+        manager.hotness_tracker.prime_accesses(
+            operation.object_id
+            for row in all_rows
+            for operation in row["_task"].operations
+        )
+        for row in all_rows:
+            manager.hotness_tracker.prime_transaction(
+                operation.object_id for operation in row["_task"].operations
+            )
 
     if warmup_rows:
         run_rows(
@@ -246,6 +359,7 @@ def run_trace(
             duration_s=float(warmup_seconds),
             cycle_trace=cycle_trace,
         )
+        manager.trajectory_collector.clear()
     counters, elapsed_s = run_rows(
         manager,
         cc,
@@ -256,6 +370,20 @@ def run_trace(
         cycle_trace=cycle_trace,
     )
     result = result_row(sample, cc, counters, elapsed_s, tokens_per_operation, rows, manager)
+    if trajectory_output is not None and cc == "paper-atcc":
+        transitions = [
+            {
+                **dataclasses.asdict(transition),
+                "state": dataclasses.asdict(transition.state),
+                "next_state": dataclasses.asdict(transition.next_state),
+            }
+            for transition in manager.trajectory_collector.snapshot()
+        ]
+        trajectory_output.parent.mkdir(parents=True, exist_ok=True)
+        trajectory_output.write_text(
+            json.dumps({"transitions": transitions}, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     if policy is not None and str(policy_mode).strip().lower() == "train":
         trained_policy = getattr(manager.cc_registry.resolve(cc), "policy", None)
         if trained_policy is not None and hasattr(trained_policy, "save_json"):
@@ -279,12 +407,35 @@ def run_rows(
     for worker_rows in by_worker.values():
         worker_rows.sort(key=lambda row: int(float(row["sequence"])))
 
+    worker_kinds = {
+        worker_id: {str(row["client_type"]) for row in worker_rows}
+        for worker_id, worker_rows in by_worker.items()
+    }
+    mixed_workers = [
+        worker_id for worker_id, kinds in worker_kinds.items() if len(kinds) != 1
+    ]
+    if mixed_workers:
+        raise ValueError(
+            f"fixed trace workers must have one client type: {mixed_workers}"
+        )
+    agent_worker_count = sum(kinds == {"agent"} for kinds in worker_kinds.values())
+    background_worker_count = len(worker_kinds) - agent_worker_count
+    fixed_count_coordination = (
+        FixedCountRunCoordinator(agent_worker_count)
+        if float(duration_s) <= 0.0
+        and bool(cycle_trace)
+        and agent_worker_count > 0
+        and background_worker_count > 0
+        else None
+    )
+
     lock = threading.Lock()
     counters = MixedCounters()
     barrier = threading.Barrier(len(by_worker) + 1)
+    thread_errors: list[BaseException] = []
     threads = [
         threading.Thread(
-            target=worker_main,
+            target=worker_main_guarded,
             args=(
                 manager,
                 cc,
@@ -296,6 +447,9 @@ def run_rows(
                 counters,
                 float(duration_s),
                 bool(cycle_trace),
+                fixed_count_coordination,
+                thread_errors,
+                lock,
             ),
         )
         for _worker, worker_rows in sorted(by_worker.items())
@@ -306,8 +460,20 @@ def run_rows(
     barrier.wait()
     for thread in threads:
         thread.join()
+    if thread_errors:
+        raise RuntimeError(f"worker failed: {thread_errors[0]}") from thread_errors[0]
     elapsed_s = max(0.001, time.perf_counter() - started)
     return counters, elapsed_s
+
+
+def worker_main_guarded(*args: Any) -> None:
+    thread_errors = args[-2]
+    error_lock = args[-1]
+    try:
+        worker_main(*args[:-2])
+    except BaseException as exc:
+        with error_lock:
+            thread_errors.append(exc)
 
 
 def worker_main(
@@ -321,14 +487,64 @@ def worker_main(
     counters: MixedCounters,
     duration_s: float,
     cycle_trace: bool,
+    fixed_count_coordination: "FixedCountRunCoordinator | None" = None,
 ) -> None:
     rng = random.Random(int(float(rows[0]["seed"])) + int(float(rows[0]["worker_id"])))
     barrier.wait()
-    for row in timed_rows(rows, duration_s=duration_s, cycle_trace=cycle_trace):
-        if row["client_type"] == "agent":
-            run_agent_row(manager, cc, config, row, max_attempts, rng, lock, counters)
+    client_type = str(rows[0]["client_type"])
+    try:
+        if fixed_count_coordination is not None and client_type != "agent":
+            selected_rows = continuous_background_rows(rows, fixed_count_coordination)
         else:
-            run_background_row(manager, cc, config, row, rng, lock, counters)
+            selected_rows = timed_rows(
+                rows,
+                duration_s=duration_s,
+                cycle_trace=cycle_trace,
+            )
+        for row in selected_rows:
+            if row["client_type"] == "agent":
+                run_agent_row(manager, cc, config, row, max_attempts, rng, lock, counters)
+            else:
+                run_background_row(manager, cc, config, row, rng, lock, counters)
+    finally:
+        if fixed_count_coordination is not None and client_type == "agent":
+            fixed_count_coordination.agent_worker_done()
+
+
+class FixedCountRunCoordinator:
+    """Keep short background workers active while fixed-count agents run."""
+
+    def __init__(self, agent_worker_count: int):
+        if int(agent_worker_count) <= 0:
+            raise ValueError("agent_worker_count must be positive")
+        self._remaining_agent_workers = int(agent_worker_count)
+        self._lock = threading.Lock()
+        self.stop_background = threading.Event()
+
+    @property
+    def remaining_agent_workers(self) -> int:
+        with self._lock:
+            return self._remaining_agent_workers
+
+    def agent_worker_done(self) -> None:
+        with self._lock:
+            if self._remaining_agent_workers <= 0:
+                raise RuntimeError("agent worker completion reported more than once")
+            self._remaining_agent_workers -= 1
+            if self._remaining_agent_workers == 0:
+                self.stop_background.set()
+
+
+def continuous_background_rows(
+    rows: list[dict[str, Any]],
+    coordination: FixedCountRunCoordinator,
+) -> Iterable[dict[str, Any]]:
+    if not rows:
+        return
+    index = 0
+    while not coordination.stop_background.is_set():
+        yield rows[index]
+        index = (index + 1) % len(rows)
 
 
 def timed_rows(
@@ -371,6 +587,7 @@ def run_agent_row(
     attempts_done = 0
     reuse_reasoning = False
     previous_failure_reason = "none"
+    prior_retry_cost_ms = 0.0
     for attempt in range(max(1, max_attempts)):
         planned = planned_from_row(row, attempt=attempt)
         admission_deferred = False
@@ -387,6 +604,7 @@ def run_agent_row(
                 background_workers=config.background_workers,
                 config=config,
                 previous_failure_reason=previous_failure_reason,
+                prior_retry_cost_ms=prior_retry_cost_ms,
             )
         except LockConflict as exc:
             admission_deferred = isinstance(exc, ATCCAdmissionConflict)
@@ -444,16 +662,31 @@ def run_agent_row(
                     reason = str(result.get("failure_reason", "") or attempt_failure_reason(result))
                     if reason == "lock-timeout":
                         counters.lock_timeout_aborts += 1
+                    elif reason == "lock-preempted":
+                        counters.lock_preempted_aborts += 1
                     elif reason == "version-conflict":
                         counters.version_validation_aborts += 1
         if final_result.get("committed"):
             break
+        prior_retry_cost_ms += float(
+            diagnostics.get(
+                "restart_cost_ms",
+                result.get("wasted_reasoning_ms", 0.0),
+            )
+            or 0.0
+        )
         previous_failure_reason = str(
             final_result.get("failure_reason", "") or attempt_failure_reason(final_result)
         )
-        sleep_for_reasoning(rng.randint(config.agent_retry_backoff_min_ms, config.agent_retry_backoff_max_ms))
+        # The fixed trace carries the seeded retry reasoning delay for the next
+        # attempt, so no runner-local backoff is added here.
 
     task_elapsed_ms = (time.perf_counter() - task_started_at) * 1000.0
+    if getattr(manager.cc_registry.resolve(cc), "family", "") == "paper-atcc":
+        manager.note_agent_task_outcome(
+            committed=bool(final_result.get("committed")),
+            latency_ms=task_elapsed_ms,
+        )
     with lock:
         counters.agent_operation_counts.append(len(row["_task"].operations))
         counters.agent_task_reservation_waits_ms.append(task_reservation_wait_s * 1000.0)
@@ -486,20 +719,24 @@ def run_background_row(
             owner=owner,
         ) as waited:
             wait_s = float(waited)
+            metadata = {
+                "workload": row["workload"],
+                "task_type": f"background-{row['task_type']}",
+                "context": dict(row["_context"]),
+            }
+            if getattr(manager.cc_registry.resolve(cc), "family", "") == "paper-atcc":
+                metadata["paper_atcc_backend"] = True
             txn = manager.begin(
                 f"bg-{row['trace_id']}-{row['worker_id']}-{row['sequence']}-{rng.randrange(10_000_000)}",
-                {
-                    "workload": row["workload"],
-                    "task_type": f"background-{row['task_type']}",
-                    "context": dict(row["_context"]),
-                },
-                snapshot_object_ids=task_targets(task),
+                metadata,
             )
             for operation in task.operations:
                 apply_operation(txn, operation)
             result = txn.commit("occ")
         committed = bool(result.committed)
     except Exception:
+        if "txn" in locals():
+            manager.atcc_locks.release_all(txn.context)
         committed = False
     with lock:
         counters.background_attempts += 1
@@ -509,6 +746,8 @@ def run_background_row(
         else:
             counters.background_aborts += 1
             counters.background_retries += 1
+            if getattr(manager.cc_registry.resolve(cc), "family", "") == "paper-atcc":
+                manager.note_background_abort()
 
 
 def result_row(
@@ -530,6 +769,10 @@ def result_row(
     agent_wait_ms_total = float(counters.agent_reservation_wait_s) * 1000.0
     background_wait_ms_total = float(counters.background_reservation_wait_s) * 1000.0
     diagnostics = manager.reservations.snapshot_diagnostics()
+    paper_diagnostics = manager.atcc_locks.snapshot_diagnostics()
+    retry_diagnostics = manager.retry_protection_diagnostics()
+    version_diagnostics = manager.version_manager.snapshot_diagnostics()
+    hotness_diagnostics = manager.hotness_tracker.snapshot()
     guarded_conflict_checks = (
         int(diagnostics.get("reservation_owner_blocked_checks", 0) or 0)
         + int(diagnostics.get("reservation_writer_blocked_checks", 0) or 0)
@@ -600,10 +843,108 @@ def result_row(
         "version_conflict_count": version_conflicts,
         "reservation_admission_abort_count": counters.reservation_admission_aborts,
         "lock_timeout_abort_count": counters.lock_timeout_aborts,
+        "lock_preempted_abort_count": counters.lock_preempted_aborts,
         "full_commit_lock_timeout_abort_count": counters.full_commit_lock_timeout_aborts,
         "hot_commit_lock_timeout_abort_count": counters.hot_commit_lock_timeout_aborts,
         "begin_lock_timeout_abort_count": counters.begin_lock_timeout_aborts,
         "version_validation_abort_count": counters.version_validation_aborts,
+        "paper_read_lock_acquires": paper_diagnostics.get("read_lock_acquires", 0),
+        "paper_write_lock_acquires": paper_diagnostics.get("write_lock_acquires", 0),
+        "paper_lock_wait_events": paper_diagnostics.get("lock_wait_events", 0),
+        "paper_lock_wait_ms": paper_diagnostics.get("lock_wait_ms", 0.0),
+        "paper_agent_lock_wait_events": paper_diagnostics.get(
+            "agent_lock_wait_events", 0
+        ),
+        "paper_agent_lock_wait_ms": paper_diagnostics.get("agent_lock_wait_ms", 0.0),
+        "paper_background_lock_wait_events": paper_diagnostics.get(
+            "background_lock_wait_events", 0
+        ),
+        "paper_background_lock_wait_ms": paper_diagnostics.get(
+            "background_lock_wait_ms", 0.0
+        ),
+        "paper_wounds": paper_diagnostics.get("wounds", 0),
+        "paper_lock_timeouts": paper_diagnostics.get("lock_timeouts", 0),
+        "paper_priority_reorders": paper_diagnostics.get("priority_reorders", 0),
+        "paper_background_fast_publishes": paper_diagnostics.get(
+            "background_fast_publishes", 0
+        ),
+        "paper_background_fast_publish_failures": paper_diagnostics.get(
+            "background_fast_publish_failures", 0
+        ),
+        "paper_background_publish_fallbacks": paper_diagnostics.get(
+            "background_publish_fallbacks", 0
+        ),
+        **{
+            f"paper_background_publish_fallback_{reason}": paper_diagnostics.get(
+                f"background_publish_fallback_{reason}", 0
+            )
+            for reason in (
+                "active_writer",
+                "version_mismatch",
+                "commit_latch",
+                "missing_private_version",
+                "multi_object_atomicity",
+                "unsupported_operation",
+            )
+        },
+        "paper_retry_conflict_objects": json.dumps(
+            retry_diagnostics.get("conflict_objects", {}), sort_keys=True
+        ),
+        **{
+            f"paper_version_{key}": version_diagnostics.get(key, 0)
+            for key in (
+                "private_prepares",
+                "private_discards",
+                "atomic_publishes",
+                "published_objects",
+                "gc_versions",
+                "history_versions",
+                "pinned_transactions",
+                "private_transactions",
+                "commit_table_entries",
+            )
+        },
+        "paper_retry_validation_conflicts": retry_diagnostics.get(
+            "validation_conflicts", 0
+        ),
+        "paper_retry_mask_escalations": retry_diagnostics.get(
+            "mask_escalations", 0
+        ),
+        "paper_retry_full_observed_escalations": retry_diagnostics.get(
+            "full_observed_escalations", 0
+        ),
+        "paper_retry_inherited_attempts": retry_diagnostics.get(
+            "inherited_attempts", 0
+        ),
+        "paper_retry_tracked_tasks": retry_diagnostics.get("tracked_tasks", 0),
+        **{
+            f"paper_retry_{key}": retry_diagnostics.get(key, 0)
+            for key in (
+                "validation_conflicts_first_attempt",
+                "validation_conflicts_retry_attempt",
+                "conflict_hot_read",
+                "conflict_cold_read",
+                "conflict_hot_write",
+                "conflict_cold_write",
+                "conflict_read_before_write",
+                "conflict_blind_write",
+                "conflict_object_warehouse",
+                "conflict_object_district",
+                "conflict_object_stock",
+                "conflict_object_customer",
+                "conflict_object_other",
+            )
+        },
+        "paper_lock_acquires_by_phase": json.dumps(
+            paper_diagnostics.get("lock_acquires_by_phase", {}), sort_keys=True
+        ),
+        "paper_hotness_observed_objects": hotness_diagnostics.get("observed_objects", 0),
+        "paper_hotness_total_accesses": hotness_diagnostics.get("total_accesses", 0),
+        "paper_hotness_hot_objects": hotness_diagnostics.get("hot_objects", 0),
+        "paper_hotness_validation_failures": hotness_diagnostics.get("validation_failures", 0),
+        "paper_hotness_lock_wait_events": hotness_diagnostics.get("lock_wait_events", 0),
+        "paper_hotness_lock_wait_ms": hotness_diagnostics.get("lock_wait_ms", 0.0),
+        "paper_hotness_wounds": hotness_diagnostics.get("wounds", 0),
         "guarded_conflict_checks": guarded_conflict_checks,
         "conflict_pressure_count": version_conflicts + guarded_conflict_checks,
         "conflict_abort_count": counters.agent_aborts,
@@ -623,13 +964,15 @@ def task_from_row(row: dict[str, Any]) -> AgentTask:
     operations = []
     for op in row["_ops"]:
         object_id = str(op.get("object_id") or f"trace:key:{int(op['key'])}")
+        metadata = {"phase": str(op.get("phase", ""))} if op.get("phase") else {}
         if op["kind"] == "read":
-            operations.append(AgentOperation.read(object_id))
+            operations.append(AgentOperation.read(object_id, **metadata))
         else:
             operations.append(
                 AgentOperation.write(
                     object_id,
                     op.get("value") or f"v:{row['worker_id']}:{row['sequence']}",
+                    **metadata,
                 )
             )
     return AgentTask(
@@ -643,18 +986,56 @@ def task_from_row(row: dict[str, Any]) -> AgentTask:
 
 def planned_from_row(row: dict[str, Any], *, attempt: int) -> PlannedTask:
     task = row.get("_task") or task_from_row(row)
+    operation_rows = list(row.get("_ops") or ())
+    delay_by_operation = {
+        id(operation): int(float(operation_row.get("delay_ms") or 0))
+        for operation, operation_row in zip(task.operations, operation_rows)
+    }
+    tagged = {
+        phase: tuple(
+            operation
+            for operation in task.operations
+            if str(dict(operation.metadata).get("phase", "")) == phase
+        )
+        for phase in ("explore", "refine", "commit")
+    }
+    has_phase_tags = any(tagged.values())
     reads = tuple(operation for operation in task.operations if operation.kind == "read")
     writes = tuple(operation for operation in task.operations if operation.kind == "write")
     pivot = max(1, (len(reads) + 1) // 2) if reads else 0
-    retry_delay_ms = int(float(row.get("retry_delay_ms") or 0)) if attempt > 0 else 0
+    retry_delays = json.loads(row.get("retry_delays_json") or "[]")
+    if retry_delays and attempt < len(retry_delays):
+        retry_delay_ms = int(float(retry_delays[attempt] or 0))
+    else:
+        retry_delay_ms = int(float(row.get("retry_delay_ms") or 0)) if attempt > 0 else 0
+    explore_operations = tagged["explore"] if has_phase_tags else reads[:pivot]
+    refine_operations = tagged["refine"] if has_phase_tags else reads[pivot:]
+    commit_operations = tagged["commit"] if has_phase_tags else writes
     phases = (
-        PlannedPhase("explore", reads[:pivot], int(float(row.get("explore_delay_ms") or 0))),
-        PlannedPhase("refine", reads[pivot:], int(float(row.get("refine_delay_ms") or 0))),
-        PlannedPhase("commit", writes, int(float(row.get("commit_delay_ms") or 0))),
+        PlannedPhase(
+            "explore",
+            explore_operations,
+            int(float(row.get("explore_delay_ms") or 0)),
+            tuple(delay_by_operation.get(id(operation), 0) for operation in explore_operations),
+        ),
+        PlannedPhase(
+            "refine",
+            refine_operations,
+            int(float(row.get("refine_delay_ms") or 0)),
+            tuple(delay_by_operation.get(id(operation), 0) for operation in refine_operations),
+        ),
+        PlannedPhase(
+            "commit",
+            commit_operations,
+            int(float(row.get("commit_delay_ms") or 0)),
+            tuple(delay_by_operation.get(id(operation), 0) for operation in commit_operations),
+        ),
     )
     return PlannedTask(
         task=task,
-        phases=tuple(phase for phase in phases if phase.operations or phase.reasoning_delay_ms > 0),
+        phases=tuple(
+            phase for phase in phases if phase.operations or phase.total_reasoning_delay_ms > 0
+        ),
         retry_delay_ms=retry_delay_ms,
     )
 

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import bisect
 import dataclasses
 import random
+from array import array
 from typing import Iterable, Sequence
 
 from .base import AgentOperation, AgentTask, AgentWorkload, ObjectSpec
@@ -12,6 +14,7 @@ from .base import AgentOperation, AgentTask, AgentWorkload, ObjectSpec
 @dataclasses.dataclass(frozen=True)
 class YCSBConfig:
     level: str = "low"
+    profile: str = "small"
     logical_record_count: int = 0
     record_count: int = 128
     field_count: int = 10
@@ -104,6 +107,7 @@ def paper_ycsb_configs() -> dict[str, YCSBConfig]:
     return {
         "low": YCSBConfig(
             level="low",
+            profile="paper",
             logical_record_count=1_000_000,
             record_count=512,
             field_count=10,
@@ -116,6 +120,7 @@ def paper_ycsb_configs() -> dict[str, YCSBConfig]:
         ),
         "medium": YCSBConfig(
             level="medium",
+            profile="paper",
             logical_record_count=1_000_000,
             record_count=128,
             field_count=10,
@@ -128,6 +133,7 @@ def paper_ycsb_configs() -> dict[str, YCSBConfig]:
         ),
         "high": YCSBConfig(
             level="high",
+            profile="paper",
             logical_record_count=1_000_000,
             record_count=64,
             field_count=10,
@@ -148,10 +154,12 @@ class YCSBWorkload(AgentWorkload):
     def __init__(self, config: YCSBConfig):
         self.config = config
         self.level = config.level
-        self._record_weights = tuple(
-            1.0 / ((record + 1) ** config.zipf_theta)
-            for record in range(config.record_count)
-        )
+        self._record_cumulative_weights = array("d")
+        if config.access_distribution == "zipfian" and config.zipf_theta > 0.0:
+            cumulative = 0.0
+            for record in range(config.record_count):
+                cumulative += 1.0 / ((record + 1) ** config.zipf_theta)
+                self._record_cumulative_weights.append(cumulative)
 
     @staticmethod
     def object_id(record: int, field: int) -> str:
@@ -198,6 +206,7 @@ class YCSBWorkload(AgentWorkload):
                     operations=tuple(operations),
                     context={
                         "level": self.level,
+                        "profile": self.config.profile,
                         "hot_record_count": hot_record_count,
                         "record_count": self.config.record_count,
                         "logical_record_count": self.config.logical_record_count or self.config.record_count,
@@ -223,11 +232,11 @@ class YCSBWorkload(AgentWorkload):
 
     def _sample_target(self, rng: random.Random) -> tuple[int, int]:
         if self.config.access_distribution == "zipfian":
-            record = rng.choices(
-                range(self.config.record_count),
-                weights=self._record_weights,
-                k=1,
-            )[0]
+            if self._record_cumulative_weights:
+                draw = rng.random() * self._record_cumulative_weights[-1]
+                record = bisect.bisect_left(self._record_cumulative_weights, draw)
+            else:
+                record = rng.randrange(self.config.record_count)
             return record, rng.randrange(self.config.field_count)
         hot_count = self._hot_record_count()
         if hot_count and rng.random() < self.config.hotspot_access_probability:
@@ -235,11 +244,7 @@ class YCSBWorkload(AgentWorkload):
         elif hot_count and hot_count < self.config.record_count:
             record = rng.randrange(hot_count, self.config.record_count)
         else:
-            record = rng.choices(
-                range(self.config.record_count),
-                weights=self._record_weights,
-                k=1,
-            )[0]
+            record = rng.randrange(self.config.record_count)
         return record, rng.randrange(self.config.field_count)
 
 
