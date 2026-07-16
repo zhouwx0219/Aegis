@@ -1,2 +1,1 @@
-"""Delivery-oriented command line entry points for CAST-DAS."""
-
+"""Command-line entry points for CAST-DAS."""

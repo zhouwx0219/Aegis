@@ -30,6 +30,8 @@ class VersionedKVStore {
                             const std::string& value) = 0;
   virtual bool DeleteIfVersion(const std::string& key,
                                std::uint64_t expected) = 0;
+  virtual bool ValidateVersions(
+      const std::vector<VersionCheck>& checks) const = 0;
   virtual bool BatchPutIfVersion(const std::vector<VersionCheck>& checks,
                                  const std::vector<WriteOp>& writes) = 0;
   virtual const char* BackendName() const = 0;

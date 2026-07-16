@@ -1,4 +1,4 @@
-"""Run delivery smoke checks for CAST-DAS."""
+"""Run CAST-DAS smoke checks."""
 
 from __future__ import annotations
 
@@ -8,17 +8,7 @@ from typing import Any, Dict, Optional, Sequence, TextIO
 
 from agent.native import load_cast_core
 from agent.runtime import AgentTransactionManager
-from agent.workloads import (
-    AgentCandidate,
-    AgentOperation,
-    AgentTask,
-    TPCCConfig,
-    YCSBConfig,
-    build_agent_workload,
-    execute_task,
-    prepare_task_transaction,
-    register_workload,
-)
+from agent.workloads import build_workload, execute_task, register_workload
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -38,68 +28,12 @@ def run_smoke_checks() -> Dict[str, Any]:
     manager = AgentTransactionManager()
     manager.register_object("counter", "0", kind="counter")
     txn = manager.begin("increment")
-    txn.add_candidate("increment", quality=1.0, gen_cost=0.0).delta("counter", 1)
-    runtime_commit = txn.commit(strategy="semantic")
+    txn.read("counter")
+    txn.write("counter", "1")
+    runtime_commit = txn.commit("occ")
 
-    hot_task = AgentTask(
-        task_id="hot-ycsb",
-        workload="agent-ycsb-semantic",
-        task_type="read-update",
-        request="delivery smoke transaction-atcc plan",
-        candidates=(
-            AgentCandidate(
-                "candidate",
-                1.0,
-                (
-                    AgentOperation.overwrite("ycsb:record:0:field:0", "v"),
-                    AgentOperation.read("ycsb:record:0:field:1"),
-                ),
-            ),
-        ),
-        context={
-            "agent_phase": "commit",
-            "hot_record_count": 2,
-            "hotspot_access_probability": 1.0,
-        },
-    )
-    atcc_targets, atcc_decisions = manager.cc_registry.pre_snapshot_operation_plan(
-        "transaction-atcc-strict",
-        hot_task.candidates,
-        metadata={
-            "workload": hot_task.workload,
-            "task_type": hot_task.task_type,
-            "context": hot_task.context,
-            "agent_phase": "commit",
-        },
-    )
-
-    ycsb_committed = _run_one_task(
-        build_agent_workload(
-            "ycsb",
-            "semantic",
-            ycsb_config=YCSBConfig(
-                record_count=16,
-                field_count=4,
-                requests_per_task=2,
-                candidates_per_task=2,
-            ),
-        )
-    )
-    tpcc_committed = _run_one_task(
-        build_agent_workload(
-            "tpcc",
-            "semantic",
-            tpcc_config=TPCCConfig(
-                warehouses=1,
-                districts_per_warehouse=1,
-                customers_per_district=8,
-                items=16,
-                order_lines=2,
-                candidates_per_task=2,
-                transaction_mix=(("new_order", 1.0),),
-            ),
-        )
-    )
+    ycsb_ok = _run_one_task("ycsb")
+    tpcc_ok = _run_one_task("tpcc")
 
     checks = {
         "native_backend": store.backend_name,
@@ -107,10 +41,8 @@ def run_smoke_checks() -> Dict[str, Any]:
         "kv_stale_write_rejected": kv_stale_rejected,
         "runtime_commit": bool(runtime_commit.committed),
         "runtime_counter": manager.value_of("counter"),
-        "transaction_atcc_targets": list(atcc_targets),
-        "transaction_atcc_decisions": len(atcc_decisions),
-        "ycsb_task_committed": ycsb_committed,
-        "tpcc_task_committed": tpcc_committed,
+        "ycsb_task_committed": ycsb_ok,
+        "tpcc_task_committed": tpcc_ok,
     }
     checks["ok"] = all(
         (
@@ -118,7 +50,6 @@ def run_smoke_checks() -> Dict[str, Any]:
             checks["kv_stale_write_rejected"],
             checks["runtime_commit"],
             checks["runtime_counter"] == "1",
-            checks["transaction_atcc_decisions"] > 0,
             checks["ycsb_task_committed"],
             checks["tpcc_task_committed"],
         )
@@ -147,12 +78,13 @@ def main(
     return 0 if checks["ok"] else 1
 
 
-def _run_one_task(workload: Any) -> bool:
+def _run_one_task(workload_name: str) -> bool:
     manager = AgentTransactionManager()
+    workload = build_workload(workload_name, "low")
     register_workload(manager, workload)
     task = workload.generate_tasks(1, seed=7)[0]
-    result = execute_task(manager, task, cc="transaction-atcc-strict")
-    return bool(result.committed or result.rejected)
+    result = execute_task(manager, task, cc="dynamic-atcc")
+    return bool(result.committed)
 
 
 if __name__ == "__main__":

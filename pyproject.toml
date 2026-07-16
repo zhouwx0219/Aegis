@@ -3,7 +3,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "astra-core"
+name = "cast-das"
 version = "0.1.0"
 description = "Agent-side transaction runtime with pluggable concurrency control over a versioned KV backend"
 readme = "README.md"
@@ -12,7 +12,7 @@ dependencies = [
   "pybind11>=2.10",
 ]
 authors = [
-  {name = "ASTRA contributors"},
+  {name = "CAST-DAS contributors"},
 ]
 classifiers = [
   "Programming Language :: Python :: 3",
@@ -23,15 +23,11 @@ classifiers = [
 
 [project.scripts]
 cast-das-smoke = "agent.cli.smoke:main"
-cast-das-benchmark = "agent.cli.benchmark:main"
-astra-cc-matrix = "agent.evaluation.cc_matrix_cli:main"
-astra-dbx1000-native = "agent.evaluation.dbx1000_native:main"
-astra-agent-paths = "agent.evaluation.agent_path_experiment:main"
-astra-atcc-retry = "agent.evaluation.atcc_retry_experiment:main"
-astra-atcc-train = "agent.evaluation.atcc_policy_training:main"
-astra-atcc-profiles = "agent.evaluation.atcc_profile_runner:main"
-astra-atcc-cost-search = "agent.evaluation.atcc_reward_cost_search:main"
-astra-atcc-ablation = "agent.evaluation.atcc_ablation_experiment:main"
+cast-das-compare = "agent.cli.compare:main"
+cast-das-mixed = "agent.cli.mixed:main"
+cast-das-matrix = "agent.cli.matrix:main"
+cast-das-atcc-ablation = "agent.cli.atcc_ablation:main"
+cast-das-train-atcc = "agent.cli.train_atcc:main"
 
 [tool.setuptools.packages.find]
 include = ["agent*"]

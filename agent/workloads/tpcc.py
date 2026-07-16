@@ -1,38 +1,26 @@
-"""General agent-style workload derived from DBx1000 TPC-C transactions."""
+"""TPC-C-style single-plan workload."""
 
 from __future__ import annotations
 
 import dataclasses
 import random
-from typing import Dict, Iterable, Sequence, Tuple
+from typing import Iterable, Sequence, Tuple
 
-from .base import (
-    AgentCandidate,
-    AgentOperation,
-    AgentStage,
-    AgentTask,
-    AgentWorkload,
-    ObjectSpec,
-    WorkloadManifest,
-)
+from .base import AgentOperation, AgentTask, AgentWorkload, ObjectSpec
 
 
 @dataclasses.dataclass(frozen=True)
 class TPCCConfig:
-    warehouses: int = 1
-    districts_per_warehouse: int = 10
-    customers_per_district: int = 300
-    items: int = 1000
+    level: str = "low"
+    profile: str = "small"
+    warehouses: int = 4
+    districts_per_warehouse: int = 4
+    customers_per_district: int = 40
+    items: int = 160
     initial_stock: int = 100
-    order_lines: int = 5
-    candidates_per_task: int = 3
-    transaction_mix: Tuple[Tuple[str, float], ...] = (
-        ("new_order", 0.45),
-        ("payment", 0.43),
-        ("order_status", 0.04),
-        ("delivery", 0.04),
-        ("stock_level", 0.04),
-    )
+    order_lines: int = 4
+    transaction_mix: Tuple[Tuple[str, float], ...] = (("new_order", 1.0),)
+    trace_mode: bool = False
 
     def __post_init__(self) -> None:
         if min(
@@ -42,31 +30,107 @@ class TPCCConfig:
             self.items,
             self.initial_stock,
             self.order_lines,
-            self.candidates_per_task,
         ) <= 0:
             raise ValueError("TPC-C dimensions must be positive")
-        supported = {
-            "new_order",
-            "payment",
-            "order_status",
-            "delivery",
-            "stock_level",
-        }
-        if not self.transaction_mix or any(
-            name not in supported or weight < 0
-            for name, weight in self.transaction_mix
-        ):
-            raise ValueError("invalid TPC-C transaction mix")
-        if sum(weight for _, weight in self.transaction_mix) <= 0:
-            raise ValueError("TPC-C transaction mix must have positive weight")
 
 
-class TPCCAgentWorkload(AgentWorkload):
-    name = "agent-tpcc-semantic"
-    workload_layer = "semantic"
+def tpcc_config(level: str, profile: str = "small") -> TPCCConfig:
+    level = str(level).strip().lower()
+    profile = str(profile).strip().lower()
+    if profile == "small":
+        configs = small_tpcc_configs()
+    elif profile == "paper":
+        configs = paper_tpcc_configs()
+    else:
+        raise ValueError(f"unsupported TPC-C profile: {profile}")
+    if level not in configs:
+        raise ValueError(f"unsupported TPC-C level: {level}")
+    return configs[level]
 
-    def __init__(self, config: TPCCConfig = TPCCConfig()):
+
+def with_warehouses(config: TPCCConfig, warehouses: int | None = None) -> TPCCConfig:
+    if warehouses is None:
+        return config
+    value = int(warehouses)
+    if value <= 0:
+        raise ValueError("TPC-C warehouse override must be positive")
+    return dataclasses.replace(config, warehouses=value)
+
+
+def small_tpcc_configs() -> dict[str, TPCCConfig]:
+    return {
+        "low": TPCCConfig(
+            level="low",
+            warehouses=4,
+            districts_per_warehouse=4,
+            customers_per_district=40,
+            items=160,
+            order_lines=4,
+        ),
+        "medium": TPCCConfig(
+            level="medium",
+            warehouses=2,
+            districts_per_warehouse=3,
+            customers_per_district=40,
+            items=120,
+            order_lines=6,
+        ),
+        "high": TPCCConfig(
+            level="high",
+            warehouses=1,
+            districts_per_warehouse=2,
+            customers_per_district=40,
+            items=100,
+            order_lines=8,
+        ),
+    }
+
+
+def paper_tpcc_configs() -> dict[str, TPCCConfig]:
+    # The paper-style profile keeps the high-contention 1 warehouse setting,
+    # but makes low/medium less artificially hot and includes Payment.
+    mix: Tuple[Tuple[str, float], ...] = (("new_order", 0.55), ("payment", 0.45))
+    return {
+        "low": TPCCConfig(
+            level="low",
+            profile="paper",
+            warehouses=48,
+            districts_per_warehouse=5,
+            customers_per_district=100,
+            items=500,
+            order_lines=5,
+            transaction_mix=mix,
+        ),
+        "medium": TPCCConfig(
+            level="medium",
+            profile="paper",
+            warehouses=2,
+            districts_per_warehouse=3,
+            customers_per_district=60,
+            items=200,
+            order_lines=8,
+            transaction_mix=mix,
+        ),
+        "high": TPCCConfig(
+            level="high",
+            profile="paper",
+            warehouses=1,
+            districts_per_warehouse=2,
+            customers_per_district=40,
+            items=100,
+            order_lines=10,
+            transaction_mix=mix,
+        ),
+    }
+
+
+class TPCCWorkload(AgentWorkload):
+    name = "tpcc"
+    family = "tpcc"
+
+    def __init__(self, config: TPCCConfig):
         self.config = config
+        self.level = config.level
 
     @staticmethod
     def _warehouse(warehouse: int, field: str) -> str:
@@ -84,122 +148,217 @@ class TPCCAgentWorkload(AgentWorkload):
     def _stock(warehouse: int, item: int, field: str) -> str:
         return f"tpcc:stock:{warehouse}:{item}:{field}"
 
-    def manifest(self) -> WorkloadManifest:
-        return WorkloadManifest(
-            name=self.name,
-            benchmark_family="TPC-C",
-            source_system="DBx1000",
-            source_files=(
-                "third_party/dbx1000/benchmarks/tpcc.h",
-                "third_party/dbx1000/benchmarks/tpcc_wl.cpp",
-                "third_party/dbx1000/benchmarks/tpcc_txn.cpp",
-                "third_party/dbx1000/benchmarks/tpcc_query.cpp",
-                "third_party/dbx1000/benchmarks/TPCC_full_schema.txt",
-            ),
-            preserved_semantics=(
-                "warehouse/district/customer/stock object families",
-                "new-order, payment, order-status, delivery, and stock-level task mix",
-                "stock lower-bound constraint for new-order",
-                "order and history append streams",
-                "customer delivery status CAS",
-            ),
-            agent_adaptations=(
-                "flattened versioned KV object layout",
-                "natural-language task envelope",
-                "ranked K candidate plans",
-                "typed delta/append/read/CAS operations",
-                "deterministic generation without requiring an LLM",
-            ),
-            workload_layer=self.workload_layer,
-            canonical_name=self.name,
-            config=dataclasses.asdict(self.config),
-        )
+    @staticmethod
+    def _item(item: int, field: str) -> str:
+        return f"tpcc:item:{item}:{field}"
+
+    @staticmethod
+    def _order(warehouse: int, district: int, order: int) -> str:
+        return f"tpcc:order:{warehouse}:{district}:{order}"
+
+    @staticmethod
+    def _new_order_row(warehouse: int, district: int, order: int) -> str:
+        return f"tpcc:new-order:{warehouse}:{district}:{order}"
+
+    @staticmethod
+    def _order_line(warehouse: int, district: int, order: int, line: int) -> str:
+        return f"tpcc:order-line:{warehouse}:{district}:{order}:{line}"
+
+    @staticmethod
+    def _history(warehouse: int, district: int, customer: int, sequence: int) -> str:
+        return f"tpcc:history:{warehouse}:{district}:{customer}:{sequence}"
 
     def objects(self) -> Iterable[ObjectSpec]:
+        for item in range(self.config.items):
+            yield ObjectSpec(self._item(item, "price"), "1", "row")
         for warehouse in range(self.config.warehouses):
             yield ObjectSpec(self._warehouse(warehouse, "ytd"), "0", "counter")
+            yield ObjectSpec(self._warehouse(warehouse, "tax"), "0", "row")
             for district in range(self.config.districts_per_warehouse):
-                yield ObjectSpec(self._district(warehouse, district, "ytd"), "0", "counter")
-                yield ObjectSpec(
-                    self._district(warehouse, district, "next_order_id"),
-                    "1",
-                    "counter",
-                )
+                yield ObjectSpec(self._district(warehouse, district, "next_order_id"), "1", "counter")
                 yield ObjectSpec(self._district(warehouse, district, "orders"), "", "text")
-                yield ObjectSpec(self._district(warehouse, district, "history"), "", "text")
+                yield ObjectSpec(self._district(warehouse, district, "tax"), "0", "row")
+                yield ObjectSpec(self._district(warehouse, district, "ytd"), "0", "counter")
                 for customer in range(self.config.customers_per_district):
-                    yield ObjectSpec(
-                        self._customer(warehouse, district, customer, "balance"),
-                        "0",
-                        "counter",
-                    )
-                    yield ObjectSpec(
-                        self._customer(warehouse, district, customer, "payment_count"),
-                        "0",
-                        "counter",
-                    )
-                    yield ObjectSpec(
-                        self._customer(warehouse, district, customer, "status"),
-                        "active",
-                        "row",
-                    )
+                    yield ObjectSpec(self._customer(warehouse, district, customer, "balance"), "0", "counter")
+                    yield ObjectSpec(self._customer(warehouse, district, customer, "status"), "active", "row")
+                    yield ObjectSpec(self._customer(warehouse, district, customer, "discount"), "0", "row")
+                    yield ObjectSpec(self._customer(warehouse, district, customer, "ytd_payment"), "0", "counter")
+                    yield ObjectSpec(self._customer(warehouse, district, customer, "payment_count"), "0", "counter")
             for item in range(self.config.items):
-                yield ObjectSpec(
-                    self._stock(warehouse, item, "quantity"),
-                    str(self.config.initial_stock),
-                    "counter",
-                )
+                yield ObjectSpec(self._stock(warehouse, item, "quantity"), str(self.config.initial_stock), "counter")
                 yield ObjectSpec(self._stock(warehouse, item, "ytd"), "0", "counter")
+                yield ObjectSpec(self._stock(warehouse, item, "order_count"), "0", "counter")
 
-    def _scope(self, rng: random.Random) -> Tuple[int, int, int]:
-        warehouse = rng.randrange(self.config.warehouses)
-        district = rng.randrange(self.config.districts_per_warehouse)
-        customer = rng.randrange(self.config.customers_per_district)
-        return warehouse, district, customer
+    def generate_tasks(self, count: int, *, seed: int = 0) -> Sequence[AgentTask]:
+        if count < 0:
+            raise ValueError("task count must be non-negative")
+        rng = random.Random(seed)
+        names = [name for name, _weight in self.config.transaction_mix]
+        weights = [weight for _name, weight in self.config.transaction_mix]
+        tasks = []
+        for task_index in range(count):
+            task_type = rng.choices(names, weights=weights, k=1)[0]
+            warehouse = rng.randrange(self.config.warehouses)
+            district = rng.randrange(self.config.districts_per_warehouse)
+            customer = rng.randrange(self.config.customers_per_district)
+            if task_type == "payment":
+                operations = self._payment(task_index, rng, warehouse, district, customer)
+            else:
+                task_type = "new_order"
+                operations = self._new_order(task_index, rng, warehouse, district, customer)
+            tasks.append(
+                AgentTask(
+                    task_id=f"tpcc-{task_index}",
+                    workload=self.name,
+                    task_type=task_type,
+                    operations=operations,
+                    context={
+                        "level": self.level,
+                        "profile": self.config.profile,
+                        "transaction_mix": tuple(name for name, _weight in self.config.transaction_mix),
+                        "warehouse": warehouse,
+                        "district": district,
+                        "customer": customer,
+                        "agent_cost_class": agent_cost_class(self.level, task_index, task_type),
+                        "phase_shape": phase_shape(self.level, task_index, task_type),
+                        "side_effect_cost_ms": side_effect_cost_ms(self.level, task_index, task_type),
+                    },
+                )
+            )
+        return tasks
 
     def _new_order(
-        self, task_index: int, rng: random.Random, warehouse: int, district: int
-    ) -> Tuple[AgentCandidate, ...]:
-        candidates = []
-        for candidate_index in range(self.config.candidates_per_task):
-            items = rng.sample(
-                range(self.config.items),
-                min(self.config.order_lines, self.config.items),
+        self,
+        task_index: int,
+        rng: random.Random,
+        warehouse: int,
+        district: int,
+        customer: int,
+    ) -> Tuple[AgentOperation, ...]:
+        if self.config.profile != "paper":
+            return self._legacy_new_order(task_index, rng, warehouse, district)
+        line_count = (
+            rng.randint(5, 15)
+            if self.config.profile == "paper" and self.config.trace_mode
+            else self.config.order_lines
+        )
+        items = rng.sample(range(self.config.items), min(line_count, self.config.items))
+        operations = [
+            AgentOperation.read(self._warehouse(warehouse, "tax"), phase="explore"),
+            AgentOperation.read(self._district(warehouse, district, "tax"), phase="explore"),
+            AgentOperation.read(
+                self._district(warehouse, district, "next_order_id"),
+                phase="explore",
+            ),
+            AgentOperation.read(
+                self._customer(warehouse, district, customer, "discount"),
+                phase="explore",
+            ),
+        ]
+        for item in items:
+            operations.append(AgentOperation.read(self._item(item, "price"), phase="refine"))
+            operations.append(
+                AgentOperation.read(
+                    self._stock(warehouse, item, "quantity"),
+                    phase="refine",
+                )
             )
-            operations = [
-                AgentOperation.delta(
-                    self._district(warehouse, district, "next_order_id"), 1
-                ),
-                AgentOperation.append(
-                    self._district(warehouse, district, "orders"),
-                    f"|order:{task_index}:{candidate_index}",
-                    commutative=True,
-                ),
+        operations.extend(
+            [
+            AgentOperation.write(
+                self._district(warehouse, district, "next_order_id"),
+                f"order-next:{task_index}",
+                phase="commit",
+            ),
+            AgentOperation.write(
+                self._district(warehouse, district, "orders"),
+                f"order-log:{task_index}",
+                phase="commit",
+            ),
             ]
-            for item in items:
-                quantity = rng.randint(1, 5)
-                operations.append(
-                    AgentOperation.delta(
-                        self._stock(warehouse, item, "quantity"),
-                        -quantity,
-                        constrained=True,
-                        lower_bound=0,
-                    )
-                )
-                operations.append(
-                    AgentOperation.delta(
-                        self._stock(warehouse, item, "ytd"), quantity
-                    )
-                )
-            candidates.append(
-                AgentCandidate(
-                    f"tpcc-new-order-{task_index}-{candidate_index}",
-                    float(self.config.candidates_per_task - candidate_index),
-                    tuple(operations),
-                    metadata={"items": items, "source": "DBx1000/TPCC"},
+        )
+        for line, item in enumerate(items):
+            quantity = rng.randint(1, 5)
+            operations.append(
+                AgentOperation.write(
+                    self._stock(warehouse, item, "quantity"),
+                    f"stock-q:{task_index}:{item}:{quantity}",
+                    phase="commit",
                 )
             )
-        return tuple(candidates)
+            operations.append(
+                AgentOperation.write(
+                    self._stock(warehouse, item, "ytd"),
+                    f"stock-ytd:{task_index}:{item}:{quantity}",
+                    phase="commit",
+                )
+            )
+            operations.append(
+                AgentOperation.write(
+                    self._stock(warehouse, item, "order_count"),
+                    f"stock-orders:{task_index}:{item}",
+                    phase="commit",
+                )
+            )
+            if self.config.trace_mode:
+                operations.append(
+                    AgentOperation.write(
+                        self._order_line(warehouse, district, task_index, line),
+                        f"line:{customer}:{item}:{quantity}",
+                        phase="commit",
+                    )
+                )
+        if self.config.trace_mode:
+            operations.extend(
+                (
+                    AgentOperation.write(
+                        self._order(warehouse, district, task_index),
+                        f"order:{customer}:{len(items)}",
+                        phase="commit",
+                    ),
+                    AgentOperation.write(
+                        self._new_order_row(warehouse, district, task_index),
+                        "pending",
+                        phase="commit",
+                    ),
+                )
+            )
+        return tuple(operations)
+
+    def _legacy_new_order(
+        self,
+        task_index: int,
+        rng: random.Random,
+        warehouse: int,
+        district: int,
+    ) -> Tuple[AgentOperation, ...]:
+        items = rng.sample(range(self.config.items), min(self.config.order_lines, self.config.items))
+        operations = [
+            AgentOperation.write(
+                self._district(warehouse, district, "next_order_id"),
+                f"order-next:{task_index}",
+            ),
+            AgentOperation.write(
+                self._district(warehouse, district, "orders"),
+                f"order-log:{task_index}",
+            ),
+        ]
+        for item in items:
+            quantity = rng.randint(1, 5)
+            operations.append(
+                AgentOperation.write(
+                    self._stock(warehouse, item, "quantity"),
+                    f"stock-q:{task_index}:{item}:{quantity}",
+                )
+            )
+            operations.append(
+                AgentOperation.write(
+                    self._stock(warehouse, item, "ytd"),
+                    f"stock-ytd:{task_index}:{item}:{quantity}",
+                )
+            )
+        return tuple(operations)
 
     def _payment(
         self,
@@ -207,241 +366,97 @@ class TPCCAgentWorkload(AgentWorkload):
         rng: random.Random,
         warehouse: int,
         district: int,
-    ) -> Tuple[AgentCandidate, ...]:
-        candidates = []
+        customer: int,
+    ) -> Tuple[AgentOperation, ...]:
+        if self.config.profile != "paper":
+            amount = rng.randint(100, 5000)
+            return (
+                AgentOperation.write(
+                    self._warehouse(warehouse, "ytd"),
+                    f"payment-ytd:{task_index}:{amount}",
+                ),
+                AgentOperation.write(
+                    self._customer(warehouse, district, customer, "balance"),
+                    f"payment-balance:{task_index}:{amount}",
+                ),
+                AgentOperation.write(
+                    self._district(warehouse, district, "orders"),
+                    f"payment-log:{task_index}:{customer}:{amount}",
+                ),
+            )
         amount = rng.randint(100, 5000)
-        customer_choices = rng.sample(
-            range(self.config.customers_per_district),
-            min(self.config.candidates_per_task, self.config.customers_per_district),
-        )
-        for candidate_index, customer in enumerate(customer_choices):
-            operations = (
-                AgentOperation.delta(self._warehouse(warehouse, "ytd"), amount),
-                AgentOperation.delta(self._district(warehouse, district, "ytd"), amount),
-                AgentOperation.delta(
-                    self._customer(warehouse, district, customer, "balance"), -amount
-                ),
-                AgentOperation.delta(
-                    self._customer(warehouse, district, customer, "payment_count"), 1
-                ),
-                AgentOperation.append(
-                    self._district(warehouse, district, "history"),
-                    f"|payment:{task_index}:{customer}:{amount}",
-                    commutative=True,
-                ),
-            )
-            candidates.append(
-                AgentCandidate(
-                    f"tpcc-payment-{task_index}-{candidate_index}",
-                    float(len(customer_choices) - candidate_index),
-                    operations,
-                    metadata={"customer": customer, "amount": amount},
-                )
-            )
-        return tuple(candidates)
-
-    def _read_task(
-        self,
-        task_index: int,
-        task_type: str,
-        rng: random.Random,
-        warehouse: int,
-        district: int,
-        customer: int,
-    ) -> Tuple[AgentCandidate, ...]:
-        if task_type == "order_status":
-            operations = (
-                AgentOperation.read(
-                    self._customer(warehouse, district, customer, "balance")
-                ),
-                AgentOperation.read(self._district(warehouse, district, "orders")),
-            )
-        else:
-            items = rng.sample(
-                range(self.config.items), min(self.config.order_lines, self.config.items)
-            )
-            operations = tuple(
-                AgentOperation.read(self._stock(warehouse, item, "quantity"))
-                for item in items
-            )
         return (
-            AgentCandidate(
-                f"tpcc-{task_type}-{task_index}", 1.0, tuple(operations)
+            AgentOperation.read(self._warehouse(warehouse, "ytd"), phase="explore"),
+            AgentOperation.read(self._district(warehouse, district, "ytd"), phase="explore"),
+            AgentOperation.read(
+                self._customer(warehouse, district, customer, "balance"),
+                phase="explore",
             ),
-        )
-
-    def _delivery(
-        self,
-        task_index: int,
-        warehouse: int,
-        district: int,
-        customer: int,
-    ) -> Tuple[AgentCandidate, ...]:
-        customers = [
-            (customer + offset) % self.config.customers_per_district
-            for offset in range(
-                min(self.config.candidates_per_task, self.config.customers_per_district)
-            )
-        ]
-        return tuple(
-            AgentCandidate(
-                f"tpcc-delivery-{task_index}-{index}",
-                float(len(customers) - index),
+            AgentOperation.read(
+                self._customer(warehouse, district, customer, "status"),
+                phase="refine",
+            ),
+            AgentOperation.write(
+                self._warehouse(warehouse, "ytd"),
+                f"payment-ytd:{task_index}:{amount}",
+                phase="commit",
+            ),
+            AgentOperation.write(
+                self._district(warehouse, district, "ytd"),
+                f"payment-district-ytd:{task_index}:{amount}",
+                phase="commit",
+            ),
+            AgentOperation.write(
+                self._customer(warehouse, district, customer, "balance"),
+                f"payment-balance:{task_index}:{amount}",
+                phase="commit",
+            ),
+            AgentOperation.write(
+                self._customer(warehouse, district, customer, "ytd_payment"),
+                f"payment-customer-ytd:{task_index}:{amount}",
+                phase="commit",
+            ),
+            AgentOperation.write(
+                self._customer(warehouse, district, customer, "payment_count"),
+                f"payment-count:{task_index}",
+                phase="commit",
+            ),
+            AgentOperation.write(
                 (
-                    AgentOperation.cas(
-                        self._customer(warehouse, district, candidate, "status"),
-                        "active",
-                        "delivered",
-                    ),
+                    self._history(warehouse, district, customer, task_index)
+                    if self.config.trace_mode
+                    else self._district(warehouse, district, "orders")
                 ),
-                metadata={"customer": candidate},
-            )
-            for index, candidate in enumerate(customers)
-        )
-
-    def generate_tasks(self, count: int, *, seed: int = 0) -> Sequence[AgentTask]:
-        if count < 0:
-            raise ValueError("task count must be non-negative")
-        rng = random.Random(seed)
-        names = [name for name, _ in self.config.transaction_mix]
-        weights = [weight for _, weight in self.config.transaction_mix]
-        tasks = []
-        for task_index in range(count):
-            task_type = rng.choices(names, weights=weights, k=1)[0]
-            warehouse, district, customer = self._scope(rng)
-            if task_type == "new_order":
-                candidates = self._new_order(task_index, rng, warehouse, district)
-            elif task_type == "payment":
-                candidates = self._payment(task_index, rng, warehouse, district)
-            elif task_type == "delivery":
-                candidates = self._delivery(
-                    task_index, warehouse, district, customer
-                )
-            else:
-                candidates = self._read_task(
-                    task_index,
-                    task_type,
-                    rng,
-                    warehouse,
-                    district,
-                    customer,
-                )
-            stages = _agent_stages_for_candidates(task_type, candidates)
-            tasks.append(
-                AgentTask(
-                    task_id=f"tpcc-{task_index}",
-                    workload=self.name,
-                    task_type=task_type,
-                    request=f"Complete the TPC-C {task_type} business task.",
-                    candidates=candidates,
-                    context={
-                        "warehouse": warehouse,
-                        "district": district,
-                        "customer": customer,
-                        "source": "DBx1000/TPCC",
-                        "agent_phase_sequence": _agent_phase_sequence(task_type),
-                        "agent_stages": [stage.to_dict() for stage in stages],
-                    },
-                )
-            )
-        return tasks
-
-
-def _agent_phase_sequence(task_type: str) -> Tuple[str, ...]:
-    if task_type == "new_order":
-        return ("explore", "refine", "commit")
-    if task_type == "payment":
-        return ("refine", "commit")
-    if task_type in {"order_status", "stock_level"}:
-        return ("explore", "refine")
-    if task_type == "delivery":
-        return ("commit",)
-    return ("commit",)
-
-
-def _agent_stages_for_candidates(
-    task_type: str,
-    candidates: Sequence[AgentCandidate],
-) -> Tuple[AgentStage, ...]:
-    operations = tuple(
-        operation for candidate in candidates for operation in candidate.operations
-    )
-    if task_type == "new_order":
-        stock_reads = tuple(
-            AgentOperation.read(operation.object_id)
-            for operation in operations
-            if ":stock:" in operation.object_id and operation.object_id.endswith(":quantity")
-        )
-        midpoint = max(1, len(stock_reads) // 2) if stock_reads else 0
-        return (
-            AgentStage("explore", stock_reads[:midpoint], delay_weight=1.0),
-            AgentStage("refine", stock_reads[midpoint:], delay_weight=1.0),
-            AgentStage("commit", operations, delay_weight=1.0),
-        )
-    reads = tuple(operation for operation in operations if operation.kind == "read")
-    writes = tuple(operation for operation in operations if operation.kind != "read")
-    sequence = _agent_phase_sequence(task_type)
-    if sequence == ("refine", "commit"):
-        return (
-            AgentStage("refine", reads, delay_weight=1.0),
-            AgentStage("commit", writes, delay_weight=1.0),
-        )
-    if sequence == ("explore", "refine"):
-        return (
-            AgentStage("explore", reads, delay_weight=1.0),
-            AgentStage("refine", (), delay_weight=1.0),
-        )
-    return (AgentStage("commit", operations, delay_weight=1.0),)
-
-
-class TPCCFaithfulAgentWorkload(TPCCAgentWorkload):
-    """Agent-side TPC-C layer aligned with DBx1000's native TPCC surface.
-
-    DBx1000's vendored benchmark models Payment and NewOrder. This layer keeps
-    that transaction family boundary and uses one candidate per task so native
-    DBx1000 CC results can be compared without mixing in agent re-planning.
-    """
-
-    name = "agent-tpcc-faithful"
-    workload_layer = "faithful"
-
-    def __init__(self, config: TPCCConfig = TPCCConfig()):
-        native_mix = tuple(
-            (name, weight)
-            for name, weight in config.transaction_mix
-            if name in {"new_order", "payment"} and weight > 0
-        )
-        if not native_mix:
-            raise ValueError(
-                "faithful DBx1000 TPC-C layer needs at least one new_order/payment entry"
-            )
-        super().__init__(
-            dataclasses.replace(
-                config, candidates_per_task=1, transaction_mix=native_mix
-            )
-        )
-
-    def manifest(self) -> WorkloadManifest:
-        manifest = super().manifest()
-        return WorkloadManifest(
-            name=self.name,
-            benchmark_family=manifest.benchmark_family,
-            source_system=manifest.source_system,
-            source_files=manifest.source_files,
-            preserved_semantics=(
-                "DBx1000-modeled new-order and payment transaction families",
-                "warehouse/district/customer/stock object families",
-                "stock lower-bound constraint for new-order",
-                "order and history append streams",
-                "single candidate per request for native comparability",
+                f"payment-history:{amount}",
+                phase="commit",
             ),
-            agent_adaptations=(
-                "flattened versioned KV object layout",
-                "agent transaction envelope without K-candidate re-planning",
-                "typed delta/append operations over versioned KV objects",
-                "deterministic generation without requiring an LLM",
-            ),
-            workload_layer=self.workload_layer,
-            canonical_name=self.name,
-            config=dataclasses.asdict(self.config),
         )
+
+
+def agent_cost_class(level: str, task_index: int, task_type: str) -> str:
+    level = str(level).strip().lower()
+    if task_type == "new_order" and level == "high":
+        return "expensive"
+    if task_type == "new_order" and level == "medium":
+        return "normal"
+    if task_index % 4 == 0:
+        return "normal"
+    return "cheap"
+
+
+def phase_shape(level: str, task_index: int, task_type: str) -> str:
+    level = str(level).strip().lower()
+    if task_type == "new_order" and level in {"medium", "high"}:
+        return "tool_heavy"
+    if task_index % 2 == 0:
+        return "multi_stage"
+    return "short"
+
+
+def side_effect_cost_ms(level: str, task_index: int, task_type: str) -> int:
+    level = str(level).strip().lower()
+    if task_type == "new_order" and level == "high":
+        return 60
+    if task_type == "new_order" and level == "medium":
+        return 25
+    return 0

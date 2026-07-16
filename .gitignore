@@ -10,7 +10,10 @@ venv/
 *.dylib
 build/
 dist/
-
+tmp/
+output/
+.codex-tmp/
+results/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -19,3 +22,9 @@ Thumbs.db
 *.swp
 *.swo
 astra_core.egg-info/
+*.egg-info/
+
+# Local experiment outputs. Keep reports in README/docs and force-add any
+# artifact that must be versioned for a paper or release.
+/results/*.json
+/paper_*_results.json
