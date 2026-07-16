@@ -24,6 +24,8 @@ class Dbx1000VersionedKVStore final : public VersionedKVStore {
                     const std::string& value) override;
   bool DeleteIfVersion(const std::string& key,
                        std::uint64_t expected) override;
+  bool ValidateVersions(
+      const std::vector<VersionCheck>& checks) const override;
   bool BatchPutIfVersion(const std::vector<VersionCheck>& checks,
                          const std::vector<WriteOp>& writes) override;
   const char* BackendName() const override { return "dbx1000"; }

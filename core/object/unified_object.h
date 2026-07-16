@@ -1,4 +1,5 @@
 #pragma once
+
 #include <cstdint>
 #include <string>
 
@@ -9,10 +10,9 @@ enum class ObjectType {
   kRow,
   kText,
   kCounter,
-  kCandidateResult,
 };
 
-// 底层存储读出的版本化值。version==0 且 exists==false 表示对象不存在。
+// Versioned value read from storage. version==0 and exists==false means missing.
 struct VersionedValue {
   std::string value;
   std::uint64_t version = 0;
@@ -25,7 +25,6 @@ inline const char* ObjectTypeName(ObjectType t) {
     case ObjectType::kRow: return "row";
     case ObjectType::kText: return "text";
     case ObjectType::kCounter: return "counter";
-    case ObjectType::kCandidateResult: return "candidate_result";
   }
   return "generic";
 }
