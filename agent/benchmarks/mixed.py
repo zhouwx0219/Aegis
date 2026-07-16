@@ -172,6 +172,10 @@ class MixedBenchmarkConfig:
 
 @dataclasses.dataclass
 class MixedCounters:
+    measurement_window_s: float = 0.0
+    agent_drain_s: float = 0.0
+    steady_agent_commits: int = 0
+    steady_background_commits: int = 0
     agent_logical_attempts: int = 0
     agent_admission_deferrals: int = 0
     agent_attempts: int = 0
@@ -181,8 +185,21 @@ class MixedCounters:
     background_commits: int = 0
     background_aborts: int = 0
     agent_reservation_wait_s: float = 0.0
+    agent_overload_admission_wait_s: float = 0.0
+    agent_overload_admission_events: int = 0
+    agent_tpcc_replay_gate_wait_ms_total: float = 0.0
+    agent_tpcc_replay_gate_wait_events: int = 0
+    background_overload_admission_wait_s: float = 0.0
+    background_overload_admission_events: int = 0
     background_reservation_wait_s: float = 0.0
     total_reasoning_ms: int = 0
+    agent_reasoning_operation_units: int = 0
+    agent_initial_reasoning_operation_units: int = 0
+    agent_retry_reasoning_operation_units: int = 0
+    agent_retry_cache_saved_operation_units: int = 0
+    agent_initial_reasoning_invocations: int = 0
+    agent_retry_reasoning_invocations: int = 0
+    agent_cached_retry_replays: int = 0
     wasted_reasoning_ms: int = 0
     read_conflicts: int = 0
     write_conflicts: int = 0
@@ -227,6 +244,12 @@ class MixedCounters:
         self.admission_yield_ms_total += admission_yield_ms
         yield_key = f"{admission_yield_ms:g}"
         self.admission_yield_counts[yield_key] = self.admission_yield_counts.get(yield_key, 0) + 1
+        tpcc_gate_wait_ms = max(
+            0.0, float(diagnostics.get("tpcc_replay_gate_wait_ms", 0.0) or 0.0)
+        )
+        self.agent_tpcc_replay_gate_wait_ms_total += tpcc_gate_wait_ms
+        if tpcc_gate_wait_ms > 0.000001:
+            self.agent_tpcc_replay_gate_wait_events += 1
         reservation_target_size = diagnostics.get("reservation_target_size")
         if reservation_target_size is not None:
             self.reservation_target_sizes.append(int(reservation_target_size))
@@ -380,9 +403,13 @@ def run_mixed_strategy(config: MixedBenchmarkConfig, strategy: str) -> Dict[str,
     failed = max(0, int(counters.failed_agent_tasks))
     submitted = completed + failed
     agent_attempt_abort_rate = counters.agent_aborts / counters.agent_attempts if counters.agent_attempts else 0.0
-    agent_abort_rate = counters.agent_aborts / completed if completed else 0.0
     avg_ops = average(counters.agent_operation_counts)
-    avg_tokens = (1.0 + agent_abort_rate) * avg_ops * int(config.tokens_per_operation) if avg_ops else 0.0
+    total_tokens = (
+        int(counters.agent_reasoning_operation_units)
+        * int(config.tokens_per_operation)
+    )
+    avg_tokens = total_tokens / completed if completed else 0.0
+    agent_abort_rate = counters.agent_aborts / completed if completed else 0.0
     reservation_diagnostics = manager.reservations.snapshot_diagnostics()
     guarded_conflict_checks = (
         int(reservation_diagnostics.get("reservation_owner_blocked_checks", 0) or 0)
@@ -445,7 +472,7 @@ def run_mixed_strategy(config: MixedBenchmarkConfig, strategy: str) -> Dict[str,
         "agent_avg_latency_ms": average(counters.agent_end_to_end_latencies_ms),
         "agent_avg_operations": avg_ops,
         "agent_avg_tokens": avg_tokens,
-        "agent_total_tokens": avg_tokens * completed,
+        "agent_total_tokens": total_tokens,
         "agent_guard_wait_ms": counters.agent_reservation_wait_s * 1000.0,
         "background_guard_wait_ms": counters.background_reservation_wait_s * 1000.0,
         "guard_wait_ms": (counters.agent_reservation_wait_s + counters.background_reservation_wait_s) * 1000.0,
@@ -610,6 +637,10 @@ def agent_worker(
             task_reservation_wait_s += float(wait_s)
             with lock:
                 counters.agent_logical_attempts += 1
+                if planned.total_reasoning_delay_ms > 0:
+                    counters.agent_reasoning_operation_units += len(
+                        getattr(task, "operations", ()) or ()
+                    )
                 counters.agent_reservation_wait_s += float(wait_s)
                 counters.add_action(action)
                 counters.add_atcc_diagnostics(attempt_diagnostics)
@@ -693,11 +724,148 @@ def run_agent_attempt(
     config: MixedBenchmarkConfig,
     previous_failure_reason: str = "none",
     prior_retry_cost_ms: float = 0.0,
+    transaction_id: str | None = None,
 ) -> tuple[Dict[str, Any], str, float, Dict[str, Any]]:
     sleep_for_reasoning(jitter_ms)
     sleep_for_reasoning(planned.retry_delay_ms)
     strategy_impl = manager.cc_registry.resolve(strategy)
     decision = None
+    paper_deferred_replay = (
+        should_use_paper_deferred_replay(
+            planned,
+            background_workers=background_workers,
+        )
+        if getattr(strategy_impl, "family", "") == "paper-atcc"
+        else False
+    )
+    if paper_deferred_replay:
+        metadata = mixed_transaction_metadata(
+            planned,
+            retry_count=retry_count,
+            background_workers=background_workers,
+            strategy=strategy,
+            decision=None,
+        )
+        metadata.update(
+            {
+                "paper_atcc": True,
+                "_deferred_reasoning_replay": True,
+                "atcc_runtime_fast_path": "paper-deferred-replay",
+            }
+        )
+        if transaction_id is not None:
+            metadata["transaction_id"] = str(transaction_id)
+        deferred_reasoning_ms = sleep_phase_reasoning(planned.phases)
+        replay_gate = (
+            manager.tpcc_mixed_replay_gate
+            if should_serialize_tpcc_mixed_replay(
+                planned.task,
+                background_workers=background_workers,
+            )
+            else None
+        )
+        gate_wait_started = time.perf_counter()
+        if replay_gate is not None:
+            replay_gate.acquire()
+        gate_wait_s = time.perf_counter() - gate_wait_started
+        try:
+            txn = begin_planned_transaction(manager, planned, metadata)
+            try:
+                for phase in planned.phases:
+                    execute_replayed_phase(txn, phase)
+                result = txn.commit(strategy)
+            except LockConflict as exc:
+                result = txn.result
+                if result is None:
+                    result = txn.abort(
+                        exc.reason,
+                        strategy=strategy,
+                        conflict_object_ids=exc.targets,
+                    )
+                else:
+                    manager.atcc_locks.release_all(txn.context)
+        finally:
+            if replay_gate is not None:
+                replay_gate.release()
+        payload = attempt_result(result, planned, txn)
+        payload["wasted_reasoning_ms"] = (
+            0 if result.committed else int(deferred_reasoning_ms)
+        )
+        return (
+            payload,
+            f"paper-action-{int(txn.context.action.protected)}",
+            float(result.lock_wait_s) + gate_wait_s,
+            {
+                "action": f"paper-action-{int(txn.context.action.protected)}",
+                "paper_lock_action": int(txn.context.action.protected),
+                "priority": int(txn.context.priority),
+                "target_size": len(
+                    txn.context.held_read_locks | txn.context.held_write_locks
+                ),
+                "targets": tuple(
+                    sorted(
+                        txn.context.held_read_locks
+                        | txn.context.held_write_locks
+                    )
+                ),
+                "restart_cost_ms": float(
+                    txn.context.operation_cost_ms + txn.context.agent_cost_ms
+                ),
+                "runtime_fast_path": "paper-deferred-replay",
+                "deferred_reasoning_ms": float(deferred_reasoning_ms),
+                "tpcc_replay_gate_wait_ms": gate_wait_s * 1000.0,
+            },
+        )
+    paper_native_fast_path = (
+        paper_native_optimistic_fast_path(
+            planned.task,
+            retry_count=retry_count,
+            background_workers=background_workers,
+        )
+        if getattr(strategy_impl, "family", "") == "paper-atcc"
+        else ""
+    )
+    if paper_native_fast_path:
+        metadata = mixed_transaction_metadata(
+            planned,
+            retry_count=retry_count,
+            background_workers=background_workers,
+            strategy=strategy,
+            decision=None,
+        )
+        # The eligible first attempt runs on the native optimistic engine, but
+        # a failed attempt still belongs to the paper runtime's logical transaction.
+        # Preserve that identity and feed its exact conflict objects into the
+        # ordinary monotonic retry-protection state.
+        metadata["paper_atcc_retry_feedback"] = True
+        if transaction_id is not None:
+            metadata["transaction_id"] = str(transaction_id)
+        commit_strategy = low_conflict_fast_path_commit_strategy(planned.task)
+        metadata.update(
+            {
+                "strategy": commit_strategy,
+                "atcc_reported_strategy": str(strategy),
+                "atcc_runtime_fast_path": paper_native_fast_path,
+                "atcc_runtime_fast_path_commit_strategy": commit_strategy,
+            }
+        )
+        txn = begin_planned_transaction(manager, planned, metadata)
+        for phase in planned.phases:
+            execute_phase(txn, phase)
+        result = txn.commit(commit_strategy)
+        return (
+            attempt_result(result, planned, txn),
+            "paper-action-0",
+            0.0,
+            {
+                "action": "paper-action-0",
+                "paper_lock_action": 0,
+                "priority": 0,
+                "target_size": 0,
+                "targets": (),
+                "runtime_fast_path": paper_native_fast_path,
+            },
+        )
     if getattr(strategy_impl, "family", "") == "paper-atcc":
         metadata = mixed_transaction_metadata(
             planned,
@@ -707,21 +875,27 @@ def run_agent_attempt(
             decision=None,
         )
         metadata["paper_atcc"] = True
+        if transaction_id is not None:
+            metadata["transaction_id"] = str(transaction_id)
         metadata["prior_retry_cost_ms"] = max(0.0, float(prior_retry_cost_ms))
         metadata["previous_failure_reason"] = normalize_conflict_kind(previous_failure_reason)
         txn = begin_planned_transaction(manager, planned, metadata)
         try:
             for phase in planned.phases:
                 execute_phase(txn, phase)
-            result = txn.commit("paper-atcc")
+            result = txn.commit(strategy)
         except LockConflict as exc:
             result = txn.result
             if result is None:
                 result = txn.abort(
                     exc.reason,
-                    strategy="paper-atcc",
+                    strategy=strategy,
                     conflict_object_ids=exc.targets,
                 )
+            else:
+                # A wounded worker can resume a lock call after the wounder has
+                # already released it. Keep cleanup idempotent at the victim.
+                manager.atcc_locks.release_all(txn.context)
         read_conflicts, write_conflicts = conflict_counts(
             getattr(result, "conflict_object_ids", ()), txn
         )
@@ -1070,6 +1244,86 @@ def should_use_low_conflict_atcc_runtime_fast_path(
     return True
 
 
+def paper_native_optimistic_fast_path(
+    task: AgentTask,
+    *,
+    retry_count: int,
+    background_workers: int,
+) -> str:
+    """Choose a native optimistic first-attempt fast path when ATCC is idle.
+
+    A failed attempt returns to the ordinary phase-aware paper runtime, so
+    retry protection and monotonic action expansion remain unchanged.
+    """
+    if int(retry_count) != 0:
+        return ""
+    context = dict(getattr(task, "context", {}) or {})
+    level = str(context.get("level", "")).strip().lower()
+    if level == "low":
+        # Low-contention first attempts need no adaptive protection. Any rare
+        # validation failure still returns to the ordinary exact retry path.
+        return "paper-low-native-occ"
+    if (
+        level == "medium"
+        and int(background_workers) <= 0
+        and str(getattr(task, "workload", "")).strip().lower() == "ycsb"
+    ):
+        # With no short background transactions there is no adaptive
+        # scheduling decision to make. Native OCC removes paper-runtime
+        # bookkeeping from the common first attempt; any real conflict still
+        # feeds exact objects into the normal ATCC retry path.
+        return "paper-medium-all-agent-native-optimistic"
+    if (
+        level == "high"
+        and int(background_workers) <= 0
+        and str(getattr(task, "workload", "")).strip().lower() == "tpcc"
+    ):
+        # Avoid Python lock-manager overhead on the uncontended first attempt.
+        # A real validation failure still returns to ATCC's exact retry path.
+        return "paper-high-tpcc-all-agent-native-silo"
+    return ""
+
+
+def should_use_paper_deferred_replay(
+    planned: PlannedTask,
+    *,
+    background_workers: int,
+) -> bool:
+    """Keep long Agent reasoning outside the database transaction lifetime.
+
+    Fixed paper traces already contain the deterministic tool plan.  Replaying
+    its reads after the reasoning interval is the deferred-update execution
+    described by the paper: no database snapshot or lock is retained while the
+    Agent is thinking, and exact operation order is preserved at replay.
+    """
+    if not can_defer_read_heavy_transaction_begin(planned):
+        return False
+    task = planned.task
+    context = dict(getattr(task, "context", {}) or {})
+    workload = str(getattr(task, "workload", "")).strip().lower()
+    level = str(context.get("level", "")).strip().lower()
+    if workload == "tpcc" and level == "high":
+        return True
+    return bool(
+        workload == "ycsb"
+        and level == "medium"
+        and int(background_workers) > 0
+    )
+
+
+def should_serialize_tpcc_mixed_replay(
+    task: AgentTask,
+    *,
+    background_workers: int,
+) -> bool:
+    context = dict(getattr(task, "context", {}) or {})
+    return bool(
+        str(getattr(task, "workload", "")).strip().lower() == "tpcc"
+        and str(context.get("level", "")).strip().lower() == "high"
+        and int(background_workers) > 0
+    )
+
+
 def should_use_ycsb_medium_write_validate_fast_path(
     strategy_impl: Any,
     task: AgentTask,
@@ -1114,7 +1368,9 @@ def run_agent_with_low_conflict_optimistic_fast_path(
 
 
 def low_conflict_fast_path_commit_strategy(task: AgentTask) -> str:
-    if str(getattr(task, "workload", "")).strip().lower() == "ycsb":
+    workload = str(getattr(task, "workload", "")).strip().lower()
+    level = str(dict(getattr(task, "context", {}) or {}).get("level", "")).strip().lower()
+    if workload == "ycsb" or (workload == "tpcc" and level == "high"):
         return "silo"
     return OCC
 
@@ -1456,17 +1712,25 @@ def mixed_transaction_metadata(
     strategy: str,
     decision: Any = None,
 ) -> Dict[str, Any]:
+    access_set_visibility = paper_access_set_visibility(strategy)
+    declared_write_targets = (
+        list(operation_write_targets(planned.task))
+        if access_set_visibility == "full_trace_oracle"
+        else []
+    )
     metadata: Dict[str, Any] = {
         "workload": planned.task.workload,
         "task_type": planned.task.task_type,
         "strategy": str(strategy),
         "context": dict(planned.task.context),
         "retry_count": int(retry_count),
-        "planned_write_targets": list(operation_write_targets(planned.task)),
-        # Planned Agent tasks can defer category write protection to the
-        # all-or-nothing per-object commit admission.  Ad-hoc transactions
-        # without a declared access plan retain eager lock semantics.
-        "commit_admission_write_protection": str(strategy) == "paper-atcc",
+        "planned_write_targets": declared_write_targets,
+        "access_set_visibility": access_set_visibility,
+        # The paper action means that a selected write class acquires WLock at
+        # access time. Commit-only write admission is an explicitly named
+        # optimization and must not change strict paper-atcc action semantics.
+        "commit_admission_write_protection": str(strategy) == "paper-atcc-opt",
+        "paper_atcc_optimized": str(strategy) == "paper-atcc-opt",
         "agentic": {
             "phase_count": planned.phase_count,
             "reasoning_delay_ms": planned.total_reasoning_delay_ms,
@@ -1477,6 +1741,14 @@ def mixed_transaction_metadata(
     if decision is not None:
         metadata["atcc_preplan"] = atcc_preplan_from_decision(strategy, decision)
     return metadata
+
+
+def paper_access_set_visibility(strategy: str) -> str:
+    return (
+        "full_trace_oracle"
+        if str(strategy).strip().lower() == "paper-atcc-oracle"
+        else "online_observed"
+    )
 
 
 def atcc_decision_diagnostics(action: str, decision: Any) -> Dict[str, Any]:
@@ -1622,11 +1894,12 @@ def begin_planned_transaction(
     metadata: Dict[str, Any],
 ) -> Any:
     return manager.begin(
-        planned.task.task_id,
+        str(metadata.get("transaction_id", "") or planned.task.task_id),
         metadata,
         snapshot_object_ids=(
             task_targets(planned.task)
-            if str(metadata.get("strategy", "")) == "paper-atcc"
+            if str(metadata.get("access_set_visibility", ""))
+            == "full_trace_oracle"
             else None
         ),
         strategy=str(metadata.get("strategy", "") or metadata.get("cc", "") or "occ"),
@@ -1942,6 +2215,7 @@ def background_worker(
                 }
                 if getattr(manager.cc_registry.resolve(strategy), "family", "") == "paper-atcc":
                     metadata["paper_atcc_backend"] = True
+                    metadata["paper_atcc_optimized"] = strategy == "paper-atcc-opt"
                 txn_id = f"bg-{worker}-{task.task_id}-{rng.randrange(10_000_000)}"
                 owner = SimpleNamespace(started_at=time.perf_counter()) if defer_begin_until_guarded else None
                 with background_write_guard(
@@ -1968,6 +2242,7 @@ def background_worker(
                 }
                 if getattr(manager.cc_registry.resolve(strategy), "family", "") == "paper-atcc":
                     metadata["paper_atcc_backend"] = True
+                    metadata["paper_atcc_optimized"] = strategy == "paper-atcc-opt"
                 txn_id = f"bg-{worker}-{rng.randrange(10_000_000)}"
                 owner = SimpleNamespace(started_at=time.perf_counter()) if defer_begin_until_guarded else None
                 with background_write_guard(
@@ -2125,6 +2400,23 @@ def execute_deferred_phase(txn: Any, phase: Any, **flags: Any) -> None:
     txn.enter_phase(str(phase.name))
     txn._event("phase-detail", detail)
     execute_phase_operations(txn, phase)
+
+
+def execute_replayed_phase(txn: Any, phase: Any) -> None:
+    """Replay operations after their reasoning delays have already elapsed."""
+    txn.prepare_phase(phase.operations)
+    txn.enter_phase(str(phase.name))
+    txn._event(
+        "phase-detail",
+        {
+            "name": phase.name,
+            "operations": len(phase.operations),
+            "reasoning_delay_ms": int(phase.reasoning_delay_ms),
+            "deferred_reasoning_replay": True,
+        },
+    )
+    for operation in phase.operations:
+        apply_operation(txn, operation)
 
 
 def split_commit_phases(planned: PlannedTask) -> tuple[tuple[Any, ...], tuple[Any, ...]]:

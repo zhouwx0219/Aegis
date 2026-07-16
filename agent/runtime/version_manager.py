@@ -154,9 +154,10 @@ class VersionManager:
         """Return the most frequently background-published candidate keys."""
         keys = set(str(value) for value in object_ids)
         with self._lock:
-            total_changes = int(
-                self._diagnostics.get("background_version_change_events", 0)
-            )
+            # The frequency model is deliberately retained across the warmup
+            # boundary while measurement-only diagnostics are reset. Derive
+            # the denominator from the retained model, not the reset counter.
+            total_changes = sum(self._background_version_changes.values())
             if total_changes < max(1, int(min_total_changes)):
                 return ()
             ranked = sorted(
@@ -174,6 +175,47 @@ class VersionManager:
                 key=lambda item: (-item[0], item[1]),
             )
             return tuple(key for _count, key in ranked[: max(0, int(limit))])
+
+    def background_change_family_is_risky(
+        self,
+        *,
+        prefix: str,
+        suffix: str,
+        min_family_changes: int = 2,
+        min_total_changes: int = 32,
+    ) -> bool:
+        """Return whether a key family has enough background-change evidence."""
+        _exact, family_changes, total_changes = self.background_change_evidence(
+            "",
+            prefix=prefix,
+            suffix=suffix,
+        )
+        return (
+            total_changes >= max(1, int(min_total_changes))
+            and family_changes >= max(1, int(min_family_changes))
+        )
+
+    def background_change_evidence(
+        self,
+        object_id: str,
+        *,
+        prefix: str,
+        suffix: str,
+    ) -> tuple[int, int, int]:
+        """Return exact, matching-family, and global background change counts."""
+        key = str(object_id)
+        family_prefix = str(prefix)
+        family_suffix = str(suffix)
+        with self._lock:
+            exact_changes = int(self._background_version_changes.get(key, 0))
+            family_changes = sum(
+                int(count)
+                for candidate, count in self._background_version_changes.items()
+                if candidate.startswith(family_prefix)
+                and candidate.endswith(family_suffix)
+            )
+            total_changes = sum(self._background_version_changes.values())
+            return exact_changes, family_changes, total_changes
 
     def note_version_risk_read_lock(self) -> None:
         with self._lock:
@@ -380,10 +422,11 @@ class VersionManager:
             str(object_id): int(version)
             for object_id, version in observed_versions.items()
         }
+        write_keys = {str(value) for value in write_object_ids}
         if not versions:
             return 0, ()
         boundary = self._enter_publication(
-            set(versions) | {str(value) for value in write_object_ids}
+            set(versions) | write_keys
         )
         conflicts: list[str] = []
         with self._lock:
@@ -411,6 +454,15 @@ class VersionManager:
                     ) or int(self._last_agent_commit_epoch.get(object_id, 0)) > int(
                         epoch
                     ):
+                        conflicts.append(object_id)
+                    elif write_keys and int(self.store.get_version(object_id)) != int(
+                        observed_version
+                    ):
+                        # A read-write transaction cannot be serialized at its
+                        # old snapshot without tracking incoming background
+                        # anti-dependencies. Keep its serialization point at
+                        # commit by validating every pinned read against the
+                        # current committed version.
                         conflicts.append(object_id)
             if conflicts:
                 self._diagnostics["pinned_read_guard_conflicts"] += len(conflicts)
@@ -467,6 +519,7 @@ class VersionManager:
         publication_boundary_held: bool = False,
         published_version: Callable[[str], int] | None = None,
         timing_ms: dict[str, float] | None = None,
+        private_prepared: bool = False,
     ) -> bool:
         key = str(tid)
         write_rows = tuple((str(object_id), str(value)) for object_id, value in writes)
@@ -480,7 +533,16 @@ class VersionManager:
             with self._lock:
                 self._diagnostics["read_only_bypasses"] += 1
             return installed
-        self.prepare(key, write_rows)
+        if private_prepared:
+            with self._lock:
+                if (
+                    self._transaction_states.get(key) != "prepared"
+                    or self._private.get(key) != write_rows
+                ):
+                    self._diagnostics["missing_private_versions"] += 1
+                    return False
+        else:
+            self.prepare(key, write_rows)
         boundaries = (
             0
             if publication_boundary_held
@@ -643,6 +705,12 @@ class VersionManager:
                 "history_versions": sum(len(rows) for rows in self._history.values()),
                 "commit_table_entries": len(self._transaction_states),
             }
+
+    def reset_diagnostics(self) -> None:
+        """Reset event counters while preserving versions and predictor state."""
+        with self._lock:
+            for key in self._diagnostics:
+                self._diagnostics[key] = 0
 
     def _discard_locked(self, tid: str) -> None:
         if self._private.pop(tid, None) is not None:
@@ -902,11 +970,16 @@ class VersionManager:
             self._active_publications.pop(int(boundary), None)
             if self._boundary_waiters:
                 self._boundary_condition.notify_all()
-        if committed:
-            with self._lock:
-                self._diagnostics["native_publishes"] += 1
-                if background and int(background_sample_rate) > 0:
-                    self._note_background_version_changes_locked(
-                        object_ids,
-                        weight=max(1, int(background_sample_rate)),
-                    )
+        if not committed:
+            return
+        sample_rate = int(background_sample_rate)
+        if background and sample_rate <= 0:
+            return
+        weight = max(1, sample_rate) if background else 1
+        with self._lock:
+            self._diagnostics["native_publishes"] += weight
+            if background:
+                self._note_background_version_changes_locked(
+                    object_ids,
+                    weight=weight,
+                )

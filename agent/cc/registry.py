@@ -15,6 +15,8 @@ from agent.cc.traditional import (
     MvccConcurrencyControl,
     OccConcurrencyControl,
     PaperATCCConcurrencyControl,
+    PaperATCCOracleConcurrencyControl,
+    PaperATCCOptimizedConcurrencyControl,
     PolarisConcurrencyControl,
     SiloConcurrencyControl,
     TicTocConcurrencyControl,
@@ -37,6 +39,8 @@ class ConcurrencyControlRegistry:
         for strategy in (
             OccConcurrencyControl(),
             PaperATCCConcurrencyControl(),
+            PaperATCCOptimizedConcurrencyControl(),
+            PaperATCCOracleConcurrencyControl(),
             TwoPhaseLockingConcurrencyControl("2pl-nowait", "nowait"),
             TwoPhaseLockingConcurrencyControl("2pl-wait-die", "wait-die"),
             MvccConcurrencyControl(),

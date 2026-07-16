@@ -11,6 +11,7 @@ venv/
 build/
 dist/
 tmp/
+output/
 .codex-tmp/
 results/
 .pytest_cache/

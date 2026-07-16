@@ -320,9 +320,22 @@ def write_dbx1000_trace(path: Path, rows: list[dict[str, str]]) -> dict[str, int
                 max_key = max(max_key, key)
                 tokens.append(("W" if op["kind"] == "write" else "R") + f":{key}")
             max_ops = max(max_ops, len(tokens))
-            pre = int(float(row.get("explore_delay_ms") or 0)) + int(float(row.get("refine_delay_ms") or 0))
+            pre = (
+                int(float(row.get("explore_delay_ms") or 0))
+                + int(float(row.get("refine_delay_ms") or 0))
+                + sum(
+                    int(float(op.get("delay_ms") or 0))
+                    for op in ops
+                    if str(op.get("phase", "")).strip().lower()
+                    in {"explore", "refine"}
+                )
+            )
             retry = int(float(row.get("retry_delay_ms") or 0))
-            commit = int(float(row.get("commit_delay_ms") or 0))
+            commit = int(float(row.get("commit_delay_ms") or 0)) + sum(
+                int(float(op.get("delay_ms") or 0))
+                for op in ops
+                if str(op.get("phase", "")).strip().lower() == "commit"
+            )
             if row["client_type"] == "agent":
                 total_agent_delay += pre + commit
                 total_agent_ops += len(ops)

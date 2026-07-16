@@ -54,20 +54,51 @@ def main() -> int:
     parser.add_argument("--clients", default="24,40")
     parser.add_argument("--agent-ratios", default="1.0,0.8")
     parser.add_argument("--seeds", default="810104,810105,810106")
+    parser.add_argument(
+        "--evaluation-seeds-excluded",
+        default="920104,920105,920106",
+        help="evaluation seeds reserved from training and recorded in the report",
+    )
     parser.add_argument("--paths", default=",".join(f"{a}:{b}" for a, b in DEFAULT_PATHS))
+    parser.add_argument(
+        "--reduced-path-variants",
+        default="",
+        help="variants that use --reduced-paths instead of the full behavior path set",
+    )
+    parser.add_argument(
+        "--reduced-paths",
+        default="",
+        help="comma-separated refine:commit paths for --reduced-path-variants",
+    )
     parser.add_argument("--duration", type=float, default=1.0)
     parser.add_argument("--warmup-seconds", type=float, default=2.0)
     parser.add_argument("--transactions-per-worker", type=int, default=128)
+    parser.add_argument(
+        "--reduced-transaction-variants",
+        default="",
+        help="variants that use --reduced-transactions-per-worker for faster rollouts",
+    )
+    parser.add_argument("--reduced-transactions-per-worker", type=int)
     parser.add_argument("--generation", type=int, required=True)
     parser.add_argument("--epochs", type=int, default=4)
+    parser.add_argument("--learning-rate", type=float, default=0.003)
+    parser.add_argument("--group-learning-rate", type=float, default=0.03)
+    parser.add_argument("--critic-learning-rate", type=float, default=0.005)
+    parser.add_argument("--clip-ratio", type=float, default=0.20)
     parser.add_argument("--entropy-weight", type=float, default=0.001)
     parser.add_argument("--min-group-samples", type=int, default=16)
     parser.add_argument("--min-group-actions", type=int, default=2)
     parser.add_argument("--ppo-seed", type=int, default=810100)
     parser.add_argument("--shared-reward-weight", type=float, default=100.0)
     parser.add_argument("--refinement-distance-threshold", type=float)
+    parser.add_argument("--medoids-per-group", type=int, default=1)
     parser.add_argument("--disable-occ-cold-start-guard", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--reuse-existing-traces",
+        action="store_true",
+        help="with --resume, reuse already validated deterministic trace files",
+    )
     args = parser.parse_args()
 
     variants = split(args.variants)
@@ -76,8 +107,53 @@ def main() -> int:
     clients = [int(value) for value in split(args.clients)]
     ratios = [float(value) for value in split(args.agent_ratios)]
     seeds = [int(value) for value in split(args.seeds)]
+    evaluation_seeds_excluded = [
+        int(value) for value in split(args.evaluation_seeds_excluded)
+    ]
+    overlap = sorted(set(seeds) & set(evaluation_seeds_excluded))
+    if overlap:
+        raise SystemExit(
+            "training and evaluation seeds must be disjoint: "
+            + ",".join(str(value) for value in overlap)
+        )
     paths = [tuple(int(part) for part in item.split(":")) for item in split(args.paths)]
     validate_paths(paths)
+    reduced_path_variants = set(split(args.reduced_path_variants))
+    reduced_paths = [
+        tuple(int(part) for part in item.split(":"))
+        for item in split(args.reduced_paths)
+    ]
+    if bool(reduced_path_variants) != bool(reduced_paths):
+        raise SystemExit(
+            "--reduced-path-variants and --reduced-paths must be specified together"
+        )
+    if reduced_path_variants - set(variants):
+        raise SystemExit("reduced-path variants must be included in --variants")
+    validate_paths(reduced_paths)
+    reduced_transaction_variants = set(split(args.reduced_transaction_variants))
+    if bool(reduced_transaction_variants) != bool(args.reduced_transactions_per_worker):
+        raise SystemExit(
+            "--reduced-transaction-variants and --reduced-transactions-per-worker "
+            "must be specified together"
+        )
+    if reduced_transaction_variants - set(variants):
+        raise SystemExit("reduced-transaction variants must be included in --variants")
+    if args.transactions_per_worker <= 0 or (
+        args.reduced_transactions_per_worker is not None
+        and args.reduced_transactions_per_worker <= 0
+    ):
+        raise SystemExit("transactions per worker must be positive")
+    if args.reuse_existing_traces and not args.resume:
+        raise SystemExit("--reuse-existing-traces requires --resume")
+    if min(
+        args.learning_rate,
+        args.group_learning_rate,
+        args.critic_learning_rate,
+        args.clip_ratio,
+    ) <= 0.0:
+        raise SystemExit("PPO learning rates and clip ratio must be positive")
+    if args.medoids_per_group <= 0:
+        raise SystemExit("--medoids-per-group must be positive")
 
     output = args.output_dir.resolve()
     trace_dir, run_dir, trajectory_dir, policy_dir = (
@@ -85,31 +161,45 @@ def main() -> int:
     )
     for directory in (output, trace_dir, run_dir, trajectory_dir, policy_dir):
         directory.mkdir(parents=True, exist_ok=True)
-    policies = write_behavior_policies(policy_dir, paths)
-    action_probabilities = behavior_probabilities(paths)
+    all_paths = list(dict.fromkeys(paths + reduced_paths))
+    policies = write_behavior_policies(policy_dir, all_paths)
 
     transitions: list[PolicyTransition] = []
     source_runs = []
     run_index = 0
     for variant in variants:
+        variant_paths = reduced_paths if variant in reduced_path_variants else paths
+        transactions_per_worker = (
+            args.reduced_transactions_per_worker
+            if variant in reduced_transaction_variants
+            else args.transactions_per_worker
+        )
+        action_probabilities = behavior_probabilities(variant_paths)
         for client_count in clients:
             for ratio in ratios:
                 for seed in seeds:
                     config_id = f"{variant}_c{client_count}_a{ratio:g}_s{seed}"
                     trace = trace_dir / f"{config_id}.csv"
                     warmup_trace = trace_dir / f"{config_id}.warmup.csv"
-                    generate_trace(trace, config_id, variant, client_count, ratio, seed, args.transactions_per_worker)
-                    generate_trace(
-                        warmup_trace,
-                        f"{config_id}-warmup",
-                        variant,
-                        client_count,
-                        ratio,
-                        seed + 500_000,
-                        args.transactions_per_worker,
+                    reuse_trace_pair = (
+                        args.resume
+                        and args.reuse_existing_traces
+                        and trace.exists()
+                        and warmup_trace.exists()
                     )
+                    if not reuse_trace_pair:
+                        generate_trace(trace, config_id, variant, client_count, ratio, seed, transactions_per_worker)
+                        generate_trace(
+                            warmup_trace,
+                            f"{config_id}-warmup",
+                            variant,
+                            client_count,
+                            ratio,
+                            seed + 500_000,
+                            transactions_per_worker,
+                        )
                     coordinated_runs = []
-                    for refine_action, commit_action in paths:
+                    for refine_action, commit_action in variant_paths:
                         path_id = f"p{refine_action}_{commit_action}"
                         result = run_dir / f"{config_id}_{path_id}.csv"
                         trajectory = trajectory_dir / f"{config_id}_{path_id}.json"
@@ -141,12 +231,23 @@ def main() -> int:
                         path_id = coordinated["path_id"]
                         for row in coordinated["rows"]:
                             state = phase_aware_state_from_dict(row["state"])
-                            probability = behavior_probability(
-                                action_probabilities,
-                                state.phase,
-                                int(state.current_action),
-                                int(row["action"]),
-                            )
+                            try:
+                                probability = behavior_probability(
+                                    action_probabilities,
+                                    state.phase,
+                                    int(state.current_action),
+                                    int(row["action"]),
+                                )
+                            except KeyError:
+                                # Conflict inheritance and the runtime safety
+                                # guard can deterministically add protection
+                                # after the behavior policy samples its action.
+                                # Such a transition is not another stochastic
+                                # policy choice; retain the probability recorded
+                                # at the actual control point.
+                                probability = float(
+                                    row.get("behavior_probability", 1.0) or 1.0
+                                )
                             transition = policy_transition_from_dict(
                                 row, source_id=config_id
                             )
@@ -178,6 +279,10 @@ def main() -> int:
     policy = DiscretePPOPolicy(seed=args.ppo_seed)
     config = PPOConfig(
         epochs=args.epochs,
+        learning_rate=args.learning_rate,
+        group_learning_rate=args.group_learning_rate,
+        critic_learning_rate=args.critic_learning_rate,
+        clip_ratio=args.clip_ratio,
         entropy_weight=args.entropy_weight,
         min_group_samples=args.min_group_samples,
         min_group_actions=args.min_group_actions,
@@ -185,6 +290,7 @@ def main() -> int:
     training = DiscretePPOTrainer(config).train(policy, transitions)
     compiled = policy.compile(
         generation=args.generation,
+        medoids_per_group=args.medoids_per_group,
         refinement_distance_threshold=args.refinement_distance_threshold,
         occ_cold_start_guard=not args.disable_occ_cold_start_guard,
     )
@@ -209,14 +315,31 @@ def main() -> int:
         "algorithm": "coordinated-discrete-clipped-ppo",
         "generation": args.generation,
         "training_seeds": seeds,
-        "evaluation_seeds_excluded": [920104, 920105, 920106],
+        "evaluation_seeds_excluded": evaluation_seeds_excluded,
         "variants": variants,
         "clients": clients,
         "agent_ratios": ratios,
-        "behavior_paths": [list(path) for path in paths],
+        "behavior_paths": [list(path) for path in all_paths],
+        "behavior_paths_by_variant": {
+            variant: [
+                list(path)
+                for path in (
+                    reduced_paths if variant in reduced_path_variants else paths
+                )
+            ]
+            for variant in variants
+        },
         "rollout_duration_seconds": args.duration,
         "warmup_seconds": args.warmup_seconds,
         "transactions_per_worker": args.transactions_per_worker,
+        "transactions_per_worker_by_variant": {
+            variant: (
+                args.reduced_transactions_per_worker
+                if variant in reduced_transaction_variants
+                else args.transactions_per_worker
+            )
+            for variant in variants
+        },
         "shared_reward_weight": args.shared_reward_weight,
         "shared_reward_applied": True,
         "shared_reward_semantics": "terminal_delta_psys_eta_weight",
@@ -231,6 +354,7 @@ def main() -> int:
         "policy_audit": policy_audit,
         "coverage": coverage_report(transitions),
         "compiled_entries": len(compiled.entries),
+        "medoids_per_group": compiled.medoids_per_group,
         "selective_refinement": bool(compiled.refinement_actor),
         "refinement_distance_threshold": args.refinement_distance_threshold,
         "occ_cold_start_guard": compiled.occ_cold_start_guard,
@@ -252,14 +376,21 @@ def normalized_system_scores(runs, *, mixed: bool) -> list[float]:
                 "total": number(row, "total_tps"),
                 "abort_good": 1.0 - number(row, "agent_attempt_abort_rate"),
                 "latency_good": -number(row, "agent_p99_latency_ms"),
-                "background": number(row, "background_commit_rate") if mixed else 0.0,
+                # The paper evaluates whether background work keeps making
+                # progress, not merely whether admitted background attempts
+                # commit. A near-one commit rate can still hide starvation
+                # when only a handful of transactions are admitted.
+                "background": number(row, "background_tps") if mixed else 0.0,
             }
         )
     normalized = {
         key: minmax([row[key] for row in metrics]) for key in metrics[0]
     }
     weights = (
-        {"agent": 0.25, "total": 0.30, "abort_good": 0.10, "latency_good": 0.10, "background": 0.25}
+        # Agent viability is the primary paper objective under mixed load.
+        # Total/background throughput remain explicit externality terms, but
+        # must not dominate the policy and reward agent starvation.
+        {"agent": 0.45, "total": 0.15, "abort_good": 0.15, "latency_good": 0.15, "background": 0.10}
         if mixed
         else {"agent": 0.40, "total": 0.25, "abort_good": 0.20, "latency_good": 0.15, "background": 0.0}
     )

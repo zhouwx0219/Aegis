@@ -116,11 +116,13 @@ class CompiledPhasePolicy:
         entries: Iterable[CompiledPolicyEntry] = (),
         *,
         generation: int = 0,
+        medoids_per_group: int = 1,
         refinement_actor: dict[str, object] | None = None,
         occ_cold_start_guard: bool = False,
     ):
         self.entries = tuple(entries)
         self.generation = int(generation)
+        self.medoids_per_group = max(1, int(medoids_per_group))
         self.refinement_actor = dict(refinement_actor or {})
         self.occ_cold_start_guard = bool(occ_cold_start_guard)
         exact = {}
@@ -255,7 +257,7 @@ class CompiledPhasePolicy:
             "state_source": "observed_execution_only",
             "future_access_plan_features": False,
             "compaction": "weighted_k_medoids_per_phase_current_action_action",
-            "medoids_per_group": 1,
+            "medoids_per_group": self.medoids_per_group,
             "selective_refinement": bool(self.refinement_actor),
             "refinement_actor": self.refinement_actor,
             "occ_cold_start_guard": self.occ_cold_start_guard,
@@ -273,6 +275,7 @@ class CompiledPhasePolicy:
                 for row in data.get("entries", [])
             ),
             generation=int(data.get("generation", 0) or 0),
+            medoids_per_group=int(data.get("medoids_per_group", 1) or 1),
             refinement_actor=dict(data.get("refinement_actor", {}) or {}),
             occ_cold_start_guard=bool(data.get("occ_cold_start_guard", False)),
         )
@@ -400,14 +403,15 @@ def _state_key(state: PhaseAwareState) -> tuple[object, ...]:
 
 def should_keep_occ(state: PhaseAwareState) -> bool:
     """Avoid speculative locking until the runtime has observed conflict pressure."""
+    low_conflict_rate = 0.05
     return (
         int(state.current_action) == 0
         and int(state.retry_count) == 0
         and normalize_conflict_kind(state.recent_conflict_kind) == "none"
         and int(state.global_waiter_count) == 0
-        and float(state.global_abort_rate) <= 0.0
-        and float(state.global_conflict_abort_rate) <= 0.0
-        and float(state.global_background_abort_rate) <= 0.0
+        and float(state.global_abort_rate) <= low_conflict_rate
+        and float(state.global_conflict_abort_rate) <= low_conflict_rate
+        and float(state.global_background_abort_rate) <= low_conflict_rate
     )
 
 

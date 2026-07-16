@@ -29,6 +29,36 @@ class PaperATCCConcurrencyControl(ConcurrencyControl):
         )
 
 
+class PaperATCCOptimizedConcurrencyControl(PaperATCCConcurrencyControl):
+    """ATCC plus experimental commit-admission and multi-version fast paths."""
+
+    name = "paper-atcc-opt"
+    description = (
+        "Paper ATCC with separately reported commit-admission and safe "
+        "per-object version optimizations."
+    )
+
+    def plan(self, txn: Any) -> CCPlan:
+        plan = super().plan(txn)
+        return CCPlan(
+            strategy=self.name,
+            family=self.family,
+            validate_reads=plan.validate_reads,
+            validate_writes=plan.validate_writes,
+            metadata={**plan.metadata, "paper_atcc_optimized": True},
+        )
+
+
+class PaperATCCOracleConcurrencyControl(PaperATCCConcurrencyControl):
+    """Declared-footprint ablation retained outside the paper main path."""
+
+    name = "paper-atcc-oracle"
+    description = (
+        "Paper ATCC with the complete fixed-trace access footprint exposed as "
+        "an explicitly labeled oracle ablation."
+    )
+
+
 class TwoPhaseLockingConcurrencyControl(ConcurrencyControl):
     family = "pessimistic"
 

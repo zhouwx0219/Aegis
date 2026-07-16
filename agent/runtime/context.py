@@ -6,7 +6,7 @@ import dataclasses
 import enum
 import threading
 import time
-from typing import Dict, Set
+from typing import Dict, Iterable, Set
 
 
 class TransactionStatus(str, enum.Enum):
@@ -124,6 +124,24 @@ class TransactionContext:
             if target not in _ALLOWED_TRANSITIONS[self.status]:
                 raise RuntimeError(f"invalid transaction transition: {self.status.value}->{target.value}")
             self.status = target
+
+    def try_transition(
+        self,
+        target: TransactionStatus,
+        *,
+        from_statuses: Iterable[TransactionStatus],
+    ) -> bool:
+        """Atomically transition only while the context is in an expected state."""
+        expected = frozenset(from_statuses)
+        with self._mutex:
+            if self.status not in expected:
+                return False
+            if target not in _ALLOWED_TRANSITIONS[self.status]:
+                raise RuntimeError(
+                    f"invalid transaction transition: {self.status.value}->{target.value}"
+                )
+            self.status = target
+            return True
 
     def change_phase(self, phase: TransactionPhase) -> None:
         with self._mutex:

@@ -132,6 +132,7 @@ class DiscretePPOPolicy:
         self,
         *,
         generation: int,
+        medoids_per_group: int = 1,
         refinement_distance_threshold: float | None = None,
         occ_cold_start_guard: bool = False,
     ) -> CompiledPhasePolicy:
@@ -143,7 +144,12 @@ class DiscretePPOPolicy:
             grouped[(state.phase, int(state.current_action), action)].append(
                 (entry, state, max(1, int(self.prototype_counts.get(key, 0))))
             )
-        entries = [weighted_one_medoid(rows) for _group, rows in sorted(grouped.items())]
+        medoids_per_group = max(1, int(medoids_per_group))
+        entries = [
+            entry
+            for _group, rows in sorted(grouped.items())
+            for entry in weighted_k_medoids(rows, medoids_per_group)
+        ]
         refinement_actor = {}
         if refinement_distance_threshold is not None:
             refinement_actor = {
@@ -164,6 +170,7 @@ class DiscretePPOPolicy:
         return CompiledPhasePolicy(
             entries,
             generation=generation,
+            medoids_per_group=medoids_per_group,
             refinement_actor=refinement_actor,
             occ_cold_start_guard=occ_cold_start_guard,
         )
@@ -554,6 +561,67 @@ def weighted_one_medoid(
         ),
     )[0]
     return dataclasses.replace(selected, support_weight=support_weight)
+
+
+def weighted_k_medoids(
+    rows: Sequence[tuple[CompiledPolicyEntry, PhaseAwareState, int]],
+    count: int,
+) -> tuple[CompiledPolicyEntry, ...]:
+    """Greedily retain several representative observed states per action group."""
+    requested = max(1, int(count))
+    if requested == 1 or len(rows) <= 1:
+        return (weighted_one_medoid(rows),)
+    candidates = []
+    seen = set()
+    for row in sorted(rows, key=lambda item: (-item[2], state_key(item[1]))):
+        key = state_key(row[1])
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(row)
+        if len(candidates) >= 128:
+            break
+    requested = min(requested, len(candidates))
+    distances = [
+        [candidate[0].distance(state) for _entry, state, _weight in rows]
+        for candidate in candidates
+    ]
+    selected: list[int] = []
+    best_distances = [float("inf")] * len(rows)
+    while len(selected) < requested:
+        choice = min(
+            (index for index in range(len(candidates)) if index not in selected),
+            key=lambda index: (
+                sum(
+                    max(1, int(rows[row_index][2]))
+                    * min(best_distances[row_index], distances[index][row_index])
+                    for row_index in range(len(rows))
+                ),
+                state_key(candidates[index][1]),
+            ),
+        )
+        selected.append(choice)
+        best_distances = [
+            min(current, distance)
+            for current, distance in zip(best_distances, distances[choice])
+        ]
+    assigned_weights = [0] * len(selected)
+    for row_index, (_entry, _state, weight) in enumerate(rows):
+        owner = min(
+            range(len(selected)),
+            key=lambda position: (
+                distances[selected[position]][row_index],
+                state_key(candidates[selected[position]][1]),
+            ),
+        )
+        assigned_weights[owner] += max(1, int(weight))
+    return tuple(
+        dataclasses.replace(
+            candidates[candidate_index][0],
+            support_weight=max(1, assigned_weights[position]),
+        )
+        for position, candidate_index in enumerate(selected)
+    )
 
 
 def actor_bit_probabilities(

@@ -1,9 +1,11 @@
 import dataclasses
 import math
+import threading
 import unittest
 import tempfile
 from pathlib import Path
 
+from agent.cc import LockConflict
 from agent.cli.smoke import run_smoke_checks
 from agent.runtime import (
     AgentTransactionManager,
@@ -34,6 +36,31 @@ from agent.runtime.trajectory import system_performance_delta
 
 
 class SmokeRuntimeTests(unittest.TestCase):
+    def test_conditional_status_transition_has_one_concurrent_winner(self):
+        context = TransactionContext("conditional-transition", 0, 0)
+        barrier = threading.Barrier(17)
+        results = []
+
+        def begin_abort():
+            barrier.wait()
+            results.append(
+                context.try_transition(
+                    TransactionStatus.ABORTING,
+                    from_statuses=(TransactionStatus.ACTIVE, TransactionStatus.WAITING),
+                )
+            )
+
+        threads = [threading.Thread(target=begin_abort) for _ in range(16)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(1, sum(results))
+        self.assertEqual(TransactionStatus.ABORTING, context.status)
+        context.transition(TransactionStatus.ABORTED)
+
     def test_hotness_tracker_uses_runtime_access_and_contention_signals(self):
         tracker = HotnessTracker()
         for index in range(200):
@@ -219,6 +246,57 @@ class SmokeRuntimeTests(unittest.TestCase):
         txn.abort("test cleanup")
         manager.atcc_locks.release_all(txn.context)
 
+    def test_low_and_medium_first_attempt_wait_for_retry_evidence(self):
+        policy = CompiledPhasePolicy(
+            [
+                CompiledPolicyEntry(phase="explore", action=15),
+                CompiledPolicyEntry(phase="refine", action=15),
+            ],
+            generation=1,
+            occ_cold_start_guard=False,
+        )
+        for level in ("low", "medium"):
+            with self.subTest(level=level):
+                manager = AgentTransactionManager(
+                    paper_policy=policy,
+                    low_conflict_occ_guard=True,
+                )
+                manager.register_object("hot", "0", kind="row")
+                for _ in range(8):
+                    manager.hotness_tracker.observe_access("hot")
+                first = manager.begin(
+                    f"{level}-first",
+                    {
+                        "paper_atcc": True,
+                        "workload": "ycsb",
+                        "context": {"level": level},
+                    },
+                )
+
+                first.enter_phase("explore")
+                first.read("hot")
+                first.enter_phase("refine")
+
+                self.assertEqual(LockClass.NONE, first.context.action.protected)
+                self.assertEqual(set(), first.context.held_read_locks)
+                first.abort("test cleanup")
+
+                retry = manager.begin(
+                    f"{level}-retry",
+                    {
+                        "paper_atcc": True,
+                        "workload": "ycsb",
+                        "context": {"level": level},
+                        "retry_count": 1,
+                    },
+                )
+                retry.enter_phase("explore")
+                self.assertEqual(LockClass.NONE, retry.context.action.protected)
+                retry.read("hot")
+                retry.enter_phase("refine")
+                self.assertEqual(LockClass(15), retry.context.action.protected)
+                retry.abort("test cleanup")
+
     def test_lock_action_only_expands_protection(self):
         initial = LockAction()
         reads = LockAction(LockClass.HOT_READ)
@@ -357,8 +435,41 @@ class SmokeRuntimeTests(unittest.TestCase):
 
         self.assertEqual(TransactionStatus.ABORTED, lower.context.status)
         self.assertEqual(1, higher.context.agent_aborts_caused)
+        diagnostics = manager.atcc_locks.snapshot_diagnostics()
+        self.assertEqual(1, diagnostics["wounds_agent_to_agent"])
+        self.assertEqual(
+            {
+                "requester_role": "agent",
+                "victim_role": "agent",
+                "object_id": "row",
+                "requester_phase": "explore",
+                "victim_phase": "explore",
+                "requester_retry": 0,
+                "victim_retry": 0,
+                "requester_priority": 9,
+                "victim_priority": 1,
+                "victim_status": "active",
+            },
+            diagnostics["wound_events"][0],
+        )
         self.assertEqual(higher.context.tid, manager.atcc_locks.snapshot("row")["writer"])
         manager.atcc_locks.release_all(higher.context)
+        self.assertEqual(
+            0, manager.atcc_locks.snapshot_diagnostics()["live_contexts"]
+        )
+
+    def test_aborted_context_cannot_reregister_for_a_lock(self):
+        manager = AgentTransactionManager()
+        manager.register_object("row", "0", kind="row")
+        txn = manager.begin("aborted-reregister", {"paper_atcc": True})
+        txn.abort("test")
+
+        with self.assertRaises(LockConflict):
+            manager.atcc_locks.wlock("row", txn.context, timeout_s=0.01)
+
+        self.assertEqual(
+            0, manager.atcc_locks.snapshot_diagnostics()["live_contexts"]
+        )
 
     def test_policy_lock_footprint_survives_release_for_reward_accounting(self):
         manager = AgentTransactionManager()
@@ -428,7 +539,9 @@ class SmokeRuntimeTests(unittest.TestCase):
             "deferred-agent-write",
             {
                 "paper_atcc": True,
+                "paper_atcc_optimized": True,
                 "retry_protection_mask": int(LockClass.COLD_WRITE),
+                "commit_admission_write_protection": True,
             },
         )
 
@@ -436,7 +549,7 @@ class SmokeRuntimeTests(unittest.TestCase):
 
         self.assertFalse(txn.context.held_write_locks)
         self.assertEqual({"row"}, txn.context.policy_write_lock_targets)
-        self.assertTrue(txn.commit("paper-atcc").committed)
+        self.assertTrue(txn.commit("paper-atcc-opt").committed)
         self.assertEqual("1", manager.store.get("row").value)
 
     def test_late_phase_hot_write_is_protected_on_first_attempt(self):
@@ -499,7 +612,7 @@ class SmokeRuntimeTests(unittest.TestCase):
         self.assertTrue(agent.commit("paper-atcc").committed)
         self.assertEqual("agent", manager.store.get("target").value)
 
-    def test_profiled_hot_planned_write_is_wlocked_on_explore_read(self):
+    def test_profiled_hot_planned_write_does_not_bypass_explore_policy(self):
         manager = AgentTransactionManager()
         manager.register_object("hot-target", "0", kind="row")
         manager.hotness_tracker.prime_accesses(["hot-target"] * 8)
@@ -513,8 +626,8 @@ class SmokeRuntimeTests(unittest.TestCase):
 
         agent.read("hot-target")
 
-        self.assertIn("hot-target", agent.context.held_write_locks)
-        self.assertTrue(agent.context.action.protected & LockClass.HOT_WRITE)
+        self.assertNotIn("hot-target", agent.context.held_write_locks)
+        self.assertEqual(LockClass.NONE, agent.context.action.protected)
         agent.abort("test cleanup")
 
     def test_first_planned_write_read_refreshes_after_unrelated_snapshot_pin(self):
@@ -539,10 +652,10 @@ class SmokeRuntimeTests(unittest.TestCase):
 
         self.assertEqual(current.version, observed.version)
         self.assertEqual("background", observed.value)
-        self.assertIn("target", agent.context.held_write_locks)
+        self.assertNotIn("target", agent.context.held_write_locks)
         agent.abort("test cleanup")
 
-    def test_profiled_hot_read_uses_nonblocking_read_protection(self):
+    def test_profiled_hot_read_does_not_bypass_explore_policy(self):
         manager = AgentTransactionManager()
         manager.register_object("hot-read", "0", kind="row")
         manager.hotness_tracker.prime_accesses(["hot-read"] * 8)
@@ -550,11 +663,11 @@ class SmokeRuntimeTests(unittest.TestCase):
 
         agent.read("hot-read")
 
-        self.assertIn("hot-read", agent.context.held_read_locks)
-        self.assertTrue(agent.context.action.protected & LockClass.HOT_READ)
+        self.assertNotIn("hot-read", agent.context.held_read_locks)
+        self.assertEqual(LockClass.NONE, agent.context.action.protected)
         agent.abort("test cleanup")
 
-    def test_profiled_cross_transaction_cold_write_is_protected(self):
+    def test_profiled_shared_cold_write_does_not_bypass_explore_policy(self):
         manager = AgentTransactionManager()
         manager.register_object("shared-cold", "0", kind="row")
         manager.hotness_tracker.prime_transaction(["shared-cold"])
@@ -569,8 +682,8 @@ class SmokeRuntimeTests(unittest.TestCase):
 
         agent.read("shared-cold")
 
-        self.assertIn("shared-cold", agent.context.held_write_locks)
-        self.assertTrue(agent.context.action.protected & LockClass.COLD_WRITE)
+        self.assertNotIn("shared-cold", agent.context.held_write_locks)
+        self.assertEqual(LockClass.NONE, agent.context.action.protected)
         agent.abort("test cleanup")
 
     def test_write_conflict_retry_eagerly_protects_only_failed_write_class(self):
@@ -581,9 +694,9 @@ class SmokeRuntimeTests(unittest.TestCase):
             {
                 "paper_atcc": True,
                 "retry_count": 0,
-                "retry_protection_mask": int(LockClass.COLD_WRITE),
             },
         )
+        first.read("row")
         first.write("row", "agent-1")
         background = manager.begin(
             "background",
@@ -609,6 +722,7 @@ class SmokeRuntimeTests(unittest.TestCase):
         manager = AgentTransactionManager()
         manager.register_object("row", "0", kind="row")
         first = manager.begin("read-before-write", {"paper_atcc": True})
+        first.read("row")
         first.write("row", "agent-1")
         background = manager.begin("background", {"paper_atcc_backend": True})
         background.write("row", "background")
@@ -1141,6 +1255,34 @@ class SmokeRuntimeTests(unittest.TestCase):
         self.assertGreater(metrics["background_throughput"], 0.0)
         self.assertEqual(0.5, metrics["background_abort_rate"])
 
+    def test_measurement_reset_preserves_versions_but_clears_event_counters(self):
+        manager = AgentTransactionManager()
+        manager.register_object("row", "0", kind="row")
+        background = manager.begin(
+            "warmup-background",
+            {"paper_atcc_backend": True, "planned_write_targets": ["row"]},
+        )
+        background.write("row", "1")
+        self.assertTrue(background.commit("occ").committed)
+        self.assertGreater(
+            manager.version_manager.snapshot_diagnostics()["atomic_publishes"],
+            0,
+        )
+
+        manager.reset_measurement_diagnostics()
+
+        self.assertEqual("1", manager.store.get("row").value)
+        self.assertEqual(
+            0,
+            manager.version_manager.snapshot_diagnostics()["atomic_publishes"],
+        )
+        self.assertEqual(
+            0,
+            manager.atcc_locks.snapshot_diagnostics().get(
+                "background_fast_publishes", 0
+            ),
+        )
+
     def test_compiled_policy_occ_guard_yields_after_conflict_pressure(self):
         policy = CompiledPhasePolicy(
             [CompiledPolicyEntry(phase="refine", current_action=0, action=13)],
@@ -1166,6 +1308,19 @@ class SmokeRuntimeTests(unittest.TestCase):
         )
 
         self.assertEqual(0, int(policy.select(state).protected))
+        sparse_pressure = dataclasses.replace(
+            state,
+            global_abort_rate=0.04,
+            global_conflict_abort_rate=0.04,
+            global_background_abort_rate=0.04,
+        )
+        self.assertEqual(0, int(policy.select(sparse_pressure).protected))
+        sustained_pressure = dataclasses.replace(
+            state,
+            global_abort_rate=0.06,
+            global_conflict_abort_rate=0.06,
+        )
+        self.assertEqual(13, int(policy.select(sustained_pressure).protected))
         pressured = dataclasses.replace(state, global_waiter_count=1)
         self.assertEqual(13, int(policy.select(pressured).protected))
         restored = CompiledPhasePolicy.from_dict(policy.to_dict())

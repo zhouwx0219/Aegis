@@ -73,10 +73,23 @@ class PaperATCCLockManager:
         self._contention_callback = contention_callback
         self._priority_reorder_threshold = max(1, int(priority_reorder_threshold))
         self._diagnostics: Dict[str, float] = defaultdict(float)
+        self._native_diagnostics_lock = threading.Lock()
+        self._native_diagnostics: Dict[str, float] = defaultdict(float)
         self._lock_acquires_by_phase: Dict[str, int] = defaultdict(int)
+        self._wound_events: List[dict[str, object]] = []
 
     def register(self, context: TransactionContext) -> None:
         with self._condition:
+            if context.status in {
+                TransactionStatus.COMMITTED,
+                TransactionStatus.ABORTING,
+                TransactionStatus.ABORTED,
+            }:
+                raise LockConflict(
+                    f"terminal transaction cannot acquire a lock: {context.tid}",
+                    (),
+                    kind="lock-preempted",
+                )
             existing = self._contexts.get(context.tid)
             if existing is not None and existing is not context:
                 raise RuntimeError(f"duplicate live transaction id: {context.tid}")
@@ -410,14 +423,15 @@ class PaperATCCLockManager:
         context: TransactionContext,
         publish: Callable[[], Any],
         *,
+        allow_reader_bypass: bool = False,
         timing_callback: Callable[[float], None] | None = None,
     ) -> tuple[bool, Any]:
         """Publish buffered backend writes without materializing object locks.
 
         A per-object committing intent is registered before the metadata latch
-        is released. Pinned readers do not block publication: their transaction
-        snapshot retains the old committed version. Writers, publishers, and
-        queued write upgrades still force the Wound-Wait path.
+        is released. Only the explicitly optimized runtime may bypass pinned
+        readers; strict paper-atcc preserves ordinary RLock/WLock semantics.
+        Writers, publishers, and queued write upgrades force the slow path.
         """
         if not context.is_background:
             raise ValueError("background publish fast path requires a background transaction")
@@ -446,9 +460,19 @@ class PaperATCCLockManager:
                 writer = self._live_context(meta.writer)
                 if writer is not None and writer.tid == context.tid:
                     writer = None
-                live_write_waiter = any(
-                    request.mode == "write" and self._request_live(request)
-                    for request in meta.waiters
+                readers = tuple(
+                    reader
+                    for tid in meta.readers
+                    if tid != context.tid
+                    and (reader := self._live_context(tid)) is not None
+                    and (
+                        not allow_reader_bypass
+                        or reader.status != TransactionStatus.ACTIVE
+                        or bool(reader.planned_write_targets)
+                        or key in reader.retry_conflict_read_targets
+                        or key in reader.retry_conflict_write_targets
+                        or key in reader.hot_read_targets
+                    )
                 )
                 if writer is not None and (
                     writer.status == TransactionStatus.COMMITTING
@@ -458,11 +482,16 @@ class PaperATCCLockManager:
                     if timing_callback is not None:
                         timing_callback((time.perf_counter() - admission_started) * 1000.0)
                     return False, CommitAdmissionBlock("commit_latch", (key,))
-                if writer is not None or live_write_waiter:
+                if writer is not None:
                     self._note_background_publish_fallback_locked("active_writer")
                     if timing_callback is not None:
                         timing_callback((time.perf_counter() - admission_started) * 1000.0)
                     return False, CommitAdmissionBlock("active_writer", (key,))
+                if readers:
+                    self._note_background_publish_fallback_locked("active_reader")
+                    if timing_callback is not None:
+                        timing_callback((time.perf_counter() - admission_started) * 1000.0)
+                    return False, CommitAdmissionBlock("active_reader", (key,))
             context.transition(TransactionStatus.COMMITTING)
             with self._publisher_lock:
                 self._publisher_reservations[context.tid] = (
@@ -492,45 +521,45 @@ class PaperATCCLockManager:
         object_ids: Iterable[str],
         *,
         timeout_s: float = 0.002,
+        allow_reader_bypass: bool = False,
     ) -> bool:
-        """Briefly queue behind same-key commit admission blockers.
-
-        The caller must discard its old transaction and start a fresh one
-        after this returns. Waiting here only sequences same-key publishers;
-        it never carries an already-observed version into prepare/install.
-        """
+        """Wait briefly for covered keys to become writable."""
         keys = tuple(sorted(set(str(value) for value in object_ids)))
         if not keys:
             return True
         started = time.perf_counter()
         deadline = started + max(0.0, float(timeout_s))
         with self._condition:
-            blocked = any(self._background_admission_blocked_locked(key) for key in keys)
-            if not blocked:
-                return True
-            self._diagnostics["background_admission_queue_events"] += 1
-            self._diagnostics["background_publisher_queue_events"] += 1
             self._background_admission_waiters += 1
+            self._diagnostics["background_publisher_queue_events"] += 1
             try:
-                while any(self._background_admission_blocked_locked(key) for key in keys):
+                while True:
+                    blocked = any(
+                        self._background_admission_blocked_locked(
+                            key,
+                            allow_reader_bypass=allow_reader_bypass,
+                        )
+                        for key in keys
+                    )
+                    if not blocked:
+                        waited_ms = (time.perf_counter() - started) * 1000.0
+                        self._diagnostics[
+                            "background_publisher_queue_wait_ms"
+                        ] += waited_ms
+                        return True
                     remaining = deadline - time.perf_counter()
                     if remaining <= 0.0:
-                        self._diagnostics["background_admission_queue_timeouts"] += 1
-                        self._diagnostics["background_publisher_queue_timeouts"] += 1
-                        self._diagnostics["background_admission_queue_wait_ms"] += (
-                            time.perf_counter() - started
-                        ) * 1000.0
-                        self._diagnostics["background_publisher_queue_wait_ms"] += (
-                            time.perf_counter() - started
-                        ) * 1000.0
+                        self._diagnostics[
+                            "background_publisher_queue_timeouts"
+                        ] += 1
+                        waited_ms = (time.perf_counter() - started) * 1000.0
+                        self._diagnostics[
+                            "background_publisher_queue_wait_ms"
+                        ] += waited_ms
                         return False
-                    self._condition.wait(timeout=min(0.001, remaining))
+                    self._condition.wait(timeout=min(0.005, remaining))
             finally:
                 self._background_admission_waiters -= 1
-            waited_ms = (time.perf_counter() - started) * 1000.0
-            self._diagnostics["background_admission_queue_wait_ms"] += waited_ms
-            self._diagnostics["background_publisher_queue_wait_ms"] += waited_ms
-            return True
 
     def wait_for_background_publishers(
         self,
@@ -538,7 +567,7 @@ class PaperATCCLockManager:
         *,
         timeout_s: float = 0.002,
     ) -> bool:
-        """Compatibility alias for the generalized admission queue."""
+        """Compatibility alias for condition-aware publisher waiting."""
         return self.wait_for_background_admission(
             object_ids,
             timeout_s=timeout_s,
@@ -547,6 +576,8 @@ class PaperATCCLockManager:
     def background_pre_admission_block(
         self,
         object_ids: Iterable[str],
+        *,
+        allow_reader_bypass: bool = False,
     ) -> CommitAdmissionBlock | None:
         """Return an exact current blocker without reserving or waiting.
 
@@ -562,7 +593,10 @@ class PaperATCCLockManager:
             conflicts = tuple(
                 key
                 for key in keys
-                if self._background_admission_blocked_locked(key)
+                if self._background_admission_blocked_locked(
+                    key,
+                    allow_reader_bypass=allow_reader_bypass,
+                )
             )
             if not conflicts:
                 return None
@@ -645,7 +679,12 @@ class PaperATCCLockManager:
                 with self._condition:
                     self._diagnostics["occ_native_fast_publish_failures"] += 1
 
-    def _background_admission_blocked_locked(self, object_id: str) -> bool:
+    def _background_admission_blocked_locked(
+        self,
+        object_id: str,
+        *,
+        allow_reader_bypass: bool = False,
+    ) -> bool:
         key = str(object_id)
         if self._publishers_for_key_locked(key):
             return True
@@ -653,11 +692,23 @@ class PaperATCCLockManager:
         if meta is None:
             return False
         writer = self._live_context(meta.writer)
-        live_write_waiter = any(
-            request.mode == "write" and self._request_live(request)
-            for request in meta.waiters
+        live_reader = any(
+            reader is not None
+            and (
+                not allow_reader_bypass
+                or reader.status != TransactionStatus.ACTIVE
+                or bool(reader.planned_write_targets)
+                or key in reader.retry_conflict_read_targets
+                or key in reader.retry_conflict_write_targets
+                or key in reader.hot_read_targets
+            )
+            for tid in meta.readers
+            for reader in (self._live_context(tid),)
         )
-        return bool(writer is not None or live_write_waiter)
+        return bool(
+            writer is not None
+            or live_reader
+        )
 
     def note_background_publish_fallback(
         self,
@@ -670,6 +721,25 @@ class PaperATCCLockManager:
                 reason,
                 count_total=count_total,
             )
+
+    def note_background_native_batch(self, outcome: str) -> None:
+        """Record the outcome of the transaction-free background OCC path."""
+        normalized = str(outcome).strip().lower().replace("-", "_")
+        allowed = {
+            "attempt",
+            "commit",
+            "read_only_commit",
+            "validation_failure",
+            "admission_fallback",
+            "pin_fallback",
+            "unsupported_fallback",
+        }
+        if normalized not in allowed:
+            raise ValueError(f"unsupported native background batch outcome: {outcome}")
+        # Native batches are the hottest background path. Their reporting
+        # counters must not contend with Agent lock admission on _condition.
+        with self._native_diagnostics_lock:
+            self._native_diagnostics[f"background_native_batch_{normalized}s"] += 1
 
     def _note_background_publish_fallback_locked(
         self,
@@ -698,6 +768,36 @@ class PaperATCCLockManager:
             return
         with self._condition:
             self._diagnostics["agent_blind_write_rebases"] += increment
+
+    def note_tpcc_exact_risk_wlock(self, *, family_fallback: bool = False) -> None:
+        """Record one exact district dependency protected before its first read."""
+        with self._condition:
+            self._diagnostics["tpcc_exact_risk_wlocks"] += 1
+            if family_fallback:
+                self._diagnostics["tpcc_family_risk_wlocks"] += 1
+
+    def note_tpcc_exact_guard_evidence(
+        self,
+        *,
+        exact_changes: int,
+        family_changes: int,
+        total_changes: int,
+        sufficient: bool,
+    ) -> None:
+        with self._condition:
+            self._diagnostics["tpcc_exact_guard_checks"] += 1
+            if not sufficient:
+                self._diagnostics["tpcc_exact_guard_insufficient_evidence"] += 1
+            for name, value in (
+                ("exact", exact_changes),
+                ("family", family_changes),
+                ("total", total_changes),
+            ):
+                key = f"tpcc_exact_guard_max_{name}_changes"
+                self._diagnostics[key] = max(
+                    self._diagnostics.get(key, 0),
+                    max(0, int(value)),
+                )
 
     def enter_committing(self, context: TransactionContext) -> None:
         with self._condition:
@@ -797,7 +897,12 @@ class PaperATCCLockManager:
         return self._waiter_count
 
     def snapshot_diagnostics(self) -> dict[str, object]:
+        with self._native_diagnostics_lock:
+            native_diagnostics = dict(self._native_diagnostics)
         with self._condition:
+            live_by_status: Dict[str, int] = defaultdict(int)
+            for context in self._contexts.values():
+                live_by_status[context.status.value] += 1
             return {
                 "background_publish_fallbacks": self._diagnostics.get(
                     "background_publish_fallbacks", 0
@@ -807,6 +912,7 @@ class PaperATCCLockManager:
                         f"background_publish_fallback_{reason}", 0
                     )
                     for reason in (
+                        "active_reader",
                         "active_writer",
                         "version_mismatch",
                         "commit_latch",
@@ -816,32 +922,56 @@ class PaperATCCLockManager:
                     )
                 },
                 **dict(self._diagnostics),
+                **native_diagnostics,
                 "lock_acquires_by_phase": dict(sorted(self._lock_acquires_by_phase.items())),
+                "wound_events": tuple(dict(event) for event in self._wound_events),
                 "current_waiters": self._waiter_count,
+                "live_contexts": len(self._contexts),
+                "live_contexts_by_status": dict(sorted(live_by_status.items())),
+                "live_context_ids": tuple(sorted(self._contexts)),
             }
+
+    def reset_diagnostics(self) -> None:
+        """Start a new reporting interval without changing lock state."""
+        with self._native_diagnostics_lock:
+            self._native_diagnostics.clear()
+        with self._condition:
+            self._diagnostics.clear()
+            self._lock_acquires_by_phase.clear()
+            self._wound_events.clear()
 
     def has_foreign_committing_writer(
         self,
         object_id: str,
         context: TransactionContext,
     ) -> bool:
+        return bool(
+            self.foreign_committing_writer_targets((object_id,), context)
+        )
+
+    def foreign_committing_writer_targets(
+        self,
+        object_ids: Iterable[str],
+        context: TransactionContext,
+    ) -> tuple[str, ...]:
+        """Snapshot conflicting committers for a read set under one latch."""
+        keys = tuple(dict.fromkeys(str(value) for value in object_ids))
+        conflicts: list[str] = []
         with self._condition:
-            key = str(object_id)
-            meta = self._objects[key]
-            return bool(
-                (
-                    meta.committing
-                    and meta.writer
-                    and meta.writer != context.tid
-                )
-                or (
-                    bool(
-                        self._publishers_for_key_locked(
-                            key, exclude_tid=context.tid
-                        )
+            for key in keys:
+                meta = self._objects[key]
+                if (
+                    (
+                        meta.committing
+                        and meta.writer
+                        and meta.writer != context.tid
                     )
-                )
-            )
+                    or self._publishers_for_key_locked(
+                        key, exclude_tid=context.tid
+                    )
+                ):
+                    conflicts.append(key)
+        return tuple(conflicts)
 
     def has_object_protection(
         self,
@@ -1003,14 +1133,47 @@ class PaperATCCLockManager:
         object_id: str,
         requester: TransactionContext | None = None,
     ) -> None:
+        victim_status = context.status.value
+        if not context.try_transition(
+            TransactionStatus.ABORTING,
+            from_statuses=(TransactionStatus.ACTIVE, TransactionStatus.WAITING),
+        ):
+            return
+        requester_role = (
+            "unknown"
+            if requester is None
+            else "background" if requester.is_background else "agent"
+        )
+        victim_role = "background" if context.is_background else "agent"
+        relation = f"{requester_role}_to_{victim_role}"
+        self._diagnostics[f"wounds_{relation}"] += 1
+        event = {
+            "requester_role": requester_role,
+            "victim_role": victim_role,
+            "object_id": str(object_id),
+            "requester_phase": (
+                requester.phase.value if requester is not None else "unknown"
+            ),
+            "victim_phase": context.phase.value,
+            "requester_retry": (
+                int(requester.retry_count) if requester is not None else -1
+            ),
+            "victim_retry": int(context.retry_count),
+            "requester_priority": (
+                int(requester.priority) if requester is not None else -1
+            ),
+            "victim_priority": int(context.priority),
+            "victim_status": victim_status,
+        }
+        self._wound_events.append(event)
+        if len(self._wound_events) > 1024:
+            del self._wound_events[: len(self._wound_events) - 1024]
         self._note_contention(object_id, "wound")
         self._diagnostics["wounds"] += 1
         if requester is not None and not requester.is_background and context.is_background:
             requester.background_aborts_caused += 1
         elif requester is not None and not requester.is_background and not context.is_background:
             requester.agent_aborts_caused += 1
-        if context.status in {TransactionStatus.ACTIVE, TransactionStatus.WAITING}:
-            context.transition(TransactionStatus.ABORTING)
         if self._wound_callback is not None:
             self._wound_callback(context, reason)
         self.release_all(context)

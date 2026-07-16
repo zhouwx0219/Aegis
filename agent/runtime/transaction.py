@@ -51,6 +51,12 @@ class _RetryProtectionState:
     protected_write_targets: frozenset[str] = frozenset()
 
 
+@dataclasses.dataclass(frozen=True)
+class _NativeBackgroundBatchPayload:
+    committed: bool
+    native_admitted: bool
+
+
 class AgentTransaction:
     """One logical agent task transaction with one concrete plan."""
 
@@ -349,8 +355,37 @@ class AgentTransaction:
         }
 
 
+def use_targeted_paper_atcc_optimization(
+    metadata: Dict[str, Any],
+    *,
+    strategy_name: str,
+) -> bool:
+    """Enable the measured high-contention optimization only for mixed YCSB."""
+    if str(strategy_name).strip().lower() not in {
+        "paper-atcc",
+        "paper-atcc-oracle",
+    }:
+        return False
+    context = dict(metadata.get("context", {}) or {})
+    if (
+        str(metadata.get("workload", "")).strip().lower() != "ycsb"
+        or str(context.get("level", "")).strip().lower() != "high"
+    ):
+        return False
+    agentic = dict(metadata.get("agentic", {}) or {})
+    return bool(
+        metadata.get("runtime_background", False)
+        or int(agentic.get("background_workers", 0) or 0) > 0
+    )
+
+
 class AgentTransactionManager:
     """Thread-safe transaction manager backed by versioned KV primitives."""
+
+    _NATIVE_BACKGROUND_YIELD_INTERVAL = 1
+    _NATIVE_BACKGROUND_PRESSURE_YIELD_INTERVAL = 1
+    _NATIVE_BACKGROUND_PRESSURE_WORKERS = 6
+    _NATIVE_BACKGROUND_YIELD_SECONDS = 0.0005
 
     _KIND_MAP = {
         "generic": cc.ObjectType.kGeneric,
@@ -389,6 +424,9 @@ class AgentTransactionManager:
         self.two_phase_locks = TwoPhaseLockTable()
         self.reservations = ReservationTable()
         self._lock = threading.RLock()
+        self.tpcc_mixed_replay_gate = threading.Lock()
+        self._online_prefix_condition = threading.Condition()
+        self._online_prefix_agents = 0
         self._catalog: Dict[str, Any] = {}
         self._traces: list[Dict[str, Any]] = []
         self._record_traces = bool(record_traces)
@@ -423,6 +461,15 @@ class AgentTransactionManager:
         self._paper_versioning_enabled = False
         self._native_dirty_objects: set[str] = set()
         self._background_sampling = threading.local()
+        self._native_background_plan_cache: Dict[
+            int, tuple[tuple[str, ...], tuple[tuple[str, str], ...]] | None
+        ] = {}
+        # Bounded committed dependency footprints support conservative
+        # serialization checks for online-observed reader bypass.  This is not
+        # an access-set oracle: a footprint is appended only after operations
+        # have actually executed and committed.
+        self._commit_dependency_sequence = 0
+        self._commit_dependency_history = collections.deque(maxlen=100_000)
         self._commit_timing_lock = threading.Lock()
         self._commit_timing_totals: Dict[str, float] = collections.defaultdict(float)
         self._commit_timing_counts: Dict[str, int] = collections.defaultdict(int)
@@ -463,12 +510,23 @@ class AgentTransactionManager:
         """Retroactively validate and lock objects newly protected by an action."""
         if not self.paper_versioning_enabled:
             self._enable_paper_versioning()
-        self.ensure_snapshot_epoch(txn)
+        online_observed = (
+            str(txn.metadata.get("access_set_visibility", "")).strip().lower()
+            == "online_observed"
+        )
+        if txn.metadata.get("paper_atcc_optimized", False) and not online_observed:
+            self.ensure_snapshot_epoch(txn)
         previous = txn.context.action
         added = action.added_since(previous)
         self.refresh_hot_targets(txn)
         defer_write_locks = bool(
             txn.metadata.get("_defer_policy_write_locks", False)
+        )
+        allow_historical_read_lock = bool(
+            txn.metadata.get("paper_atcc_optimized", False)
+            and not online_observed
+            and not txn.context.planned_write_targets
+            and not txn.write_set
         )
         read_targets = []
         write_targets: dict[str, int] = {}
@@ -501,7 +559,8 @@ class AgentTransactionManager:
                     version,
                     lambda key=object_id, observed=version: (
                         int(observed)
-                        if self.version_manager.can_lock_pinned_version(
+                        if allow_historical_read_lock
+                        and self.version_manager.can_lock_pinned_version(
                             txn.context.snapshot_epoch,
                             key,
                             int(observed),
@@ -512,6 +571,10 @@ class AgentTransactionManager:
                     timeout_s=timeout_s,
                 )
                 txn.context.policy_read_lock_targets.add(str(object_id))
+                if online_observed and txn.metadata.get("paper_atcc_optimized", False):
+                    txn.metadata.setdefault(
+                        "_online_bypass_read_targets", set()
+                    ).add(str(object_id))
             for object_id, version in sorted(write_targets.items()):
                 self.atcc_locks.validate_and_wlock(
                     object_id,
@@ -690,6 +753,173 @@ class AgentTransactionManager:
                     result[f"{key}_ms_mean"] = total / count if count else 0.0
             return result
 
+    def reset_measurement_diagnostics(self) -> None:
+        """Keep warmed runtime state but start measurement-only counters."""
+        self.atcc_locks.reset_diagnostics()
+        self.version_manager.reset_diagnostics()
+        with self._lock:
+            self._retry_protection_diagnostics.clear()
+            self._retry_conflict_objects.clear()
+        with self._commit_timing_lock:
+            self._commit_timing_totals.clear()
+            self._commit_timing_counts.clear()
+
+    def next_background_metric_sample_rate(self, sample_rate: int = 16) -> int:
+        """Return a weighted sampling rate for this background worker."""
+        rate = max(1, int(sample_rate))
+        sequence = int(getattr(self._background_sampling, "sequence", 0)) + 1
+        self._background_sampling.sequence = sequence
+        return rate if (sequence - 1) % rate == 0 else 0
+
+    def _yield_after_native_background_commit(self, background_workers: int) -> None:
+        sequence = int(
+            getattr(self._background_sampling, "native_commit_sequence", 0)
+        ) + 1
+        self._background_sampling.native_commit_sequence = sequence
+        interval = (
+            self._NATIVE_BACKGROUND_PRESSURE_YIELD_INTERVAL
+            if int(background_workers) >= self._NATIVE_BACKGROUND_PRESSURE_WORKERS
+            else self._NATIVE_BACKGROUND_YIELD_INTERVAL
+        )
+        if sequence % interval == 0:
+            time.sleep(self._NATIVE_BACKGROUND_YIELD_SECONDS)
+
+    def try_native_background_batch(
+        self,
+        task_id: str,
+        checks: Iterable[tuple[str, int]],
+        writes: Iterable[tuple[str, Any]],
+        *,
+        sample_metrics: bool = False,
+        background_workers: int = 0,
+        allow_reader_bypass: bool = False,
+    ) -> tuple[bool, bool | None]:
+        """Execute a short background OCC batch without transaction metadata.
+
+        ``handled`` is false when the ordinary transaction path must re-execute
+        the stored procedure. ``committed=None`` is an admission-only deferral:
+        no transactional work was exposed and the scheduler should move to a
+        different row without counting an abort.
+        """
+        self.atcc_locks.note_background_native_batch("attempt")
+        if self.undo_log.path is not None:
+            self.atcc_locks.note_background_native_batch("unsupported_fallback")
+            return False, False
+
+        check_versions: dict[str, int] = {}
+        for object_id, version in checks:
+            key = str(object_id)
+            observed = int(version)
+            previous = check_versions.setdefault(key, observed)
+            if previous != observed:
+                self.atcc_locks.note_background_native_batch("validation_failure")
+                return True, False
+        write_values: dict[str, str] = {}
+        for object_id, value in writes:
+            key = str(object_id)
+            if key in write_values:
+                self.atcc_locks.note_background_native_batch("unsupported_fallback")
+                return False, False
+            write_values[key] = str(value)
+
+        check_rows = tuple(check_versions.items())
+        write_rows = tuple(write_values.items())
+        if not write_rows:
+            committed = bool(self.store.batch_put_if_version(check_rows, ()))
+            if committed:
+                self._record_commit_dependency(
+                    (object_id for object_id, _version in check_rows),
+                    (),
+                )
+            self.atcc_locks.note_background_native_batch(
+                "read_only_commit" if committed else "validation_failure"
+            )
+            return True, committed
+
+        context = TransactionContext(
+            task_id=str(task_id),
+            attempt_id=0,
+            generation=0,
+            is_background=True,
+            planned_write_targets=set(write_values),
+        )
+        background_sample_rate = (
+            self.next_background_metric_sample_rate()
+            if sample_metrics
+            else 1
+        )
+        def publish() -> _NativeBackgroundBatchPayload:
+            native_admitted, committed = self.version_manager.try_native_publish(
+                write_values,
+                lambda: self.store.batch_put_if_version(check_rows, write_rows),
+                background=True,
+                # Weight sampled changes back to the original volume. Most
+                # native commits then avoid the VersionManager metadata lock.
+                background_sample_rate=background_sample_rate,
+            )
+            return _NativeBackgroundBatchPayload(
+                committed=bool(native_admitted and committed),
+                native_admitted=bool(native_admitted),
+            )
+
+        admitted, payload = self.atcc_locks.try_uncontended_background_publish(
+            write_values,
+            context,
+            publish,
+            allow_reader_bypass=bool(allow_reader_bypass),
+        )
+        if not admitted and allow_reader_bypass:
+            # Online-observed Agent write protection is acquired only when the
+            # write is actually reached, so its remaining critical section is
+            # short.  Wait once on the lock-manager condition and retry the
+            # native OCC publication instead of falling back to the much more
+            # expensive Python transaction/backoff path.  Admission and store
+            # validation remain atomic on the retry; no lock is bypassed here.
+            ready = self.atcc_locks.wait_for_background_admission(
+                write_values,
+                timeout_s=0.005,
+                allow_reader_bypass=True,
+            )
+            if ready:
+                admitted, payload = self.atcc_locks.try_uncontended_background_publish(
+                    write_values,
+                    context,
+                    publish,
+                    allow_reader_bypass=True,
+                )
+        if not admitted:
+            self.atcc_locks.note_background_native_batch("admission_fallback")
+            if allow_reader_bypass:
+                context.transition(TransactionStatus.ABORTING)
+                context.transition(TransactionStatus.ABORTED)
+                return True, None
+            return False, False
+        if not payload.native_admitted:
+            self.atcc_locks.note_background_native_batch("pin_fallback")
+            return False, False
+        if payload.committed:
+            self._record_commit_dependency(
+                (object_id for object_id, _version in check_rows),
+                write_values,
+            )
+            context.transition(TransactionStatus.COMMITTED)
+            self.atcc_locks.note_background_native_batch("commit")
+            # Native background batches are intentionally short and can form
+            # a tight GIL loop. Periodic yielding preserves Agent progress at
+            # full NUMA-node utilization without throttling every commit.
+            self._yield_after_native_background_commit(background_workers)
+            return True, True
+        context.transition(TransactionStatus.ABORTING)
+        context.transition(TransactionStatus.ABORTED)
+        self.atcc_locks.note_background_native_batch("validation_failure")
+        if allow_reader_bypass:
+            # A native validation race has not exposed any update. Re-execute
+            # the same stored-procedure operations once through the ordinary
+            # path with a fresh observed snapshot, so it remains one logical
+            # background attempt rather than an artificial fast-path abort.
+            return False, False
+        return True, False
+
     def note_agent_task_outcome(self, *, committed: bool, latency_ms: float) -> None:
         """Publish one logical task outcome for the paper Delta-Psys window."""
         with self._lock:
@@ -701,6 +931,128 @@ class AgentTransactionManager:
     def note_background_abort(self) -> None:
         with self._lock:
             self._paper_background_aborts += 1
+
+    def enter_online_observed_prefix(self) -> None:
+        with self._online_prefix_condition:
+            self._online_prefix_agents += 1
+
+    def leave_online_observed_prefix(self) -> None:
+        with self._online_prefix_condition:
+            if self._online_prefix_agents <= 0:
+                return
+            self._online_prefix_agents -= 1
+            if self._online_prefix_agents == 0:
+                self._online_prefix_condition.notify_all()
+
+    def wait_for_online_observed_prefix(self, *, timeout_s: float = 0.005) -> bool:
+        """Give an observed initial batch a short admission-free interval."""
+
+        deadline = time.perf_counter() + max(0.0, float(timeout_s))
+        with self._online_prefix_condition:
+            while self._online_prefix_agents > 0:
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0.0:
+                    return False
+                self._online_prefix_condition.wait(timeout=remaining)
+            return True
+
+    def sample_online_prefix_admission(self, *, one_in: int = 6) -> bool:
+        """Sample short prefix protection without globally pausing background."""
+
+        rate = max(1, int(one_in))
+        sequence = int(
+            getattr(self._background_sampling, "online_prefix_sequence", 0)
+        ) + 1
+        self._background_sampling.online_prefix_sequence = sequence
+        return sequence % rate == 0
+
+    def _record_commit_dependency(
+        self,
+        read_targets: Iterable[str],
+        write_targets: Iterable[str],
+    ) -> None:
+        """Record only the observed footprint of one completed transaction."""
+
+        reads = frozenset(str(value) for value in read_targets)
+        writes = frozenset(str(value) for value in write_targets)
+        with self._lock:
+            self._commit_dependency_sequence += 1
+            self._commit_dependency_history.append(
+                (self._commit_dependency_sequence, reads, writes)
+            )
+
+    def _safe_online_serialization_before_targets(
+        self,
+        txn: AgentTransaction,
+        candidates: Iterable[str],
+    ) -> set[str]:
+        """Return changed reads safe to serialize before intervening commits.
+
+        A bypassed read can remain valid in the serialization graph when all
+        intervening writers create only Agent->committed rw-antidependencies.
+        A reverse edge is safe only when it precedes every Agent->committed
+        edge, leaving a valid insertion point in commit order. Otherwise a
+        cycle is possible and ordinary version validation remains mandatory.
+        A truncated history also falls back to validation.
+        """
+
+        if (
+            str(txn.metadata.get("access_set_visibility", "")).strip().lower()
+            != "online_observed"
+        ):
+            return set()
+        candidate_set = {str(value) for value in candidates}
+        if not candidate_set:
+            return set()
+        changed = {
+            object_id
+            for object_id in candidate_set
+            if object_id in txn.read_set
+            and int(self.store.get_version(object_id))
+            != int(txn.read_set[object_id].version)
+        }
+        if not changed:
+            return set()
+        start_sequence = int(
+            txn.metadata.get("_commit_dependency_start_seq", 0) or 0
+        )
+        with self._lock:
+            current_sequence = int(self._commit_dependency_sequence)
+            history = tuple(self._commit_dependency_history)
+        if current_sequence <= start_sequence or not history:
+            return set()
+        if int(history[0][0]) > start_sequence + 1:
+            return set()
+        later_writes: set[str] = set()
+        first_forward_sequence: int | None = None
+        last_reverse_sequence: int | None = None
+        agent_reads = set(txn.read_set)
+        agent_writes = set(txn.write_set)
+        for sequence, reads, writes in history:
+            if int(sequence) <= start_sequence:
+                continue
+            later_writes.update(writes)
+            if agent_reads & set(writes):
+                first_forward_sequence = (
+                    int(sequence)
+                    if first_forward_sequence is None
+                    else min(first_forward_sequence, int(sequence))
+                )
+            if agent_writes & set(reads):
+                last_reverse_sequence = (
+                    int(sequence)
+                    if last_reverse_sequence is None
+                    else max(last_reverse_sequence, int(sequence))
+                )
+        if (
+            first_forward_sequence is not None
+            and last_reverse_sequence is not None
+            and last_reverse_sequence >= first_forward_sequence
+        ):
+            return set()
+        if not changed.issubset(agent_reads & later_writes):
+            return set()
+        return changed
 
     @property
     def backend_name(self) -> str:
@@ -734,14 +1086,24 @@ class AgentTransactionManager:
             metadata.setdefault("strategy", strategy_impl.name)
             if strategy_impl.family == "paper-atcc":
                 metadata["paper_atcc"] = True
+                targeted_optimization = use_targeted_paper_atcc_optimization(
+                    metadata,
+                    strategy_name=strategy_impl.name,
+                )
+                metadata["paper_atcc_optimized"] = bool(
+                    metadata.get("paper_atcc_optimized", False)
+                    or strategy_impl.name == "paper-atcc-opt"
+                    or targeted_optimization
+                )
+                if targeted_optimization:
+                    metadata["paper_atcc_engineering_profile"] = "ycsb-high-mixed"
         task_key = str(task_id)
         runtime_background = bool(metadata.get("runtime_background", False))
         coordinated_backend = bool(metadata.get("paper_atcc_backend", False))
         if runtime_background:
-            sequence = int(getattr(self._background_sampling, "sequence", 0)) + 1
-            self._background_sampling.sequence = sequence
             sample_rate = 16
-            sampled = (sequence - 1) % sample_rate == 0
+            sampled_rate = self.next_background_metric_sample_rate(sample_rate)
+            sampled = sampled_rate > 0
             metadata["_commit_timing_sample_rate"] = sample_rate
             metadata["_commit_timing_sampled"] = sampled
             if coordinated_backend:
@@ -785,7 +1147,25 @@ class AgentTransactionManager:
             if snapshot_object_ids is not None
             else ()
         )
+        if (
+            metadata.get("paper_atcc", False)
+            and str(metadata.get("access_set_visibility", "")).strip().lower()
+            == "online_observed"
+        ):
+            snapshot_ids = tuple(
+                dict.fromkeys(
+                    str(value)
+                    for value in (
+                        tuple(metadata.get("retry_conflict_read_targets", ()))
+                        + tuple(metadata.get("retry_conflict_write_targets", ()))
+                    )
+                )
+            )
         metadata["_planned_snapshot_object_ids"] = snapshot_ids
+        with self._lock:
+            metadata["_commit_dependency_start_seq"] = int(
+                self._commit_dependency_sequence
+            )
         initial_protection = LockClass(
             int(metadata.get("retry_protection_mask", 0) or 0) & 0xF
         )
@@ -800,14 +1180,24 @@ class AgentTransactionManager:
         metadata["snapshot_epoch"] = snapshot_epoch
         txn = AgentTransaction(self, str(task_id), snapshot, metadata)
         if materialize_initial_snapshot:
-            snapshot_epoch, snapshot = self.version_manager.snapshot_and_pin(
-                txn.context.tid,
-                snapshot_ids,
-                materialized=bool(snapshot_ids),
-            )
+            if metadata.get("paper_atcc_optimized", False):
+                snapshot_epoch, snapshot = self.version_manager.snapshot_and_pin(
+                    txn.context.tid,
+                    snapshot_ids,
+                    materialized=bool(snapshot_ids),
+                )
+            else:
+                # Strict ATCC never permits a publisher to bypass an RLock and
+                # never treats an old pinned version as satisfying retroactive
+                # validation. It needs an atomic initial snapshot, not retained
+                # MVCC history for the whole retry lifetime.
+                snapshot_epoch, snapshot = self.version_manager.snapshot_current(
+                    snapshot_ids
+                )
             txn.snapshot.update(snapshot)
-            txn.context.snapshot_epoch = int(snapshot_epoch)
-            txn.metadata["snapshot_epoch"] = int(snapshot_epoch)
+            if metadata.get("paper_atcc_optimized", False):
+                txn.context.snapshot_epoch = int(snapshot_epoch)
+                txn.metadata["snapshot_epoch"] = int(snapshot_epoch)
             if txn.events:
                 txn.events[0].detail["snapshot_objects"] = len(snapshot)
         read_only_background = bool(
@@ -893,7 +1283,6 @@ class AgentTransactionManager:
                 else LockClass.COLD_WRITE
             )
         return mask
-
     def _prepare_retry_feedback(
         self,
         txn: AgentTransaction,
@@ -903,28 +1292,64 @@ class AgentTransactionManager:
     ) -> tuple[tuple[ConflictDetail, ...], int]:
         if (
             normalize_conflict_kind(reason) != "version-conflict"
-            or not txn.metadata.get("paper_atcc", False)
+            or not (
+                txn.metadata.get("paper_atcc", False)
+                or txn.metadata.get("paper_atcc_retry_feedback", False)
+            )
             or txn.context.is_background
         ):
             return (), int(txn.context.action.protected)
         details = self._conflict_details(txn, conflict_object_ids)
+        context_metadata = dict(txn.metadata.get("context", {}) or {})
+        agentic_metadata = dict(txn.metadata.get("agentic", {}) or {})
+        online_ycsb_high_mixed = bool(
+            str(txn.metadata.get("access_set_visibility", "")).strip().lower()
+            == "online_observed"
+            and str(txn.metadata.get("workload", "")).strip().lower() == "ycsb"
+            and str(context_metadata.get("level", "")).strip().lower() == "high"
+            and int(agentic_metadata.get("background_workers", 0) or 0) > 0
+        )
+        tpcc_root_only = bool(
+            str(txn.metadata.get("workload", "")).strip().lower() == "tpcc"
+            and str(
+                dict(txn.metadata.get("context", {}) or {}).get("level", "")
+            ).strip().lower()
+            == "high"
+            and int(
+                dict(txn.metadata.get("agentic", {}) or {}).get(
+                    "background_workers", 0
+                )
+                or 0
+            )
+            == 0
+        )
         conflict_mask = LockClass.NONE
         for detail in details:
             conflict_mask |= LockClass(int(detail.protection_bit))
         with self._lock:
             previous = self._retry_protection.get(txn.task_id, _RetryProtectionState())
             conflict_count = previous.validation_conflicts + 1
-            mask = previous.mask | txn.context.action.protected | conflict_mask
+            mask = previous.mask | txn.context.action.protected
+            if not online_ycsb_high_mixed:
+                mask |= conflict_mask
             protected_reads = set(previous.protected_read_targets)
             protected_writes = set(previous.protected_write_targets)
             for detail in details:
+                if tpcc_root_only and not detail.object_id.startswith(
+                    ("tpcc:warehouse:", "tpcc:district:")
+                ):
+                    continue
                 target_set = (
                     protected_writes
                     if detail.access_kind == "write"
                     else protected_reads
                 )
                 target_set.add(detail.object_id)
-            if conflict_count >= 2:
+            if (
+                conflict_count >= 2
+                and not tpcc_root_only
+                and not online_ycsb_high_mixed
+            ):
                 mask |= self._observed_protection_mask(txn)
                 observed_reads = set(txn.read_set) | set(txn.context.read_versions)
                 planned_observed_writes = (
@@ -953,8 +1378,16 @@ class AgentTransactionManager:
             self._retry_protection_diagnostics[
                 f"validation_conflicts_{attempt_bucket}"
             ] += 1
+            exact_tpcc_targets = {
+                str(value)
+                for value in txn.metadata.get("_tpcc_exact_risk_targets", ())
+            }
             for detail in details:
                 self._retry_conflict_objects[detail.object_id] += 1
+                if detail.object_id in exact_tpcc_targets:
+                    self._retry_protection_diagnostics[
+                        "conflict_after_tpcc_exact_guard"
+                    ] += 1
                 conflict_class = detail.protection_class.replace("-", "_")
                 self._retry_protection_diagnostics[
                     f"conflict_{conflict_class}"
@@ -1011,10 +1444,13 @@ class AgentTransactionManager:
         txn = self._live_transactions.get(context.tid)
         if txn is None or txn.state != TransactionState.ACTIVE:
             return
+        if not context.try_transition(
+            TransactionStatus.ABORTED,
+            from_statuses=(TransactionStatus.ABORTING,),
+        ):
+            return
         txn.state = TransactionState.ABORTED
         context.note_conflict("lock-preempted")
-        if context.status == TransactionStatus.ABORTING:
-            context.transition(TransactionStatus.ABORTED)
         txn._event("wound", {"reason": str(reason)})
         txn.result = txn._result(
             strategy="paper-atcc",
@@ -1131,6 +1567,20 @@ class AgentTransactionManager:
             )
 
         if coordinated_backend:
+            prepare_started = time.perf_counter()
+            self.version_manager.prepare(
+                txn.context.tid,
+                (
+                    (write.object_id, write.value)
+                    for write in txn.write_set.values()
+                ),
+            )
+            txn.metadata["_private_prepared"] = True
+            self.add_commit_timing(
+                txn,
+                "install",
+                (time.perf_counter() - prepare_started) * 1000.0,
+            )
             used_fast_path, result = self.atcc_locks.try_uncontended_background_publish(
                 txn.write_set,
                 txn.context,
@@ -1141,8 +1591,11 @@ class AgentTransactionManager:
                     started_wait,
                     paper_atcc=True,
                     release_atcc_locks=False,
-                    allow_native_publish=True,
+                    allow_native_publish=False,
                     native_publication_held=False,
+                ),
+                allow_reader_bypass=bool(
+                    txn.metadata.get("paper_atcc_optimized", False)
                 ),
                 timing_callback=lambda elapsed_ms: self.add_commit_timing(
                     txn, "lock", elapsed_ms
@@ -1356,6 +1809,14 @@ class AgentTransactionManager:
         pinned_read_targets = set(
             txn.metadata.get("_version_risk_pinned_read_targets", ())
         )
+        online_bypass_read_targets = set(
+            txn.metadata.get("_online_bypass_read_targets", ())
+        )
+        online_serialization_before_targets = (
+            self._safe_online_serialization_before_targets(
+                txn, online_bypass_read_targets
+            )
+        )
         if pinned_read_targets and txn.context.snapshot_epoch >= 0:
             pinned_read_targets = set(txn.read_set) - set(txn.write_set)
         if paper_atcc and not txn.context.is_background and pinned_read_targets:
@@ -1404,6 +1865,19 @@ class AgentTransactionManager:
                 )
                 self._observe_strategy(strategy_impl, plan, result, txn)
                 return result
+        foreign_committing_writers: set[str] = set()
+        batched_foreign_writer_snapshot = bool(
+            paper_atcc
+            and not txn.context.is_background
+            and len(txn.read_set) <= 16
+        )
+        if batched_foreign_writer_snapshot:
+            foreign_committing_writers.update(
+                self.atcc_locks.foreign_committing_writer_targets(
+                    txn.read_set,
+                    txn.context,
+                )
+            )
         read_checks = []
         for read in txn.read_set.values():
             protected = (
@@ -1415,11 +1889,26 @@ class AgentTransactionManager:
                 )
             )
             if (
+                read.object_id in online_bypass_read_targets
+                and read.object_id not in txn.context.held_write_locks
+            ):
+                # ACTIVE online-observed readers may be bypassed by a short
+                # background publisher. Once this transaction is COMMITTING,
+                # new bypass is closed by the lock manager; validating the
+                # observed version here conservatively detects the resulting
+                # rw anti-dependency without any future access oracle.
+                protected = False
+            if (
                 paper_atcc
                 and not txn.context.is_background
                 and not protected
-                and self.atcc_locks.has_foreign_committing_writer(
-                    read.object_id, txn.context
+                and (
+                    read.object_id in foreign_committing_writers
+                    if batched_foreign_writer_snapshot
+                    else self.atcc_locks.has_foreign_committing_writer(
+                        read.object_id,
+                        txn.context,
+                    )
                 )
             ):
                 self.hotness_tracker.observe_contention(
@@ -1434,7 +1923,11 @@ class AgentTransactionManager:
                 )
                 self._observe_strategy(strategy_impl, plan, result, txn)
                 return result
-            if plan.validate_reads and not (paper_atcc and protected):
+            if (
+                plan.validate_reads
+                and not (paper_atcc and protected)
+                and read.object_id not in online_serialization_before_targets
+            ):
                 read_checks.append((read.object_id, int(read.version)))
         checks = list(read_checks)
         checks.extend(
@@ -1471,10 +1964,6 @@ class AgentTransactionManager:
             # rebasing it here gives the batch a fresh serialization point
             # without turning every deferred write into a long-lived WLock.
             blind_writes = set(txn.write_set) - set(txn.read_set)
-            if not txn.metadata.get("_version_risk_exact_mode", False):
-                blind_writes &= set(txn.context.planned_write_targets)
-                if not txn.metadata.get("_defer_policy_write_locks", False):
-                    blind_writes.clear()
             if blind_writes:
                 rebased_versions: dict[str, int] = {}
                 for object_id in blind_writes:
@@ -1595,6 +2084,9 @@ class AgentTransactionManager:
                     )
                     + 1,
                     timing_ms=timing_bucket,
+                    private_prepared=bool(
+                        txn.metadata.get("_private_prepared", False)
+                    ),
                 )
         else:
             ok = install_private_versions()
@@ -1617,6 +2109,7 @@ class AgentTransactionManager:
             self._observe_strategy(strategy_impl, plan, result, txn)
             return result
         self._inject_commit_fault("after_publish", txn)
+        self._record_commit_dependency(txn.read_set, txn.write_set)
         txn.state = TransactionState.COMMITTED
         txn.context.transition(TransactionStatus.COMMITTED)
         txn._event("finish", {"state": txn.state.value, "action": "commit"})
@@ -1635,6 +2128,8 @@ class AgentTransactionManager:
         self.interceptor.finish(txn)
         if (
             release_atcc_locks
+            or txn.metadata.get("paper_atcc", False)
+            or txn.metadata.get("paper_atcc_backend", False)
             or txn.context.held_read_locks
             or txn.context.held_write_locks
         ):

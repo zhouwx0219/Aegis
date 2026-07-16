@@ -127,15 +127,14 @@ def plan_task_phases(
                 phase,
                 operations,
                 0,
-                tuple(
-                    profile.operation_delay_ms(
-                        level=level,
-                        phase=phase,
-                        task_id=task.task_id,
-                        attempt=attempt,
-                        operation_index=operation_indexes[id(operation)],
-                    )
-                    for operation in operations
+                paper_operation_delays(
+                    task,
+                    phase=phase,
+                    operations=operations,
+                    level=level,
+                    attempt=attempt,
+                    profile=profile,
+                    operation_indexes=operation_indexes,
                 ),
             )
             for phase, operations in operations_by_phase
@@ -166,6 +165,69 @@ def plan_task_phases(
         ),
         retry_delay_ms=profile.retry_delay_ms(level=level, task_id=task.task_id, attempt=attempt),
     )
+
+
+def paper_operation_delays(
+    task: AgentTask,
+    *,
+    phase: str,
+    operations: Tuple[AgentOperation, ...],
+    level: str,
+    attempt: int,
+    profile: ReasoningProfile,
+    operation_indexes: dict[int, int],
+) -> Tuple[int, ...]:
+    """Model Agent think time at logical tool-call boundaries.
+
+    YCSB exposes one record-field operation per query, so every operation is a
+    boundary.  The TPC-C adapter represents a single row query/update as
+    several field-level KV operations. Sleeping for every field makes one SQL
+    tool call look like several independent Agent interactions and inflates
+    the vulnerable reasoning window. Keep the field operations intact for
+    concurrency control, but charge the 1--20 ms delay once per consecutive
+    logical row access.
+    """
+
+    workload = str(task.workload).strip().lower()
+    previous_group: tuple[str, str] | None = None
+    delays = []
+    for operation in operations:
+        group = (
+            str(operation.kind),
+            paper_reasoning_group(operation) if workload == "tpcc" else str(operation.object_id),
+        )
+        is_boundary = group != previous_group
+        delays.append(
+            profile.operation_delay_ms(
+                level=level,
+                phase=phase,
+                task_id=task.task_id,
+                attempt=attempt,
+                operation_index=operation_indexes[id(operation)],
+            )
+            if is_boundary
+            else 0
+        )
+        previous_group = group
+    return tuple(delays)
+
+
+def paper_reasoning_group(operation: AgentOperation) -> str:
+    metadata = dict(operation.metadata)
+    explicit = str(metadata.get("reasoning_group", "")).strip()
+    if explicit:
+        return explicit
+    object_id = str(operation.object_id)
+    parts = object_id.split(":")
+    if len(parts) >= 4 and parts[0] == "tpcc" and parts[1] in {
+        "warehouse",
+        "district",
+        "customer",
+        "stock",
+        "item",
+    }:
+        return ":".join(parts[:-1])
+    return object_id
 
 
 def phase_operations(task: AgentTask) -> tuple[tuple[str, Tuple[AgentOperation, ...]], ...]:

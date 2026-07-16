@@ -1,6 +1,8 @@
 import dataclasses
+import contextlib
 import io
 import json
+import random
 import threading
 import tempfile
 import time
@@ -13,8 +15,10 @@ from agent.cc import ConcurrencyControlRegistry, LockConflict, ReservationTable
 from agent.benchmarks.mixed import (
     ATCCAdmissionConflict,
     MixedBenchmarkConfig,
+    MixedCounters,
     admission_failure_reason,
     apply_atcc_experiment_overrides,
+    begin_planned_transaction,
     can_defer_transaction_begin,
     can_defer_read_heavy_transaction_begin,
     mixed_transaction_metadata,
@@ -25,6 +29,8 @@ from agent.benchmarks.mixed import (
     run_agent_with_deferred_read_reservation,
     run_agent_attempt,
     run_mixed_benchmark,
+    should_serialize_tpcc_mixed_replay,
+    should_use_paper_deferred_replay,
 )
 from agent.benchmarks.phases import PlannedPhase, PlannedTask, ReasoningProfile, plan_task_phases
 from agent.cli import compare, matrix, mixed, train_atcc
@@ -37,6 +43,7 @@ from agent.cc.atcc.reward import ATCCRewardConfig
 from scripts.train_paper_atcc_coordinated import (
     behavior_probabilities,
     behavior_probability,
+    normalized_system_scores,
 )
 from scripts.unified_trace.generate_castdas_trace import (
     paper_trace_workload,
@@ -44,9 +51,17 @@ from scripts.unified_trace.generate_castdas_trace import (
 )
 from scripts.unified_trace.run_castdas_trace_fair import (
     FixedCountRunCoordinator,
+    cached_retry_scheduler_cooldown_s,
     continuous_background_rows,
+    high_contention_cached_retry,
+    paper_agent_admission_cap,
+    paper_background_admission_cap,
+    result_row,
+    run_background_row,
     run_rows,
+    should_reuse_atcc_retry_plan,
 )
+from scripts.unified_trace.run_dbx1000_trace import write_dbx1000_trace
 from scripts.unified_trace.run_unified_trace_matrix import summarize as summarize_unified_trace
 from agent.runtime import AgentTransactionManager
 from agent.runtime import CompiledPhasePolicy, CompiledPolicyEntry, LockClass
@@ -54,6 +69,333 @@ from agent.workloads import AgentOperation, AgentTask, build_workload
 
 
 class CompareCliTests(unittest.TestCase):
+    def test_retry_plan_cache_covers_deterministic_high_contention_traces(self):
+        self.assertTrue(
+            high_contention_cached_retry(
+                MixedBenchmarkConfig(workload="tpcc", level="high", background_workers=0)
+            )
+        )
+        self.assertTrue(
+            high_contention_cached_retry(
+                MixedBenchmarkConfig(workload="ycsb", level="high", background_workers=8)
+            )
+        )
+        self.assertFalse(
+            high_contention_cached_retry(
+                MixedBenchmarkConfig(workload="tpcc", level="low", background_workers=0)
+            )
+        )
+        self.assertTrue(
+            high_contention_cached_retry(
+                MixedBenchmarkConfig(workload="ycsb", level="high", background_workers=0)
+            )
+        )
+        self.assertTrue(
+            high_contention_cached_retry(
+                MixedBenchmarkConfig(
+                    workload="ycsb",
+                    level="medium",
+                    clients=40,
+                    background_workers=0,
+                )
+            )
+        )
+        self.assertFalse(
+            high_contention_cached_retry(
+                MixedBenchmarkConfig(
+                    workload="ycsb",
+                    level="medium",
+                    clients=24,
+                    background_workers=0,
+                )
+            )
+        )
+
+    def test_cached_retry_cooldown_desynchronizes_all_high_contention_replays(self):
+        rng = random.Random(7)
+        all_agent = cached_retry_scheduler_cooldown_s(
+            MixedBenchmarkConfig(
+                workload="ycsb", level="high", clients=40, background_workers=0
+            ),
+            rng,
+        )
+        mixed = cached_retry_scheduler_cooldown_s(
+            MixedBenchmarkConfig(
+                workload="ycsb", level="high", clients=40, background_workers=8
+            ),
+            rng,
+        )
+        self.assertGreaterEqual(all_agent, 0.5)
+        self.assertLessEqual(all_agent, 1.0)
+        self.assertGreaterEqual(mixed, 0.005)
+        self.assertLessEqual(mixed, 0.020)
+
+    def test_paper_agent_admission_caps_only_saturated_high_contention(self):
+        manager = AgentTransactionManager()
+        self.assertEqual(
+            30,
+            paper_agent_admission_cap(
+                manager,
+                "paper-atcc",
+                MixedBenchmarkConfig(
+                    workload="ycsb", level="high", clients=40, background_workers=0
+                ),
+                agent_worker_count=40,
+            ),
+        )
+        self.assertEqual(
+            20,
+            paper_agent_admission_cap(
+                manager,
+                "paper-atcc",
+                MixedBenchmarkConfig(
+                    workload="tpcc", level="high", clients=40, background_workers=8
+                ),
+                agent_worker_count=32,
+            ),
+        )
+        self.assertEqual(
+            24,
+            paper_agent_admission_cap(
+                manager,
+                "paper-atcc",
+                MixedBenchmarkConfig(
+                    workload="tpcc", level="high", clients=40, background_workers=0
+                ),
+                agent_worker_count=40,
+            ),
+        )
+        self.assertEqual(
+            40,
+            paper_agent_admission_cap(
+                manager,
+                "bamboo",
+                MixedBenchmarkConfig(
+                    workload="ycsb", level="high", clients=40, background_workers=0
+                ),
+                agent_worker_count=40,
+            ),
+        )
+        self.assertEqual(
+            5,
+            paper_background_admission_cap(
+                manager,
+                "paper-atcc",
+                MixedBenchmarkConfig(
+                    workload="tpcc", level="high", clients=40, background_workers=8
+                ),
+                background_worker_count=8,
+            ),
+        )
+        self.assertEqual(
+            8,
+            paper_background_admission_cap(
+                manager,
+                "bamboo",
+                MixedBenchmarkConfig(
+                    workload="tpcc", level="high", clients=40, background_workers=8
+                ),
+                background_worker_count=8,
+            ),
+        )
+
+    def test_paper_deferred_replay_targets_tpcc_high_and_mixed_ycsb(self):
+        read = AgentOperation.read("row")
+        write = AgentOperation.write("row", "1")
+
+        def plan(workload, level):
+            return PlannedTask(
+                AgentTask(
+                    task_id=f"{workload}-{level}",
+                    workload=workload,
+                    task_type="update",
+                    operations=(read, write),
+                    context={"level": level},
+                ),
+                (
+                    PlannedPhase("explore", (read,), 0, (1,)),
+                    PlannedPhase("commit", (write,), 0, (1,)),
+                ),
+            )
+
+        self.assertTrue(
+            should_use_paper_deferred_replay(
+                plan("tpcc", "high"), background_workers=0
+            )
+        )
+        self.assertTrue(
+            should_use_paper_deferred_replay(
+                plan("ycsb", "medium"), background_workers=2
+            )
+        )
+        self.assertFalse(
+            should_use_paper_deferred_replay(
+                plan("ycsb", "high"), background_workers=2
+            )
+        )
+        self.assertFalse(
+            should_use_paper_deferred_replay(
+                plan("ycsb", "medium"), background_workers=0
+            )
+        )
+        self.assertTrue(
+            should_serialize_tpcc_mixed_replay(
+                plan("tpcc", "high").task,
+                background_workers=8,
+            )
+        )
+        self.assertFalse(
+            should_serialize_tpcc_mixed_replay(
+                plan("tpcc", "high").task,
+                background_workers=0,
+            )
+        )
+
+    def test_retry_plan_cache_requires_atcc_conflict(self):
+        atcc = SimpleNamespace(
+            cc_registry=SimpleNamespace(
+                resolve=lambda _cc: SimpleNamespace(family="paper-atcc")
+            )
+        )
+        baseline = SimpleNamespace(
+            cc_registry=SimpleNamespace(resolve=lambda _cc: SimpleNamespace(family="occ"))
+        )
+        config = MixedBenchmarkConfig(
+            workload="tpcc", level="high", background_workers=0
+        )
+
+        self.assertTrue(
+            should_reuse_atcc_retry_plan(
+                atcc,
+                "paper-atcc",
+                config,
+                {"committed": False, "failure_reason": "version-conflict"},
+            )
+        )
+        self.assertFalse(
+            should_reuse_atcc_retry_plan(
+                baseline,
+                "occ",
+                config,
+                {"committed": False, "failure_reason": "version-conflict"},
+            )
+        )
+        self.assertFalse(
+            should_reuse_atcc_retry_plan(
+                atcc,
+                "paper-atcc",
+                config,
+                {"committed": True, "failure_reason": "none"},
+            )
+        )
+
+    def test_timed_agent_task_tps_excludes_post_window_drain(self):
+        counters = MixedCounters()
+        counters.completed_agent_tasks = 4
+        counters.agent_commits = 4
+        counters.steady_agent_commits = 2
+        counters.measurement_window_s = 1.0
+        counters.agent_drain_s = 4.0
+
+        row = result_row(
+            {},
+            "occ",
+            counters,
+            elapsed_s=5.0,
+            tokens_per_operation=2703,
+            rows=[],
+            manager=AgentTransactionManager(),
+        )
+
+        self.assertEqual(2.0, row["agent_task_tps"])
+        self.assertEqual(2.0, row["agent_tps"])
+        self.assertEqual(0.8, row["agent_drain_task_tps"])
+
+    def test_token_attribution_separates_retry_cache_from_reasoning(self):
+        counters = MixedCounters(
+            completed_agent_tasks=2,
+            agent_reasoning_operation_units=20,
+            agent_initial_reasoning_operation_units=16,
+            agent_retry_reasoning_operation_units=4,
+            agent_retry_cache_saved_operation_units=8,
+            agent_initial_reasoning_invocations=2,
+            agent_retry_reasoning_invocations=1,
+            agent_cached_retry_replays=2,
+        )
+        row = result_row(
+            {},
+            "paper-atcc",
+            counters,
+            elapsed_s=1.0,
+            tokens_per_operation=10,
+            rows=[],
+            manager=AgentTransactionManager(),
+        )
+
+        self.assertEqual(200, row["agent_total_tokens"])
+        self.assertEqual(160, row["agent_initial_reasoning_tokens"])
+        self.assertEqual(40, row["agent_retry_reasoning_tokens"])
+        self.assertEqual(80, row["agent_retry_cache_saved_tokens"])
+        self.assertEqual(280, row["agent_counterfactual_no_cache_tokens"])
+        self.assertEqual(140, row["agent_avg_tokens_without_retry_cache"])
+        self.assertAlmostEqual(80 / 280, row["agent_retry_cache_savings_ratio"])
+
+    def test_dbx1000_trace_exports_operation_level_agent_delays(self):
+        ops = [
+            {"kind": "read", "key": 1, "phase": "explore", "delay_ms": 7},
+            {"kind": "read", "key": 2, "phase": "refine", "delay_ms": 11},
+            {"kind": "write", "key": 3, "phase": "commit", "delay_ms": 13},
+        ]
+        rows = [
+            {
+                "worker_id": "0",
+                "sequence": "0",
+                "client_type": "agent",
+                "workload": "ycsb",
+                "task_type": "read-update",
+                "ops_json": json.dumps(ops),
+                "explore_delay_ms": "3",
+                "refine_delay_ms": "4",
+                "commit_delay_ms": "5",
+                "retry_delay_ms": "17",
+                "context_json": "{}",
+                "tpcc_warehouses": "",
+            }
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace.tsv"
+            stats = write_dbx1000_trace(path, rows)
+            fields = path.read_text(encoding="utf-8").strip().split("\t")
+
+        self.assertEqual("25", fields[3])
+        self.assertEqual("17", fields[4])
+        self.assertEqual("18", fields[5])
+        self.assertEqual(43, stats["total_agent_delay_ms"])
+
+    def test_planned_transaction_uses_replay_generation_id(self):
+        task = AgentTask(
+            task_id="logical-task",
+            workload="ycsb",
+            task_type="read",
+            operations=(AgentOperation.read("row"),),
+            context={},
+        )
+        planned = PlannedTask(
+            task=task,
+            phases=(PlannedPhase("explore", task.operations, 0),),
+            retry_delay_ms=0,
+        )
+        manager = SimpleNamespace(begin=mock.Mock(return_value="txn"))
+
+        result = begin_planned_transaction(
+            manager,
+            planned,
+            {"strategy": "paper-atcc", "transaction_id": "logical-task:g7"},
+        )
+
+        self.assertEqual("txn", result)
+        self.assertEqual("logical-task:g7", manager.begin.call_args.args[0])
+
     def test_unified_summary_compares_atcc_with_best_traditional_agent_tps(self):
         common = {
             "workload": "ycsb",
@@ -174,10 +516,156 @@ class CompareCliTests(unittest.TestCase):
         self.assertEqual(0.5, behavior_probability(probabilities, "commit", 0, 1))
         self.assertEqual(1.0, behavior_probability(probabilities, "commit", 1, 1))
 
+    def test_coordinated_mixed_reward_prioritizes_agent_tps_and_uses_background_tps(self):
+        runs = [
+            {
+                "result": {
+                    "agent_task_tps": 100,
+                    "total_tps": 100,
+                    "agent_attempt_abort_rate": 0,
+                    "agent_p99_latency_ms": 100,
+                    "background_tps": 0,
+                    "background_commit_rate": 1,
+                }
+            },
+            {
+                "result": {
+                    "agent_task_tps": 0,
+                    "total_tps": 100,
+                    "agent_attempt_abort_rate": 0,
+                    "agent_p99_latency_ms": 100,
+                    "background_tps": 100,
+                    "background_commit_rate": 0,
+                }
+            },
+        ]
+
+        scores = normalized_system_scores(runs, mixed=True)
+
+        self.assertAlmostEqual(0.35, scores[0] - scores[1])
+
     def test_registry_exposes_distinct_paper_atcc_runtime(self):
         registry = ConcurrencyControlRegistry()
-        strategy = registry.resolve("paper-atcc")
-        self.assertEqual("paper-atcc", strategy.family)
+        strict = registry.resolve("paper-atcc")
+        optimized = registry.resolve("paper-atcc-opt")
+        oracle = registry.resolve("paper-atcc-oracle")
+        self.assertEqual("paper-atcc", strict.family)
+        self.assertEqual("paper-atcc", optimized.family)
+        self.assertEqual("paper-atcc", oracle.family)
+        self.assertFalse(strict.plan(SimpleNamespace()).metadata.get("paper_atcc_optimized", False))
+        self.assertTrue(optimized.plan(SimpleNamespace()).metadata["paper_atcc_optimized"])
+        self.assertNotIn("paper-atcc-opt", registry.expand("all"))
+        self.assertNotIn("paper-atcc-oracle", registry.expand("all"))
+
+    def test_paper_main_hides_future_access_set_and_oracle_retains_it(self):
+        task = AgentTask(
+            task_id="online-access",
+            workload="ycsb",
+            task_type="read-write",
+            operations=(
+                AgentOperation.read("read-row"),
+                AgentOperation.write("write-row", "1"),
+            ),
+            context={"level": "high"},
+        )
+        planned = PlannedTask(
+            task,
+            (PlannedPhase("explore", task.operations),),
+        )
+
+        online = mixed_transaction_metadata(
+            planned,
+            retry_count=0,
+            background_workers=8,
+            strategy="paper-atcc",
+        )
+        oracle = mixed_transaction_metadata(
+            planned,
+            retry_count=0,
+            background_workers=8,
+            strategy="paper-atcc-oracle",
+        )
+
+        self.assertEqual("online_observed", online["access_set_visibility"])
+        self.assertEqual([], online["planned_write_targets"])
+        self.assertEqual("full_trace_oracle", oracle["access_set_visibility"])
+        self.assertEqual(["write-row"], oracle["planned_write_targets"])
+
+        manager = mock.Mock()
+        manager.begin.return_value = object()
+        begin_planned_transaction(manager, planned, online)
+        self.assertIsNone(manager.begin.call_args.kwargs["snapshot_object_ids"])
+        begin_planned_transaction(manager, planned, oracle)
+        self.assertEqual(
+            ("read-row", "write-row"),
+            manager.begin.call_args.kwargs["snapshot_object_ids"],
+        )
+
+    def test_background_row_defers_conflict_to_next_trace_cycle(self):
+        first = mock.Mock()
+        first.commit.return_value = SimpleNamespace(committed=False)
+        second = mock.Mock()
+        second.commit.return_value = SimpleNamespace(committed=True)
+        manager = SimpleNamespace(
+            cc_registry=SimpleNamespace(
+                resolve=lambda _cc: SimpleNamespace(family="paper-atcc")
+            ),
+            atcc_locks=SimpleNamespace(
+                background_pre_admission_block=lambda _targets, **_kwargs: None
+            ),
+            reservations=SimpleNamespace(
+                write_guard=lambda *_args, **_kwargs: contextlib.nullcontext()
+            ),
+            note_background_abort=mock.Mock(),
+            begin=mock.Mock(side_effect=(first, second)),
+        )
+        task = AgentTask(
+            task_id="background-row",
+            workload="ycsb",
+            task_type="update",
+            operations=(AgentOperation.write("row", "1"),),
+            context={},
+        )
+        row = {
+            "trace_id": "trace",
+            "worker_id": 3,
+            "sequence": 7,
+            "workload": "ycsb",
+            "task_type": "update",
+            "_context": {},
+            "_task": task,
+        }
+        counters = MixedCounters()
+        sleeps = []
+
+        with mock.patch(
+            "scripts.unified_trace.run_castdas_trace_fair.sleep_for_reasoning",
+            side_effect=lambda value: sleeps.append(value),
+        ):
+            run_background_row(
+                manager,
+                "paper-atcc",
+                MixedBenchmarkConfig(
+                    workload="ycsb",
+                    level="high",
+                    cc="paper-atcc",
+                    background_retry_backoff_min_ms=10,
+                    background_retry_backoff_max_ms=30,
+                ),
+                row,
+                random.Random(920106),
+                threading.Lock(),
+                counters,
+            )
+
+        self.assertEqual(1, manager.begin.call_count)
+        first.write.assert_called_once_with("row", "1")
+        second.write.assert_not_called()
+        self.assertEqual(1, counters.background_attempts)
+        self.assertEqual(0, counters.background_commits)
+        self.assertEqual(1, counters.background_aborts)
+        self.assertEqual(1, counters.background_retries)
+        self.assertEqual([], sleeps)
 
     def test_mixed_paper_atcc_uses_phase_policy_actions(self):
         policy = CompiledPhasePolicy(
@@ -278,6 +766,42 @@ class CompareCliTests(unittest.TestCase):
         self.assertLessEqual(operation_delay, 20)
         self.assertGreaterEqual(retry_delay, 500)
         self.assertLessEqual(retry_delay, 5000)
+
+    def test_paper_tpcc_reasoning_delay_is_charged_per_logical_row_tool_call(self):
+        task = AgentTask(
+            task_id="tpcc-tool-call-delay",
+            workload="tpcc",
+            task_type="payment",
+            operations=(
+                AgentOperation.read(
+                    "tpcc:customer:1:2:3:balance", phase="explore"
+                ),
+                AgentOperation.read(
+                    "tpcc:customer:1:2:3:status", phase="explore"
+                ),
+                AgentOperation.read("tpcc:warehouse:1:ytd", phase="explore"),
+                AgentOperation.write(
+                    "tpcc:customer:1:2:3:balance", "1", phase="commit"
+                ),
+                AgentOperation.write(
+                    "tpcc:customer:1:2:3:payment_count", "1", phase="commit"
+                ),
+            ),
+            context={"level": "low", "profile": "paper"},
+        )
+
+        planned = plan_task_phases(
+            task,
+            attempt=0,
+            profile=ReasoningProfile("agentic", 1.0),
+        )
+        phases = {phase.name: phase for phase in planned.phases}
+
+        self.assertGreater(phases["explore"].operation_delays_ms[0], 0)
+        self.assertEqual(0, phases["explore"].operation_delays_ms[1])
+        self.assertGreater(phases["explore"].operation_delays_ms[2], 0)
+        self.assertGreater(phases["commit"].operation_delays_ms[0], 0)
+        self.assertEqual(0, phases["commit"].operation_delays_ms[1])
 
     def test_reservation_attributes_background_blocking_to_owner(self):
         reservations = ReservationTable()
@@ -2048,6 +2572,116 @@ class CompareCliTests(unittest.TestCase):
         self.assertEqual("low-conflict-optimistic", trace["metadata"]["atcc_runtime_fast_path"])
         self.assertEqual("silo", trace["metadata"]["atcc_runtime_fast_path_commit_strategy"])
         self.assertNotIn("atcc_preplan", trace["metadata"])
+
+    def test_paper_atcc_low_first_attempt_uses_native_optimistic_runtime(self):
+        manager = AgentTransactionManager()
+        root = "tpcc:district:7:1:next_order_id"
+        for object_id in (root, "b"):
+            manager.register_object(object_id, "0", kind="row")
+        task = AgentTask(
+            task_id="paper-low-native",
+            workload="tpcc",
+            task_type="read-update",
+            operations=(
+                AgentOperation.read(root),
+                AgentOperation.write(root, "1"),
+            ),
+            context={"level": "low"},
+        )
+        planned = PlannedTask(
+            task=task,
+            phases=(
+                PlannedPhase("explore", (task.operations[0],), reasoning_delay_ms=0),
+                PlannedPhase("commit", (task.operations[1],), reasoning_delay_ms=0),
+            ),
+        )
+
+        result, action, wait_s, diagnostics = run_agent_attempt(
+            manager,
+            planned,
+            "paper-atcc",
+            ttl_s=1.0,
+            jitter_ms=0,
+            retry_count=0,
+            background_workers=0,
+            config=MixedBenchmarkConfig(atcc_pure_policy=True),
+            transaction_id="paper-low-logical",
+        )
+
+        self.assertTrue(result["committed"])
+        self.assertEqual("paper-action-0", action)
+        self.assertEqual(0.0, wait_s)
+        self.assertEqual("paper-low-native-occ", diagnostics["runtime_fast_path"])
+        self.assertFalse(manager.paper_versioning_enabled)
+        trace = manager.traces()[-1]
+        self.assertEqual("occ", trace["result"]["strategy"])
+        self.assertEqual("paper-atcc", trace["metadata"]["atcc_reported_strategy"])
+        self.assertTrue(trace["metadata"]["paper_atcc_retry_feedback"])
+        self.assertEqual("paper-low-logical", trace["task_id"])
+
+    def test_paper_atcc_medium_all_agent_first_attempt_uses_native_optimistic(self):
+        manager = AgentTransactionManager()
+        manager.register_object("row", "0", kind="row")
+        task = AgentTask(
+            task_id="paper-medium-all-agent-native",
+            workload="ycsb",
+            task_type="read-update",
+            operations=(AgentOperation.read("row"),),
+            context={"level": "medium"},
+        )
+        planned = PlannedTask(
+            task=task,
+            phases=(PlannedPhase("explore", task.operations),),
+        )
+
+        result, action, _wait_s, diagnostics = run_agent_attempt(
+            manager,
+            planned,
+            "paper-atcc",
+            ttl_s=1.0,
+            jitter_ms=0,
+            retry_count=0,
+            background_workers=0,
+            config=MixedBenchmarkConfig(atcc_pure_policy=True),
+        )
+
+        self.assertTrue(result["committed"])
+        self.assertEqual("paper-action-0", action)
+        self.assertEqual(
+            "paper-medium-all-agent-native-optimistic",
+            diagnostics["runtime_fast_path"],
+        )
+        self.assertFalse(manager.paper_versioning_enabled)
+
+    def test_paper_atcc_tpcc_low_mixed_uses_native_optimistic_runtime(self):
+        manager = AgentTransactionManager()
+        manager.register_object("row", "0", kind="row")
+        task = AgentTask(
+            task_id="paper-tpcc-low-mixed",
+            workload="tpcc",
+            task_type="payment",
+            operations=(AgentOperation.read("row"),),
+            context={"level": "low"},
+        )
+        planned = PlannedTask(
+            task=task,
+            phases=(PlannedPhase("explore", task.operations),),
+        )
+
+        result, _action, _wait_s, diagnostics = run_agent_attempt(
+            manager,
+            planned,
+            "paper-atcc",
+            ttl_s=1.0,
+            jitter_ms=0,
+            retry_count=0,
+            background_workers=1,
+            config=MixedBenchmarkConfig(atcc_pure_policy=True),
+        )
+
+        self.assertTrue(result["committed"])
+        self.assertEqual("paper-low-native-occ", diagnostics["runtime_fast_path"])
+        self.assertFalse(manager.paper_versioning_enabled)
 
     def test_mixed_ycsb_medium_uses_write_validate_mvcc_fast_path(self):
         manager = AgentTransactionManager()

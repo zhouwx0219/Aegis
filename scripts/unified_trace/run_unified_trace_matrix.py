@@ -374,7 +374,10 @@ def main() -> int:
         )
     elif needs_legacy_policy and not policy_path.exists():
         raise SystemExit(f"missing policy with --skip-training: {policy_path}")
-    if "paper-atcc" in internal_ccs and args.paper_policy is None:
+    if any(
+        cc in {"paper-atcc", "paper-atcc-opt", "paper-atcc-oracle"}
+        for cc in internal_ccs
+    ) and args.paper_policy is None:
         raise SystemExit("paper-atcc requires --paper-policy")
 
     matrix = list(iter_matrix(variants, clients, agent_ratios, seeds))
@@ -479,7 +482,10 @@ def main() -> int:
                     internal_cmd.extend(["--policy", str(policy_path)])
                 if args.paper_policy is not None:
                     internal_cmd.extend(["--paper-policy", str(args.paper_policy.resolve())])
-                if trajectory_dir is not None and "paper-atcc" in internal_ccs:
+                if trajectory_dir is not None and any(
+                    cc in {"paper-atcc", "paper-atcc-opt", "paper-atcc-oracle"}
+                    for cc in internal_ccs
+                ):
                     internal_cmd.extend(
                         ["--trajectory-output", str(trajectory_dir / f"{trace_id}.json")]
                     )
@@ -1150,6 +1156,10 @@ def label_for(row: dict[str, Any]) -> str:
     cc = str(row.get("cc", "")).lower()
     if cc in {"dynamic-atcc", "paper-atcc"}:
         return "ATCC"
+    if cc == "paper-atcc-opt":
+        return "ATCC-Opt"
+    if cc == "paper-atcc-oracle":
+        return "ATCC-Oracle"
     if cc == "occ":
         return "OCC"
     if cc == "2pl-nowait":
