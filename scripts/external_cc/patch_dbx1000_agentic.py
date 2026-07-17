@@ -23,6 +23,7 @@ CONFIG_BLOCK = r"""
 #define CASTDAS_AGENT_LEVEL          0
 #define CASTDAS_REASONING_SCALE      1.0
 #define CASTDAS_RECORD_AGENT_STATS   true
+#define CASTDAS_RUN_SECONDS          3
 """
 
 
@@ -160,6 +161,11 @@ def main() -> int:
         help="Apply GCC 4.8 compatibility fixes used on node1.",
     )
     parser.add_argument(
+        "--plor",
+        action="store_true",
+        help="Patch the chenyoumin1993/Plor layout and native rundb driver.",
+    )
+    parser.add_argument(
         "--compiler",
         default="",
         help="Optional C++ compiler path to write into the external Makefile.",
@@ -169,11 +175,14 @@ def main() -> int:
     repo = args.repo.resolve()
     if not repo.exists():
         raise SystemExit(f"repo does not exist: {repo}")
-    patch_repo(repo, compat=args.compat, compiler=args.compiler)
+    patch_repo(repo, compat=args.compat, compiler=args.compiler, plor=args.plor)
     return 0
 
 
-def patch_repo(repo: Path, *, compat: bool, compiler: str = "") -> None:
+def patch_repo(repo: Path, *, compat: bool, compiler: str = "", plor: bool = False) -> None:
+    if plor:
+        patch_plor_repo(repo, compat=compat, compiler=compiler)
+        return
     normalize_schema_line_endings(repo)
     patch_config(repo / "config-std.h")
     write_if_changed(repo / "system" / "castdas_agentic.h", AGENTIC_HEADER)
@@ -184,6 +193,208 @@ def patch_repo(repo: Path, *, compat: bool, compiler: str = "") -> None:
     patch_makefile(repo / "Makefile", compat=compat, compiler=compiler)
     if compat:
         patch_static_asserts(repo / "config-std.h")
+
+
+def patch_plor_repo(repo: Path, *, compat: bool, compiler: str = "") -> None:
+    patch_plor_config(repo / "config.h")
+    write_if_changed(repo / "system" / "castdas_agentic.h", AGENTIC_HEADER)
+    patch_plor_stats(repo / "system" / "stats.h", repo / "system" / "stats.cpp")
+    patch_plor_thread(repo / "system" / "thread.cpp")
+    patch_plor_txn(repo / "system" / "txn.cpp")
+    patch_makefile(repo / "Makefile", compat=compat, compiler=compiler)
+
+
+def patch_plor_config(path: Path) -> None:
+    text = path.read_text()
+    if "CAST-DAS external benchmark adapter" in text:
+        return
+    marker = "// [PLOR]"
+    if marker not in text:
+        raise SystemExit(f"cannot find Plor configuration marker in {path}")
+    path.write_text(text.replace(marker, CONFIG_BLOCK + "\n" + marker, 1))
+
+
+def patch_plor_stats(header: Path, source: Path) -> None:
+    header_text = header.read_text()
+    if "castdas_agent_txn_cnt" not in header_text:
+        needle = "\tuint64_t abort_cnt;\n"
+        repl = (
+            needle +
+            "\tuint64_t castdas_agent_txn_cnt;\n"
+            "\tuint64_t castdas_agent_abort_cnt;\n"
+            "\tuint64_t castdas_background_txn_cnt;\n"
+            "\tuint64_t castdas_background_abort_cnt;\n"
+            "\tuint64_t castdas_agent_delay_ns;\n"
+        )
+        if needle not in header_text:
+            raise SystemExit(f"cannot patch Plor stats header in {header}")
+        header.write_text(header_text.replace(needle, repl, 1))
+
+    source_text = source.read_text()
+    if "total_castdas_agent_txn_cnt" in source_text:
+        ensure_plor_run_duration(source, source_text)
+        return
+    clear_needle = "\tabort_cnt = 0;\n"
+    clear_repl = (
+        clear_needle +
+        "\tcastdas_agent_txn_cnt = 0;\n"
+        "\tcastdas_agent_abort_cnt = 0;\n"
+        "\tcastdas_background_txn_cnt = 0;\n"
+        "\tcastdas_background_abort_cnt = 0;\n"
+        "\tcastdas_agent_delay_ns = 0;\n"
+    )
+    source_text, count = source_text.replace(clear_needle, clear_repl, 1), source_text.count(clear_needle)
+    if count == 0:
+        raise SystemExit(f"cannot initialize Plor CAST-DAS stats in {source}")
+    total_needle = "\tuint64_t total_abort_cnt = 0;\n"
+    total_repl = (
+        total_needle +
+        "\tuint64_t total_castdas_agent_txn_cnt = 0;\n"
+        "\tuint64_t total_castdas_agent_abort_cnt = 0;\n"
+        "\tuint64_t total_castdas_background_txn_cnt = 0;\n"
+        "\tuint64_t total_castdas_background_abort_cnt = 0;\n"
+        "\tuint64_t total_castdas_agent_delay_ns = 0;\n"
+    )
+    if total_needle not in source_text:
+        raise SystemExit(f"cannot add Plor CAST-DAS totals in {source}")
+    source_text = source_text.replace(total_needle, total_repl, 1)
+    sum_needle = "\t\ttotal_abort_cnt += _stats[tid]->abort_cnt;\n"
+    sum_repl = (
+        sum_needle +
+        "\t\ttotal_castdas_agent_txn_cnt += _stats[tid]->castdas_agent_txn_cnt;\n"
+        "\t\ttotal_castdas_agent_abort_cnt += _stats[tid]->castdas_agent_abort_cnt;\n"
+        "\t\ttotal_castdas_background_txn_cnt += _stats[tid]->castdas_background_txn_cnt;\n"
+        "\t\ttotal_castdas_background_abort_cnt += _stats[tid]->castdas_background_abort_cnt;\n"
+        "\t\ttotal_castdas_agent_delay_ns += _stats[tid]->castdas_agent_delay_ns;\n"
+    )
+    if sum_needle not in source_text:
+        raise SystemExit(f"cannot sum Plor CAST-DAS stats in {source}")
+    source_text = source_text.replace(sum_needle, sum_repl, 1)
+    format_needle = "fprintf(outf, \"[summary] txn_cnt=%ld, abort_cnt=%ld\""
+    format_repl = (
+        "fprintf(outf, \"[summary] txn_cnt=%ld, abort_cnt=%ld\"\n"
+        "\t\t\t\", castdas_agent_txn_cnt=%ld, castdas_agent_abort_cnt=%ld\"\n"
+        "\t\t\t\", castdas_background_txn_cnt=%ld, castdas_background_abort_cnt=%ld\"\n"
+        "\t\t\t\", castdas_agent_delay_ns=%ld\""
+    )
+    if format_needle not in source_text:
+        raise SystemExit(f"cannot add Plor CAST-DAS summary fields in {source}")
+    source_text = source_text.replace(format_needle, format_repl, 1)
+    args_needle = "\t\t\ttotal_abort_cnt,\n"
+    args_repl = (
+        args_needle +
+        "\t\t\ttotal_castdas_agent_txn_cnt,\n"
+        "\t\t\ttotal_castdas_agent_abort_cnt,\n"
+        "\t\t\ttotal_castdas_background_txn_cnt,\n"
+        "\t\t\ttotal_castdas_background_abort_cnt,\n"
+        "\t\t\ttotal_castdas_agent_delay_ns,\n"
+    )
+    if args_needle not in source_text:
+        raise SystemExit(f"cannot add Plor CAST-DAS summary values in {source}")
+    source_text = source_text.replace(args_needle, args_repl, 1)
+    ensure_plor_run_duration(source, source_text)
+
+
+def ensure_plor_run_duration(path: Path, text: str) -> None:
+    if "sleep(CASTDAS_RUN_SECONDS);" in text:
+        return
+    duration_needle = "\tsleep(3);\n"
+    if duration_needle not in text:
+        raise SystemExit(f"cannot configure Plor run duration in {path}")
+    path.write_text(text.replace(duration_needle, "\tsleep(CASTDAS_RUN_SECONDS);\n", 1))
+
+
+def patch_plor_thread(path: Path) -> None:
+    text = path.read_text()
+    if '"castdas_agentic.h"' not in text:
+        text = text.replace('#include "test.h"\n', '#include "test.h"\n#include "castdas_agentic.h"\n', 1)
+    if "castdas_agent_pre_exec_delay_ms" not in text:
+        pattern = re.compile(r"(\s*if \(rc == RCOK\)\s*\n\s*\{\n)(\s*// scoped_rcu_region guard;)")
+        repl = (
+            r"\1"
+            "#if CASTDAS_AGENTIC\n"
+            "\t\t\tuint32_t castdas_pre_delay_ms = castdas_agent_pre_exec_delay_ms(\n"
+            "\t\t\t\tget_thd_id(), m_txn->get_txn_id(), m_txn->abort_cnt);\n"
+            "\t\t\tcastdas_sleep_ms(castdas_pre_delay_ms);\n"
+            "\t\t\tif (CASTDAS_RECORD_AGENT_STATS && castdas_pre_delay_ms > 0)\n"
+            "\t\t\t\tstats._stats[get_thd_id()]->castdas_agent_delay_ns +=\n"
+            "\t\t\t\t\t((uint64_t) castdas_pre_delay_ms) * 1000000UL;\n"
+            "#endif\n"
+            r"\2"
+        )
+        text, count = pattern.subn(repl, text, count=1)
+        if count != 1:
+            raise SystemExit(f"cannot add Plor pre-execution delay in {path}")
+    if "castdas_agent_txn_cnt" not in text:
+        commit_needle = "\t\t\ttxn_cnt ++;\n"
+        commit_repl = (
+            commit_needle +
+            "#if CASTDAS_AGENTIC\n"
+            "\t\t\tif (CASTDAS_RECORD_AGENT_STATS) {\n"
+            "\t\t\t\tif (castdas_is_agent_thread(get_thd_id()))\n"
+            "\t\t\t\t\tstats._stats[get_thd_id()]->castdas_agent_txn_cnt += 1;\n"
+            "\t\t\t\telse\n"
+            "\t\t\t\t\tstats._stats[get_thd_id()]->castdas_background_txn_cnt += 1;\n"
+            "\t\t\t}\n"
+            "#endif\n"
+        )
+        abort_needle = "\t\t\tINC_STATS(get_thd_id(), abort_cnt, 1);\n"
+        abort_repl = (
+            abort_needle +
+            "#if CASTDAS_AGENTIC\n"
+            "\t\t\tif (CASTDAS_RECORD_AGENT_STATS) {\n"
+            "\t\t\t\tif (castdas_is_agent_thread(get_thd_id()))\n"
+            "\t\t\t\t\tstats._stats[get_thd_id()]->castdas_agent_abort_cnt += 1;\n"
+            "\t\t\t\telse\n"
+            "\t\t\t\t\tstats._stats[get_thd_id()]->castdas_background_abort_cnt += 1;\n"
+            "\t\t\t}\n"
+            "#endif\n"
+        )
+        if commit_needle not in text or abort_needle not in text:
+            raise SystemExit(f"cannot add Plor commit or abort counters in {path}")
+        text = text.replace(commit_needle, commit_repl, 1).replace(abort_needle, abort_repl, 1)
+    if "castdas_retry_delay_ms" not in text:
+        retry_needle = "\t\t\tm_query->abort_cnt += 1;\n"
+        retry_repl = (
+            retry_needle +
+            "#if CASTDAS_AGENTIC\n"
+            "\t\t\tuint32_t castdas_retry_delay_ms = castdas_agent_phase_delay_ms(\n"
+            "\t\t\t\tget_thd_id(), m_txn->get_txn_id(), m_query->abort_cnt, CASTDAS_PHASE_RETRY);\n"
+            "\t\t\tcastdas_sleep_ms(castdas_retry_delay_ms);\n"
+            "\t\t\tif (CASTDAS_RECORD_AGENT_STATS && castdas_retry_delay_ms > 0)\n"
+            "\t\t\t\tstats._stats[get_thd_id()]->castdas_agent_delay_ns +=\n"
+            "\t\t\t\t\t((uint64_t) castdas_retry_delay_ms) * 1000000UL;\n"
+            "#endif\n"
+        )
+        if retry_needle not in text:
+            raise SystemExit(f"cannot add Plor retry delay in {path}")
+        text = text.replace(retry_needle, retry_repl, 1)
+    path.write_text(text)
+
+
+def patch_plor_txn(path: Path) -> None:
+    text = path.read_text()
+    if '"castdas_agentic.h"' not in text:
+        text = text.replace('#include "row_hlock.h"\n', '#include "row_hlock.h"\n#include "castdas_agentic.h"\n', 1)
+    if "castdas_commit_delay_ms" not in text:
+        pattern = re.compile(r"(RC txn_man::finish\(RC rc\) \{\n#if CC_ALG == HSTORE\n\s*return RCOK;\n#endif\n)")
+        repl = (
+            r"\1"
+            "#if CASTDAS_AGENTIC\n"
+            "\tif (rc == RCOK && castdas_is_agent_thread(get_thd_id())) {\n"
+            "\t\tuint32_t castdas_commit_delay_ms = castdas_agent_phase_delay_ms(\n"
+            "\t\t\tget_thd_id(), get_txn_id(), abort_cnt, CASTDAS_PHASE_COMMIT);\n"
+            "\t\tcastdas_sleep_ms(castdas_commit_delay_ms);\n"
+            "\t\tif (CASTDAS_RECORD_AGENT_STATS && castdas_commit_delay_ms > 0)\n"
+            "\t\t\tstats._stats[get_thd_id()]->castdas_agent_delay_ns +=\n"
+            "\t\t\t\t((uint64_t) castdas_commit_delay_ms) * 1000000UL;\n"
+            "\t}\n"
+            "#endif\n"
+        )
+        text, count = pattern.subn(repl, text, count=1)
+        if count != 1:
+            raise SystemExit(f"cannot add Plor commit delay in {path}")
+    path.write_text(text)
 
 
 def normalize_schema_line_endings(repo: Path) -> None:
