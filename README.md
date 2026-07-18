@@ -82,7 +82,7 @@ python3 -m agent.cli.mixed \
   --cc occ,dynamic-atcc \
   --duration 5 \
   --clients 48 \
-  --agent-ratio 0.8 \
+  --agent-ratio 1.0 \
   --retry-until-commit
 ```
 
