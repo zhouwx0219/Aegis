@@ -120,7 +120,7 @@ python3 -m agent.cli.matrix \
   --workload-profile paper \
   --zipfian 0.8 \
   --client-counts 8,16,24,32,40,48 \
-  --agent-ratio 0.8 \
+  --agent-ratio 1.0 \
   --background-mode procedure \
   --retry-until-commit \
   --duration 5 \
