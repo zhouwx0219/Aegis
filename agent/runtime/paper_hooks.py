@@ -40,9 +40,7 @@ class PaperATCCHooks(NoopTransactionHooks):
 
     @classmethod
     def mark_online_bypass_read(cls, txn: Any, object_id: str) -> None:
-        if cls.online_ycsb_high_mixed(txn) and txn.metadata.get(
-            "paper_atcc_optimized", False
-        ):
+        if cls.online_ycsb_high_mixed(txn):
             txn.metadata.setdefault("_online_bypass_read_targets", set()).add(
                 str(object_id)
             )
@@ -61,7 +59,6 @@ class PaperATCCHooks(NoopTransactionHooks):
         # All classification below is based on operations already executed.
         txn.metadata["_version_risk_exact_mode"] = bool(
             self.online_observed(txn)
-            and txn.metadata.get("paper_atcc_optimized", False)
         )
         txn.metadata["_version_risk_read_targets"] = ()
         txn.metadata["_cold_occ_fast_task"] = False
@@ -323,9 +320,8 @@ class PaperATCCHooks(NoopTransactionHooks):
             return
         if exact_write or category_write_protected:
             self.manager.refresh_atcc_priority(txn)
-            # In strict paper mode, selecting a write class means acquiring
-            # its WLock when the object is accessed, independent of phase.
-            # Only paper-atcc-opt may defer that acquisition to commit.
+            # Exact retry writes acquire their WLock immediately. Category
+            # write protection is deferred to the short commit admission.
             if key in txn.read_set:
                 snapshot = txn.snapshot[key]
                 self.manager.atcc_locks.validate_and_wlock(
@@ -736,7 +732,6 @@ class PaperATCCHooks(NoopTransactionHooks):
             and txn.context.retry_count <= 0
             and bool(
                 txn.metadata.get("_defer_policy_write_locks", False)
-                or txn.metadata.get("paper_atcc_optimized", False)
             )
         ):
             # This is an optimized-path pressure guard, not paper policy

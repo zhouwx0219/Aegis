@@ -21,6 +21,8 @@ results/
 .mypy_cache/
 third_party/
 .ruff_cache/
+
+tests/
 .DS_Store
 Thumbs.db
 *.swp

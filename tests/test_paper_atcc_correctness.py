@@ -21,7 +21,6 @@ from agent.runtime import (
     TransactionStatus,
 )
 from agent.runtime.paper_hooks import PaperATCCHooks
-from agent.runtime.transaction import use_targeted_paper_atcc_optimization
 
 
 cc = load_cast_core()
@@ -185,40 +184,11 @@ class PaperATCCCorrectnessStressTests(unittest.TestCase):
             [CompiledPolicyEntry(phase="refine", action=15)], generation=1
         )
 
-    def test_targeted_optimization_is_limited_to_mixed_ycsb_high(self):
-        base = {
-            "workload": "ycsb",
-            "context": {"level": "high"},
-            "agentic": {"background_workers": 8},
-        }
-
-        self.assertTrue(
-            use_targeted_paper_atcc_optimization(base, strategy_name="paper-atcc")
-        )
-        self.assertTrue(
-            use_targeted_paper_atcc_optimization(
-                base, strategy_name="paper-atcc-oracle"
-            )
-        )
-        self.assertFalse(
-            use_targeted_paper_atcc_optimization(
-                {**base, "agentic": {"background_workers": 0}},
-                strategy_name="paper-atcc",
-            )
-        )
-        self.assertFalse(
-            use_targeted_paper_atcc_optimization(
-                {**base, "workload": "tpcc"},
-                strategy_name="paper-atcc",
-            )
-        )
-
     def test_tpcc_high_all_agent_first_attempt_keeps_exact_only_action(self):
         hooks = PaperATCCHooks(SimpleNamespace(low_conflict_occ_guard=True))
         txn = SimpleNamespace(
             metadata={
                 "workload": "tpcc",
-                "paper_atcc_optimized": True,
                 "context": {"level": "high"},
                 "agentic": {"background_workers": 0},
             },
@@ -356,7 +326,6 @@ class PaperATCCCorrectnessStressTests(unittest.TestCase):
         txn = SimpleNamespace(
             metadata={
                 "workload": "tpcc",
-                "paper_atcc_optimized": True,
                 "context": {"level": "high"},
                 "agentic": {"background_workers": 0},
             },
@@ -415,7 +384,6 @@ class PaperATCCCorrectnessStressTests(unittest.TestCase):
         txn = SimpleNamespace(
             metadata={
                 "workload": "ycsb",
-                "paper_atcc_optimized": True,
                 "context": {"level": "high"},
                 "agentic": {"background_workers": 6},
             }
@@ -480,7 +448,6 @@ class PaperATCCCorrectnessStressTests(unittest.TestCase):
             "online-agent",
             {
                 "paper_atcc": True,
-                "paper_atcc_optimized": True,
                 "access_set_visibility": "online_observed",
                 "workload": "ycsb",
                 "context": {"level": "high"},
@@ -520,7 +487,6 @@ class PaperATCCCorrectnessStressTests(unittest.TestCase):
             "online-cycle-agent",
             {
                 "paper_atcc": True,
-                "paper_atcc_optimized": True,
                 "access_set_visibility": "online_observed",
                 "workload": "ycsb",
                 "context": {"level": "high"},
@@ -754,7 +720,6 @@ class PaperATCCCorrectnessStressTests(unittest.TestCase):
             "tpcc-low-exact-root",
             {
                 "paper_atcc": True,
-                "paper_atcc_optimized": True,
                 "workload": "tpcc",
                 "context": {"level": "low"},
                 "access_set_visibility": "online_observed",
@@ -770,7 +735,7 @@ class PaperATCCCorrectnessStressTests(unittest.TestCase):
         self.assertNotIn(customer, agent.context.held_write_locks)
         agent.write(district, "1")
         agent.write(customer, "1")
-        self.assertTrue(agent.commit("paper-atcc-opt").committed)
+        self.assertTrue(agent.commit("paper-atcc").committed)
 
     def test_native_low_conflict_abort_feeds_exact_paper_retry_protection(self):
         manager = AgentTransactionManager(low_conflict_occ_guard=True)
@@ -801,7 +766,6 @@ class PaperATCCCorrectnessStressTests(unittest.TestCase):
             "tpcc-low-logical",
             {
                 "paper_atcc": True,
-                "paper_atcc_optimized": True,
                 "workload": "tpcc",
                 "context": {"level": "low"},
                 "retry_count": 1,
@@ -886,7 +850,7 @@ class PaperATCCCorrectnessStressTests(unittest.TestCase):
         )
         agent.write(district, "1")
 
-        self.assertTrue(agent.commit("paper-atcc-opt").committed)
+        self.assertTrue(agent.commit("paper-atcc").committed)
         self.assertEqual(
             {district, warehouse},
             agent.metadata["_tpcc_late_protected_targets"],
@@ -1040,7 +1004,6 @@ class PaperATCCCorrectnessStressTests(unittest.TestCase):
             "deferred-policy-write",
             {
                 "paper_atcc": True,
-                "paper_atcc_optimized": True,
                 "planned_write_targets": ["row"],
                 "commit_admission_write_protection": True,
             },
@@ -1051,7 +1014,7 @@ class PaperATCCCorrectnessStressTests(unittest.TestCase):
         self.assertNotIn("row", agent.context.held_write_locks)
         agent.write("row", "1")
 
-        result = agent.commit("paper-atcc-opt")
+        result = agent.commit("paper-atcc")
 
         self.assertTrue(result.committed)
         self.assertEqual("1", manager.store.get("row").value)
@@ -1339,7 +1302,6 @@ class PaperATCCCorrectnessStressTests(unittest.TestCase):
             "agent-reader",
             {
                 "paper_atcc": True,
-                "paper_atcc_optimized": True,
                 "planned_write_targets": [],
             },
             snapshot_object_ids=("row",),
@@ -1359,7 +1321,7 @@ class PaperATCCCorrectnessStressTests(unittest.TestCase):
         fresh = manager.begin("fresh-reader")
         self.assertEqual("1", fresh.read("row").value)
         self.assertTrue(fresh.commit("occ").committed)
-        self.assertTrue(agent.commit("paper-atcc-opt").committed)
+        self.assertTrue(agent.commit("paper-atcc").committed)
         diagnostics = manager.atcc_locks.snapshot_diagnostics()
         self.assertEqual(1, diagnostics["background_fast_publishes"])
         self.assertEqual(0, diagnostics["background_publish_fallbacks"])
@@ -1370,7 +1332,7 @@ class PaperATCCCorrectnessStressTests(unittest.TestCase):
         manager.register_object("background-row", "0", kind="row")
         agent = manager.begin(
             "agent-reader",
-            {"paper_atcc": True, "paper_atcc_optimized": True},
+            {"paper_atcc": True},
             snapshot_object_ids=("agent-row",),
         )
         self.assertEqual("0", agent.read("agent-row").value)
@@ -1390,9 +1352,9 @@ class PaperATCCCorrectnessStressTests(unittest.TestCase):
         self.assertEqual(0, versions["native_publish_pin_fallbacks"])
         self.assertEqual(1, versions["private_prepares"])
         self.assertEqual(1, versions["atomic_publishes"])
-        self.assertTrue(agent.commit("paper-atcc-opt").committed)
+        self.assertTrue(agent.commit("paper-atcc").committed)
 
-    def test_ycsb_high_exact_predictor_is_optimized_ablation_only(self):
+    def test_ycsb_high_exact_predictor_uses_unified_aegis_policy(self):
         manager = AgentTransactionManager(paper_policy=self.full_lock_policy())
         for object_id in ("a", "b", "c"):
             manager.register_object(object_id, "0", kind="row")
@@ -1413,7 +1375,6 @@ class PaperATCCCorrectnessStressTests(unittest.TestCase):
             "ycsb-high-risk-reader",
             {
                 "paper_atcc": True,
-                "paper_atcc_optimized": True,
                 "workload": "ycsb",
                 "context": {"level": "high"},
                 "planned_write_targets": [],
@@ -1432,14 +1393,7 @@ class PaperATCCCorrectnessStressTests(unittest.TestCase):
         self.assertEqual({"a", "b", "c"}, agent.context.held_read_locks)
         predictor_action = agent.context.action.protected
         self.assertNotEqual(LockClass.NONE, predictor_action)
-        self.assertEqual(
-            LockClass.HOT_READ | LockClass.COLD_READ,
-            agent.context.action.protected,
-        )
-        self.assertFalse(
-            agent.context.action.protected
-            & (LockClass.HOT_WRITE | LockClass.COLD_WRITE)
-        )
+        self.assertEqual(LockClass(15), agent.context.action.protected)
         self.assertEqual(
             predictor_action,
             predictor_action & agent.context.action.protected,
@@ -1461,11 +1415,14 @@ class PaperATCCCorrectnessStressTests(unittest.TestCase):
             },
         )
         background.write("a", "after-pin")
-        self.assertFalse(background.commit("occ").committed)
+        # The unified Aegis path uses the former optimized publisher bypass:
+        # the committed update may publish while the reader retains its
+        # pinned historical version.
+        self.assertTrue(background.commit("occ").committed)
         self.assertTrue(agent.commit("paper-atcc").committed)
         self.assertEqual(set(), agent.context.held_read_locks)
 
-    def test_strict_retry_action_locks_read_and_write_objects_at_access(self):
+    def test_retry_action_locks_read_and_write_objects_at_access(self):
         manager = AgentTransactionManager()
         manager.register_object("risk-read", "0", kind="row")
         manager.register_object("deferred-write", "0", kind="row")
@@ -1495,7 +1452,7 @@ class PaperATCCCorrectnessStressTests(unittest.TestCase):
             snapshot_object_ids=("risk-read", "deferred-write"),
         )
         self.assertEqual(
-            0, manager.version_manager.snapshot_diagnostics()["pinned_transactions"]
+            1, manager.version_manager.snapshot_diagnostics()["pinned_transactions"]
         )
         agent.read("risk-read")
         agent.write("deferred-write", "1")
@@ -1529,7 +1486,6 @@ class PaperATCCCorrectnessStressTests(unittest.TestCase):
             "pinned-reader",
             {
                 "paper_atcc": True,
-                "paper_atcc_optimized": True,
                 "workload": "ycsb",
                 "context": {"level": "high"},
                 "planned_write_targets": [],
@@ -1552,7 +1508,7 @@ class PaperATCCCorrectnessStressTests(unittest.TestCase):
         writer.write("risk-read", "agent-value")
         self.assertTrue(writer.commit("paper-atcc").committed)
 
-        result = reader.commit("paper-atcc-opt")
+        result = reader.commit("paper-atcc")
 
         self.assertFalse(result.committed)
         self.assertIn("risk-read", result.conflict_object_ids)
@@ -1572,7 +1528,6 @@ class PaperATCCCorrectnessStressTests(unittest.TestCase):
             "agent-read-a-write-b",
             {
                 "paper_atcc": True,
-                "paper_atcc_optimized": True,
                 "planned_write_targets": ["b"],
             },
             snapshot_object_ids=("a", "b"),
@@ -1596,7 +1551,7 @@ class PaperATCCCorrectnessStressTests(unittest.TestCase):
         background.write("a", "background")
         self.assertTrue(background.commit("occ").committed)
 
-        result = agent.commit("paper-atcc-opt")
+        result = agent.commit("paper-atcc")
 
         self.assertFalse(result.committed)
         self.assertIn("a", result.conflict_object_ids)
@@ -1615,7 +1570,6 @@ class PaperATCCCorrectnessStressTests(unittest.TestCase):
             "tpcc-late-protection",
             {
                 "paper_atcc": True,
-                "paper_atcc_optimized": True,
                 "workload": "tpcc",
                 "context": {"level": "high"},
                 "planned_write_targets": list(targets),
@@ -1627,7 +1581,7 @@ class PaperATCCCorrectnessStressTests(unittest.TestCase):
             agent.read(object_id)
             agent.write(object_id, "1")
 
-        self.assertTrue(agent.commit("paper-atcc-opt").committed)
+        self.assertTrue(agent.commit("paper-atcc").committed)
         self.assertEqual(
             set(targets[:2]),
             agent.metadata["_tpcc_late_protected_targets"],
@@ -1643,7 +1597,6 @@ class PaperATCCCorrectnessStressTests(unittest.TestCase):
             "pinned-agent",
             {
                 "paper_atcc": True,
-                "paper_atcc_optimized": True,
                 "planned_write_targets": [],
             },
             snapshot_object_ids=("a", "b"),
@@ -1667,7 +1620,7 @@ class PaperATCCCorrectnessStressTests(unittest.TestCase):
             (fresh.read("a").value, fresh.read("b").value),
         )
         self.assertTrue(fresh.commit("occ").committed)
-        self.assertTrue(agent.commit("paper-atcc-opt").committed)
+        self.assertTrue(agent.commit("paper-atcc").committed)
         versions = manager.version_manager.snapshot_diagnostics()
         self.assertGreaterEqual(versions["atomic_publishes"], 1)
         self.assertEqual(0, versions["private_transactions"])
@@ -1905,7 +1858,6 @@ class PaperATCCCorrectnessStressTests(unittest.TestCase):
             "agent-blind",
             {
                 "paper_atcc": True,
-                "paper_atcc_optimized": True,
                 "workload": "ycsb",
                 "context": {"level": "high"},
                 "planned_write_targets": ["row"],
@@ -1921,14 +1873,14 @@ class PaperATCCCorrectnessStressTests(unittest.TestCase):
         background.write("row", "1")
         self.assertTrue(background.commit("occ").committed)
 
-        result = agent.commit("paper-atcc-opt")
+        result = agent.commit("paper-atcc")
 
         self.assertTrue(result.committed)
         self.assertEqual("2", manager.store.get("row").value)
         diagnostics = manager.atcc_locks.snapshot_diagnostics()
         self.assertEqual(1, diagnostics["agent_blind_write_rebases"])
 
-    def test_strict_agent_blind_write_validates_recorded_version(self):
+    def test_agent_blind_write_rebases_recorded_version(self):
         manager = AgentTransactionManager()
         manager.register_object("row", "0", kind="row")
         agent = manager.begin(
@@ -1949,10 +1901,10 @@ class PaperATCCCorrectnessStressTests(unittest.TestCase):
 
         result = agent.commit("paper-atcc")
 
-        self.assertFalse(result.committed)
-        self.assertEqual("background", manager.store.get("row").value)
+        self.assertTrue(result.committed)
+        self.assertEqual("agent", manager.store.get("row").value)
         self.assertEqual(
-            0,
+            1,
             manager.atcc_locks.snapshot_diagnostics().get(
                 "agent_blind_write_rebases", 0
             ),

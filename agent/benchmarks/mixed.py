@@ -2097,24 +2097,15 @@ def mixed_transaction_metadata(
     decision: Any = None,
 ) -> Dict[str, Any]:
     access_set_visibility = paper_access_set_visibility(strategy)
-    declared_write_targets = (
-        list(operation_write_targets(planned.task))
-        if access_set_visibility == "full_trace_oracle"
-        else []
-    )
     metadata: Dict[str, Any] = {
         "workload": planned.task.workload,
         "task_type": planned.task.task_type,
         "strategy": str(strategy),
         "context": dict(planned.task.context),
         "retry_count": int(retry_count),
-        "planned_write_targets": declared_write_targets,
+        "planned_write_targets": [],
         "access_set_visibility": access_set_visibility,
-        # The paper action means that a selected write class acquires WLock at
-        # access time. Commit-only write admission is an explicitly named
-        # optimization and must not change strict paper-atcc action semantics.
-        "commit_admission_write_protection": str(strategy) == "paper-atcc-opt",
-        "paper_atcc_optimized": str(strategy) == "paper-atcc-opt",
+        "commit_admission_write_protection": str(strategy) == "paper-atcc",
         "agentic": {
             "phase_count": planned.phase_count,
             "reasoning_delay_ms": planned.total_reasoning_delay_ms,
@@ -2128,11 +2119,8 @@ def mixed_transaction_metadata(
 
 
 def paper_access_set_visibility(strategy: str) -> str:
-    return (
-        "full_trace_oracle"
-        if str(strategy).strip().lower() == "paper-atcc-oracle"
-        else "online_observed"
-    )
+    _ = strategy
+    return "online_observed"
 
 
 def atcc_decision_diagnostics(action: str, decision: Any) -> Dict[str, Any]:
@@ -2280,12 +2268,7 @@ def begin_planned_transaction(
     return manager.begin(
         str(metadata.get("transaction_id", "") or planned.task.task_id),
         metadata,
-        snapshot_object_ids=(
-            task_targets(planned.task)
-            if str(metadata.get("access_set_visibility", ""))
-            == "full_trace_oracle"
-            else None
-        ),
+        snapshot_object_ids=None,
         strategy=str(metadata.get("strategy", "") or metadata.get("cc", "") or "occ"),
     )
 
@@ -2599,7 +2582,6 @@ def background_worker(
                 }
                 if getattr(manager.cc_registry.resolve(strategy), "family", "") == "paper-atcc":
                     metadata["paper_atcc_backend"] = True
-                    metadata["paper_atcc_optimized"] = strategy == "paper-atcc-opt"
                 txn_id = f"bg-{worker}-{task.task_id}-{rng.randrange(10_000_000)}"
                 owner = SimpleNamespace(started_at=time.perf_counter()) if defer_begin_until_guarded else None
                 with background_write_guard(
@@ -2626,7 +2608,6 @@ def background_worker(
                 }
                 if getattr(manager.cc_registry.resolve(strategy), "family", "") == "paper-atcc":
                     metadata["paper_atcc_backend"] = True
-                    metadata["paper_atcc_optimized"] = strategy == "paper-atcc-opt"
                 txn_id = f"bg-{worker}-{rng.randrange(10_000_000)}"
                 owner = SimpleNamespace(started_at=time.perf_counter()) if defer_begin_until_guarded else None
                 with background_write_guard(

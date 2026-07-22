@@ -938,20 +938,19 @@ class CompareCliTests(unittest.TestCase):
 
         self.assertAlmostEqual(0.35, scores[0] - scores[1])
 
-    def test_registry_exposes_distinct_paper_atcc_runtime(self):
+    def test_registry_exposes_only_unified_paper_atcc_runtime(self):
         registry = ConcurrencyControlRegistry()
-        strict = registry.resolve("paper-atcc")
-        optimized = registry.resolve("paper-atcc-opt")
-        oracle = registry.resolve("paper-atcc-oracle")
-        self.assertEqual("paper-atcc", strict.family)
-        self.assertEqual("paper-atcc", optimized.family)
-        self.assertEqual("paper-atcc", oracle.family)
-        self.assertFalse(strict.plan(SimpleNamespace()).metadata.get("paper_atcc_optimized", False))
-        self.assertTrue(optimized.plan(SimpleNamespace()).metadata["paper_atcc_optimized"])
-        self.assertNotIn("paper-atcc-opt", registry.expand("all"))
-        self.assertNotIn("paper-atcc-oracle", registry.expand("all"))
+        aegis = registry.resolve("paper-atcc")
+        self.assertEqual("paper-atcc", aegis.family)
+        self.assertTrue(
+            aegis.plan(SimpleNamespace()).metadata["commit_admission_write_protection"]
+        )
+        with self.assertRaises(ValueError):
+            registry.resolve("paper-atcc" + "-opt")
+        with self.assertRaises(ValueError):
+            registry.resolve("paper-atcc" + "-oracle")
 
-    def test_paper_main_hides_future_access_set_and_oracle_retains_it(self):
+    def test_paper_atcc_hides_future_access_set(self):
         task = AgentTask(
             task_id="online-access",
             workload="ycsb",
@@ -973,27 +972,14 @@ class CompareCliTests(unittest.TestCase):
             background_workers=8,
             strategy="paper-atcc",
         )
-        oracle = mixed_transaction_metadata(
-            planned,
-            retry_count=0,
-            background_workers=8,
-            strategy="paper-atcc-oracle",
-        )
-
         self.assertEqual("online_observed", online["access_set_visibility"])
         self.assertEqual([], online["planned_write_targets"])
-        self.assertEqual("full_trace_oracle", oracle["access_set_visibility"])
-        self.assertEqual(["write-row"], oracle["planned_write_targets"])
+        self.assertTrue(online["commit_admission_write_protection"])
 
         manager = mock.Mock()
         manager.begin.return_value = object()
         begin_planned_transaction(manager, planned, online)
         self.assertIsNone(manager.begin.call_args.kwargs["snapshot_object_ids"])
-        begin_planned_transaction(manager, planned, oracle)
-        self.assertEqual(
-            ("read-row", "write-row"),
-            manager.begin.call_args.kwargs["snapshot_object_ids"],
-        )
 
     def test_background_row_defers_conflict_to_next_trace_cycle(self):
         first = mock.Mock()

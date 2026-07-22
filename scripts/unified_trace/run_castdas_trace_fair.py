@@ -468,7 +468,7 @@ def run_trace(
     if quantum_scale <= 0.0:
         raise ValueError("priority quantum scale must be positive")
     if paper_exploration_seed is not None:
-        if cc not in {"paper-atcc", "paper-atcc-opt", "paper-atcc-oracle"}:
+        if cc != "paper-atcc":
             raise ValueError("paper exploration is only valid for paper-atcc")
         if paper_policy is not None:
             epsilon = float(paper_exploration_epsilon)
@@ -499,11 +499,8 @@ def run_trace(
         record_traces=False,
         paper_policy=compiled_policy,
         collect_trajectories=trajectory_output is not None or paper_exploration_seed is not None,
-        # Deterministic cold-path overrides change the sampled action and its
-        # propensity. Keep them confined to the explicit optimized ablation;
-        # the paper and oracle paths execute the policy action unchanged.
-        low_conflict_occ_guard=cc == "paper-atcc-opt",
-        performance_guards_enabled=cc == "paper-atcc-opt",
+        low_conflict_occ_guard=cc == "paper-atcc",
+        performance_guards_enabled=cc == "paper-atcc",
         commit_admission_priority_enabled=bool(paper_commit_admission_priority),
         delayed_write_apply_enabled=(
             str(paper_delayed_write_apply).strip().lower() == "enabled"
@@ -526,19 +523,6 @@ def run_trace(
         all_rows.extend(warmup_rows)
     for object_id in sorted(trace_object_ids(all_rows)):
         manager.register_object(object_id, "0", kind="row")
-    if cc == "paper-atcc-oracle":
-        # Explicit oracle ablation only. The paper main path learns hotness
-        # from actual warmup/measurement accesses and never scans future rows.
-        manager.hotness_tracker.prime_accesses(
-            operation.object_id
-            for row in all_rows
-            for operation in row["_task"].operations
-        )
-        for row in all_rows:
-            manager.hotness_tracker.prime_transaction(
-                operation.object_id for operation in row["_task"].operations
-            )
-
     if warmup_rows:
         run_rows(
             manager,
@@ -563,11 +547,7 @@ def run_trace(
         execution_workers=execution_workers,
     )
     result = result_row(sample, cc, counters, elapsed_s, tokens_per_operation, rows, manager)
-    if trajectory_output is not None and cc in {
-        "paper-atcc",
-        "paper-atcc-opt",
-        "paper-atcc-oracle",
-    }:
+    if trajectory_output is not None and cc == "paper-atcc":
         transitions = [
             {
                 **dataclasses.asdict(transition),
@@ -860,7 +840,7 @@ def paper_background_batch_size(
 
     registry = getattr(manager, "cc_registry", None)
     resolve = getattr(registry, "resolve", None)
-    if not callable(resolve) or getattr(resolve(cc), "name", "") != "paper-atcc-opt":
+    if not callable(resolve) or getattr(resolve(cc), "name", "") != "paper-atcc":
         return 1
     if int(config.background_workers) <= 0:
         return 1
@@ -1416,7 +1396,7 @@ def run_background_row(
     paper_atcc = getattr(manager.cc_registry.resolve(cc), "family", "") == "paper-atcc"
     online_reader_bypass = bool(
         paper_atcc
-        and str(cc).strip().lower() == "paper-atcc-opt"
+        and str(cc).strip().lower() == "paper-atcc"
         and str(config.workload).strip().lower() == "ycsb"
         and str(config.level).strip().lower() == "high"
         and int(config.background_workers) > 0
@@ -1501,7 +1481,6 @@ def run_background_row(
                 }
                 if paper_atcc:
                     metadata["paper_atcc_backend"] = True
-                    metadata["paper_atcc_optimized"] = cc == "paper-atcc-opt"
                     metadata["access_set_visibility"] = (
                         "stored_procedure_declared"
                     )
@@ -1523,13 +1502,13 @@ def run_background_row(
             if txn is not None:
                 manager.atcc_locks.release_all(txn.context)
             committed = False
-            defer_current_update = str(cc).strip().lower() == "paper-atcc-opt"
+            defer_current_update = str(cc).strip().lower() == "paper-atcc"
 
         attempts_done += 1
         if committed:
             break
         aborts_done += 1
-        if str(cc).strip().lower() == "paper-atcc-opt":
+        if str(cc).strip().lower() == "paper-atcc":
             manager.note_background_abort()
             # A conflicting short update is deferred to the next trace cycle
             # so this worker can schedule a disjoint row.  Retrying the same
@@ -2180,7 +2159,7 @@ def paper_agent_admission_cap(
 
     registry = getattr(manager, "cc_registry", None)
     resolve = getattr(registry, "resolve", None)
-    if not callable(resolve) or getattr(resolve(cc), "name", "") != "paper-atcc-opt":
+    if not callable(resolve) or getattr(resolve(cc), "name", "") != "paper-atcc":
         return int(agent_worker_count)
     workload = str(config.workload).strip().lower()
     if workload == "ycsb" and int(config.background_workers) == 0:
@@ -2209,7 +2188,7 @@ def paper_background_admission_cap(
 
     registry = getattr(manager, "cc_registry", None)
     resolve = getattr(registry, "resolve", None)
-    if not callable(resolve) or getattr(resolve(cc), "name", "") != "paper-atcc-opt":
+    if not callable(resolve) or getattr(resolve(cc), "name", "") != "paper-atcc":
         return int(background_worker_count)
     if (
         str(config.workload).strip().lower() == "tpcc"
@@ -2261,10 +2240,8 @@ def base_row(row: dict[str, Any], cc: str) -> dict[str, Any]:
         "system": "cast-das",
         "cc": cc,
         "access_set_visibility": (
-            "full_trace_oracle"
-            if str(cc).strip().lower() == "paper-atcc-oracle"
-            else "online_observed"
-            if str(cc).strip().lower() in {"paper-atcc", "paper-atcc-opt"}
+            "online_observed"
+            if str(cc).strip().lower() == "paper-atcc"
             else "not_applicable"
         ),
         "workload": row.get("workload", ""),

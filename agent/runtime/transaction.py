@@ -356,26 +356,6 @@ class AgentTransaction:
         }
 
 
-def use_targeted_paper_atcc_optimization(
-    metadata: Dict[str, Any],
-    *,
-    strategy_name: str,
-) -> bool:
-    """Enable the measured high-contention optimization only for mixed YCSB."""
-    if str(strategy_name).strip().lower() not in {
-        "paper-atcc",
-        "paper-atcc-oracle",
-    }:
-        return False
-    if str(metadata.get("workload", "")).strip().lower() != "ycsb":
-        return False
-    agentic = dict(metadata.get("agentic", {}) or {})
-    return bool(
-        metadata.get("runtime_background", False)
-        or int(agentic.get("background_workers", 0) or 0) > 0
-    )
-
-
 class AgentTransactionManager:
     """Thread-safe transaction manager backed by versioned KV primitives."""
 
@@ -450,8 +430,7 @@ class AgentTransactionManager:
         )
         # Orthogonal ablation switch: retain the policy-selected write class,
         # but buffer the private write and acquire its exact WLock only in the
-        # short commit window.  This is intentionally independent of the
-        # broader paper-atcc-opt engineering profile.
+        # short commit window. This remains an orthogonal ablation switch.
         self.delayed_write_apply_enabled = bool(delayed_write_apply_enabled)
         hooks = transaction_hooks or PaperATCCHooks(self)
         self.interceptor = OperationInterceptor(hooks, state_collector=self.state_collector)
@@ -610,7 +589,7 @@ class AgentTransactionManager:
             str(txn.metadata.get("access_set_visibility", "")).strip().lower()
             == "online_observed"
         )
-        if txn.metadata.get("paper_atcc_optimized", False) and not online_observed:
+        if not online_observed:
             self.ensure_snapshot_epoch(txn)
         previous = txn.context.action
         added = action.added_since(previous)
@@ -619,8 +598,7 @@ class AgentTransactionManager:
             txn.metadata.get("_defer_policy_write_locks", False)
         )
         allow_historical_read_lock = bool(
-            txn.metadata.get("paper_atcc_optimized", False)
-            and not online_observed
+            not online_observed
             and not txn.context.planned_write_targets
             and not txn.write_set
         )
@@ -682,7 +660,7 @@ class AgentTransactionManager:
                     timeout_s=timeout_s,
                 )
                 txn.context.policy_read_lock_targets.add(str(object_id))
-                if online_observed and txn.metadata.get("paper_atcc_optimized", False):
+                if online_observed:
                     txn.metadata.setdefault(
                         "_online_bypass_read_targets", set()
                     ).add(str(object_id))
@@ -1199,18 +1177,15 @@ class AgentTransactionManager:
             metadata.setdefault("strategy", strategy_impl.name)
             if strategy_impl.family == "paper-atcc":
                 metadata["paper_atcc"] = True
-                if self.delayed_write_apply_enabled:
-                    metadata["commit_admission_write_protection"] = True
-                targeted_optimization = use_targeted_paper_atcc_optimization(
-                    metadata,
-                    strategy_name=strategy_impl.name,
-                )
-                metadata["paper_atcc_optimized"] = bool(
-                    metadata.get("paper_atcc_optimized", False)
-                    or strategy_impl.name == "paper-atcc-opt"
-                    or targeted_optimization
-                )
-                if targeted_optimization:
+                metadata["commit_admission_write_protection"] = True
+                agentic = dict(metadata.get("agentic", {}) or {})
+                if (
+                    str(metadata.get("workload", "")).strip().lower() == "ycsb"
+                    and (
+                        metadata.get("runtime_background", False)
+                        or int(agentic.get("background_workers", 0) or 0) > 0
+                    )
+                ):
                     metadata["paper_atcc_engineering_profile"] = "ycsb-high-mixed"
         task_key = str(task_id)
         runtime_background = bool(metadata.get("runtime_background", False))
@@ -1315,24 +1290,14 @@ class AgentTransactionManager:
         metadata["snapshot_epoch"] = snapshot_epoch
         txn = AgentTransaction(self, str(task_id), snapshot, metadata)
         if materialize_initial_snapshot:
-            if metadata.get("paper_atcc_optimized", False):
-                snapshot_epoch, snapshot = self.version_manager.snapshot_and_pin(
-                    txn.context.tid,
-                    snapshot_ids,
-                    materialized=bool(snapshot_ids),
-                )
-            else:
-                # Strict ATCC never permits a publisher to bypass an RLock and
-                # never treats an old pinned version as satisfying retroactive
-                # validation. It needs an atomic initial snapshot, not retained
-                # MVCC history for the whole retry lifetime.
-                snapshot_epoch, snapshot = self.version_manager.snapshot_current(
-                    snapshot_ids
-                )
+            snapshot_epoch, snapshot = self.version_manager.snapshot_and_pin(
+                txn.context.tid,
+                snapshot_ids,
+                materialized=bool(snapshot_ids),
+            )
             txn.snapshot.update(snapshot)
-            if metadata.get("paper_atcc_optimized", False):
-                txn.context.snapshot_epoch = int(snapshot_epoch)
-                txn.metadata["snapshot_epoch"] = int(snapshot_epoch)
+            txn.context.snapshot_epoch = int(snapshot_epoch)
+            txn.metadata["snapshot_epoch"] = int(snapshot_epoch)
             if txn.events:
                 txn.events[0].detail["snapshot_objects"] = len(snapshot)
         read_only_background = bool(
@@ -1750,9 +1715,7 @@ class AgentTransactionManager:
                     allow_native_publish=False,
                     native_publication_held=False,
                 ),
-                allow_reader_bypass=bool(
-                    txn.metadata.get("paper_atcc_optimized", False)
-                ),
+                allow_reader_bypass=True,
                 timing_callback=lambda elapsed_ms: self.add_commit_timing(
                     txn, "lock", elapsed_ms
                 ),
@@ -2116,7 +2079,6 @@ class AgentTransactionManager:
         if (
             paper_atcc
             and not txn.context.is_background
-            and bool(txn.metadata.get("paper_atcc_optimized", False))
         ):
             # A blind write has no semantic dependency on the value/version
             # captured when its private buffer was created. Commit admission

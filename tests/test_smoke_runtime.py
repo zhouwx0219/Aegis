@@ -236,7 +236,6 @@ class SmokeRuntimeTests(unittest.TestCase):
             "hot-read-guard",
             {
                 "paper_atcc": True,
-                "paper_atcc_optimized": True,
                 "retry_protection_mask": 14,
             },
         )
@@ -309,7 +308,6 @@ class SmokeRuntimeTests(unittest.TestCase):
                     f"{level}-first",
                     {
                         "paper_atcc": True,
-                        "paper_atcc_optimized": True,
                         "workload": "ycsb",
                         "context": {"level": level},
                     },
@@ -327,7 +325,6 @@ class SmokeRuntimeTests(unittest.TestCase):
                     f"{level}-retry",
                     {
                         "paper_atcc": True,
-                        "paper_atcc_optimized": True,
                         "workload": "ycsb",
                         "context": {"level": level},
                         "retry_count": 1,
@@ -618,7 +615,6 @@ class SmokeRuntimeTests(unittest.TestCase):
             "deferred-agent-write",
             {
                 "paper_atcc": True,
-                "paper_atcc_optimized": True,
                 "retry_protection_mask": int(LockClass.COLD_WRITE),
                 "commit_admission_write_protection": True,
             },
@@ -628,7 +624,7 @@ class SmokeRuntimeTests(unittest.TestCase):
 
         self.assertFalse(txn.context.held_write_locks)
         self.assertEqual({"row"}, txn.context.policy_write_lock_targets)
-        self.assertTrue(txn.commit("paper-atcc-opt").committed)
+        self.assertTrue(txn.commit("paper-atcc").committed)
         self.assertEqual("1", manager.store.get("row").value)
 
     def test_delayed_write_apply_is_independent_of_optimized_profile(self):
@@ -645,7 +641,7 @@ class SmokeRuntimeTests(unittest.TestCase):
 
         txn.write("row", "1")
 
-        self.assertFalse(txn.metadata.get("paper_atcc_optimized", False))
+        self.assertTrue(txn.metadata.get("paper_atcc", False))
         self.assertTrue(txn.metadata["commit_admission_write_protection"])
         self.assertFalse(txn.context.held_write_locks)
         self.assertEqual({"row"}, txn.context.policy_write_lock_targets)
