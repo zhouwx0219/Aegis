@@ -31,12 +31,10 @@ class PaperATCCHooks(NoopTransactionHooks):
 
     @classmethod
     def online_ycsb_high_mixed(cls, txn: Any) -> bool:
-        context = dict(txn.metadata.get("context", {}) or {})
         agentic = dict(txn.metadata.get("agentic", {}) or {})
         return bool(
             cls.online_observed(txn)
             and str(txn.metadata.get("workload", "")).strip().lower() == "ycsb"
-            and str(context.get("level", "")).strip().lower() == "high"
             and int(agentic.get("background_workers", 0) or 0) > 0
         )
 
@@ -59,58 +57,26 @@ class PaperATCCHooks(NoopTransactionHooks):
         txn.metadata["_defer_policy_write_locks"] = bool(
             txn.metadata.get("commit_admission_write_protection", False)
         )
-        planned = tuple(
-            str(value)
-            for value in txn.metadata.get("_planned_snapshot_object_ids", ())
-        )
-        profiled_hot = self.manager.hotness_tracker.hot_targets(planned)
-        profiled_hot_ratio = len(profiled_hot) / len(set(planned)) if planned else 0.0
-        txn.metadata["_profiled_hot_ratio"] = profiled_hot_ratio
-        context = dict(txn.metadata.get("context", {}) or {})
-        level = str(context.get("level", "")).strip().lower()
-        workload = str(txn.metadata.get("workload", "")).strip().lower()
-        ycsb_high = bool(
-            str(txn.metadata.get("workload", "")).strip().lower() == "ycsb"
-            and level == "high"
-        )
+        # Do not inspect the declared access set or static contention label.
+        # All classification below is based on operations already executed.
         txn.metadata["_version_risk_exact_mode"] = bool(
-            ycsb_high and txn.metadata.get("paper_atcc_optimized", False)
+            self.online_observed(txn)
+            and txn.metadata.get("paper_atcc_optimized", False)
         )
-        metrics = self.manager.paper_runtime_metrics()
-        agentic = dict(txn.metadata.get("agentic", {}) or {})
-        background_workers = int(agentic.get("background_workers", 0) or 0)
-        planned_reads = set(planned) - set(txn.context.planned_write_targets)
-        version_risk_reads = (
-            self.manager.version_manager.top_background_changed(
-                planned_reads,
-                limit=2,
-                min_changes=2,
-                min_share=0.005,
-                min_total_changes=32,
-            )
-            if ycsb_high and txn.context.retry_count <= 1
-            else ()
-        )
-        txn.metadata["_version_risk_read_targets"] = version_risk_reads
-        if not self.manager.low_conflict_occ_guard:
-            txn.metadata["_cold_occ_fast_task"] = False
-            return
-        cold_profile = bool(
-            planned
-            and (
-                (
-                    level == "low"
-                    and not (workload == "tpcc" and background_workers > 0)
-                )
-                or (level == "medium" and background_workers <= 0)
-            )
-            and txn.context.retry_count <= 0
-            and not txn.context.retry_conflict_mask
-            and float(metrics.get("conflict_abort_rate", 0.0) or 0.0) < 0.30
-            and int(metrics.get("waiter_count", 0) or 0) == 0
-            and not version_risk_reads
-        )
-        txn.metadata["_cold_occ_fast_task"] = cold_profile
+        txn.metadata["_version_risk_read_targets"] = ()
+        txn.metadata["_cold_occ_fast_task"] = False
+        txn.metadata["_native_occ_stable_windows"] = 0
+        txn.metadata["_native_occ_fast_ready"] = False
+        # The switching ablation's Static arm is a fixed protection policy,
+        # not an OCC policy that happens to consult a threshold later. Install
+        # its mask before the first access so an immediate-write baseline
+        # really acquires WLocks at write time. Dynamic policies still start
+        # in OCC and transition from observed state as described in the paper.
+        static_mask = int(
+            getattr(self.manager, "paper_static_initial_mask", 0) or 0
+        ) & 0xF
+        if static_mask:
+            txn.context.action = LockAction(LockClass(static_mask))
 
     def before_read(self, txn: Any, object_id: str) -> None:
         if not self.enabled(txn):
@@ -139,10 +105,6 @@ class PaperATCCHooks(NoopTransactionHooks):
         deferred_tpcc_root_write = bool(
             txn.metadata.get("_deferred_reasoning_replay", False)
             and str(txn.metadata.get("workload", "")).strip().lower() == "tpcc"
-            and str(
-                dict(txn.metadata.get("context", {}) or {}).get("level", "")
-            ).strip().lower()
-            == "high"
             and planned_write
             and key.startswith(
                 (
@@ -326,7 +288,8 @@ class PaperATCCHooks(NoopTransactionHooks):
             return
         profiled_shared = self.manager.hotness_tracker.is_profiled_shared(key)
         if (
-            profiled_shared
+            bool(getattr(self.manager, "performance_guards_enabled", True))
+            and profiled_shared
             and not exact_retry_only
             and (
                 txn.context.retry_count > 0
@@ -349,10 +312,13 @@ class PaperATCCHooks(NoopTransactionHooks):
             and not exact_retry_only
         )
         if (
-            category_write_protected
-            and txn.metadata.get("_defer_policy_write_locks", False)
+            txn.metadata.get("_defer_policy_write_locks", False)
             and not exact_write
         ):
+            # DWA operates on the transaction's observed write set. Once a
+            # write is actually issued it is safe to remember its exact key,
+            # even when the current dynamic category action is OCC. Admission
+            # then protects only this key at commit; no future access is used.
             txn.context.policy_write_lock_targets.add(key)
             return
         if exact_write or category_write_protected:
@@ -398,11 +364,7 @@ class PaperATCCHooks(NoopTransactionHooks):
         require_evidence: bool,
     ) -> None:
         """Late-protect exact TPC-C warehouse/district read-before-writes."""
-        context = dict(txn.metadata.get("context", {}) or {})
-        if (
-            str(txn.metadata.get("workload", "")).strip().lower() != "tpcc"
-            or str(context.get("level", "")).strip().lower() != "high"
-        ):
+        if str(txn.metadata.get("workload", "")).strip().lower() != "tpcc":
             return
         agentic = dict(txn.metadata.get("agentic", {}) or {})
         if (
@@ -496,12 +458,34 @@ class PaperATCCHooks(NoopTransactionHooks):
             # policy lookup occurs only after the initial operation batch,
             # when its observed access and cost state is available.
             return
+        if self._policy_invocation_ops(txn) > 0:
+            if phase == TransactionPhase.COMMIT:
+                self._protect_tpcc_read_before_write(txn, require_evidence=True)
+            return
         state = self._state(txn)
         self._select_and_apply(txn, state)
         if phase == TransactionPhase.COMMIT:
             # Keep explore/refine optimistic, then protect only the already
             # observed high-frequency root dependency before the write suffix.
             self._protect_tpcc_read_before_write(txn, require_evidence=True)
+
+    def on_operation_finished(self, txn: Any) -> None:
+        if not self.enabled(txn) or txn.metadata.get("_cold_occ_fast_task", False):
+            return
+        interval = self._policy_invocation_ops(txn)
+        completed = int(txn.context.completed_operations)
+        last = int(txn.metadata.get("_last_policy_checkpoint_ops", 0) or 0)
+        if interval <= 0 or completed < interval or completed - last < interval:
+            return
+        txn.metadata["_last_policy_checkpoint_ops"] = completed
+        self.manager.interceptor.account_agent_interval(txn)
+        self.manager.refresh_atcc_priority(txn)
+        self._select_and_apply(txn, self._state(txn))
+
+    @staticmethod
+    def _policy_invocation_ops(txn: Any) -> int:
+        context = dict(txn.metadata.get("context", {}) or {})
+        return max(0, int(context.get("policy_invocation_ops", 0) or 0))
 
     def _protect_retry_targets(self, txn: Any) -> None:
         if txn.context.retry_count <= 0:
@@ -571,6 +555,7 @@ class PaperATCCHooks(NoopTransactionHooks):
             else:
                 selected = policy.select(state)
                 behavior_probability = 1.0
+        self._update_native_occ_hysteresis(txn, state)
         if self._low_conflict_occ_guard(txn, state):
             selected = LockAction(LockClass.NONE)
         selected = LockAction(selected.protected | txn.context.action.protected)
@@ -602,21 +587,53 @@ class PaperATCCHooks(NoopTransactionHooks):
             self.manager.interceptor.reset_agent_interval(txn)
         self._finish_online_observed_prefix(txn)
 
+    @staticmethod
+    def _update_native_occ_hysteresis(txn: Any, state: Any) -> None:
+        """Require two cold policy windows and leave fast mode on any risk."""
+        risk = bool(
+            txn.context.retry_count > 0
+            or txn.context.retry_conflict_mask
+            or txn.context.hot_read_targets
+            or txn.context.hot_write_targets
+            or float(getattr(state, "global_conflict_abort_rate", 0.0) or 0.0)
+            > 0.001
+            or int(getattr(state, "global_waiter_count", 0) or 0) > 0
+        )
+        if risk:
+            txn.metadata["_native_occ_stable_windows"] = 0
+            txn.metadata["_native_occ_fast_ready"] = False
+            return
+        windows = min(
+            2, int(txn.metadata.get("_native_occ_stable_windows", 0) or 0) + 1
+        )
+        txn.metadata["_native_occ_stable_windows"] = windows
+        txn.metadata["_native_occ_fast_ready"] = windows >= 2
+
     def _apply_protection_guard(self, txn: Any, state: Any, selected: LockAction) -> LockAction:
         """Protect observed hot reads before late phases under conflict pressure."""
         context = dict(txn.metadata.get("context", {}) or {})
-        level = str(context.get("level", "")).strip().lower()
         workload = str(txn.metadata.get("workload", "")).strip().lower()
         agentic = dict(txn.metadata.get("agentic", {}) or {})
+        engineering_guards = bool(
+            getattr(self.manager, "performance_guards_enabled", True)
+        )
         tpcc_high_all_agent = bool(
-            workload == "tpcc"
-            and level == "high"
+            engineering_guards
+            and workload == "tpcc"
             and int(agentic.get("background_workers", 0) or 0) == 0
         )
         tpcc_high_deferred_replay = bool(
-            workload == "tpcc"
-            and level == "high"
+            engineering_guards
+            and workload == "tpcc"
             and txn.metadata.get("_deferred_reasoning_replay", False)
+        )
+        ycsb_deferred_all_agent_first_attempt = bool(
+            engineering_guards
+            and workload == "ycsb"
+            and txn.metadata.get("_deferred_reasoning_replay", False)
+            and int(agentic.get("background_workers", 0) or 0) == 0
+            and txn.context.retry_count <= 0
+            and not txn.context.retry_conflict_mask
         )
         tpcc_high_all_agent_first_attempt = bool(
             tpcc_high_all_agent
@@ -630,17 +647,27 @@ class PaperATCCHooks(NoopTransactionHooks):
         )
         if (
             self.manager.low_conflict_occ_guard
-            and level in {"low", "medium"}
+            and workload == "ycsb"
+            and str(context.get("level", "")).strip().lower() in {"low", "medium"}
+            and txn.context.retry_count <= 0
+            and not txn.context.retry_conflict_mask
+        ):
+            return LockAction(txn.context.action.protected)
+        if (
+            self.manager.low_conflict_occ_guard
             and txn.context.retry_count <= 0
             and not txn.context.retry_conflict_mask
             and txn.context.action.protected == LockClass.NONE
+            and not txn.context.hot_read_targets
+            and not txn.context.hot_write_targets
         ):
             # Low/medium contention is sensitive to unnecessary first-attempt
             # locks. Let an observed retry conflict activate the learned
             # monotonic protection path on the same logical transaction.
             return LockAction(LockClass.NONE)
         online_mixed_pressure = bool(
-            self.online_ycsb_high_mixed(txn)
+            engineering_guards
+            and self.online_ycsb_high_mixed(txn)
             and (
                 int(agentic.get("background_workers", 0) or 0) >= 4
                 or float(
@@ -653,6 +680,12 @@ class PaperATCCHooks(NoopTransactionHooks):
                 )
                 >= 0.20
             )
+        )
+        ycsb_high_all_agent_commit = bool(
+            engineering_guards
+            and workload == "ycsb"
+            and int(agentic.get("background_workers", 0) or 0) == 0
+            and txn.context.phase == TransactionPhase.COMMIT
         )
         if txn.context.phase not in {TransactionPhase.REFINE, TransactionPhase.COMMIT}:
             if online_mixed_pressure:
@@ -688,7 +721,6 @@ class PaperATCCHooks(NoopTransactionHooks):
         guarded = selected.protected
         if (
             self.manager.low_conflict_occ_guard
-            and level in {"low", "medium", "high"}
             and txn.context.retry_count <= 0
             and not txn.context.retry_conflict_mask
         ):
@@ -699,16 +731,27 @@ class PaperATCCHooks(NoopTransactionHooks):
             cold_classes = LockClass.COLD_READ | LockClass.COLD_WRITE
             guarded &= ~cold_classes
             guarded |= txn.context.action.protected & cold_classes
-        if level in {"medium", "high"} and txn.context.retry_count <= 0:
-            # The paper protocol permits deferred writes. A sparse compiled
-            # policy can otherwise turn a first attempt into category-wide
-            # 2PL at refine, which blocks unrelated background rows. Medium
-            # and high contention both require concrete retry evidence before
-            # adding a write class. TPC-C root read-before-writes are handled
-            # by the exact guard below.
+        if (
+            engineering_guards
+            and txn.context.retry_count <= 0
+            and bool(
+                txn.metadata.get("_defer_policy_write_locks", False)
+                or txn.metadata.get("paper_atcc_optimized", False)
+            )
+        ):
+            # This is an optimized-path pressure guard, not paper policy
+            # semantics. Pure delayed-write evaluation must retain the
+            # selected write class so its behavior propensity remains exact;
+            # the WLock itself is still acquired only at commit admission.
             write_classes = LockClass.HOT_WRITE | LockClass.COLD_WRITE
             guarded &= ~write_classes
             guarded |= txn.context.action.protected & write_classes
+            if ycsb_high_all_agent_commit and validation_pressure >= 0.15:
+                # The compiled policy may request write protection after the
+                # observed explore/refine batches. Preserve only its hot-write
+                # bit at the commit boundary; no future target or cold class is
+                # introduced, and the WLock is acquired when the write occurs.
+                guarded |= selected.protected & LockClass.HOT_WRITE
         if online_mixed_pressure:
             # Under real mixed pressure, broad action-15 protection creates a
             # write convoy. Keep only observed hot reads; actual writes use the
@@ -730,12 +773,26 @@ class PaperATCCHooks(NoopTransactionHooks):
             guarded &= ~LockClass.HOT_READ
             guarded |= txn.context.action.protected & LockClass.HOT_READ
             txn.metadata["_tpcc_first_attempt_exact_only"] = True
-        if hot_read_ratio >= 0.25 and not tpcc_high_exact_first_attempt:
+        if ycsb_deferred_all_agent_first_attempt:
+            # The observed-replay gate already admits a single short suffix
+            # after reasoning completes. Category-wide read locks duplicate
+            # that protection and turn the serialized suffix into lock-manager
+            # work. A real failed attempt still enters exact retry protection.
+            guarded &= ~LockClass.HOT_READ
+            guarded |= txn.context.action.protected & LockClass.HOT_READ
+        if (
+            engineering_guards
+            and hot_read_ratio >= 0.25
+            and not tpcc_high_exact_first_attempt
+            and not ycsb_deferred_all_agent_first_attempt
+        ):
             guarded |= LockClass.HOT_READ
         if (
-            hot_reads
+            engineering_guards
+            and hot_reads
             and validation_pressure >= 0.30
             and not tpcc_high_exact_first_attempt
+            and not ycsb_deferred_all_agent_first_attempt
         ):
             # Global pressure justifies protecting observed hotspots, but it
             # is not transaction-specific evidence for a category-wide cold
@@ -747,22 +804,18 @@ class PaperATCCHooks(NoopTransactionHooks):
 
     @staticmethod
     def _action_transition_timeout_s(txn: Any) -> float:
-        context = dict(txn.metadata.get("context", {}) or {})
         agentic = dict(txn.metadata.get("agentic", {}) or {})
-        saturated_ycsb_high = bool(
+        mixed_ycsb_high = bool(
             str(txn.metadata.get("workload", "")).strip().lower() == "ycsb"
-            and str(context.get("level", "")).strip().lower() == "high"
-            and int(agentic.get("background_workers", 0) or 0) >= 8
+            and int(agentic.get("background_workers", 0) or 0) > 0
         )
-        return 0.025 if saturated_ycsb_high else 5.0
+        return 0.025 if mixed_ycsb_high else 5.0
 
     @staticmethod
     def _tpcc_all_agent_exact_retry(txn: Any) -> bool:
-        context = dict(txn.metadata.get("context", {}) or {})
         agentic = dict(txn.metadata.get("agentic", {}) or {})
         return bool(
             str(txn.metadata.get("workload", "")).strip().lower() == "tpcc"
-            and str(context.get("level", "")).strip().lower() == "high"
             and int(agentic.get("background_workers", 0) or 0) == 0
             and txn.context.retry_count > 0
         )

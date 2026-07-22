@@ -16,6 +16,7 @@ from agent.benchmarks.mixed import (
     ATCCAdmissionConflict,
     MixedBenchmarkConfig,
     MixedCounters,
+    TPCCReplayAdmission,
     admission_failure_reason,
     apply_atcc_experiment_overrides,
     begin_planned_transaction,
@@ -29,8 +30,16 @@ from agent.benchmarks.mixed import (
     run_agent_with_deferred_read_reservation,
     run_agent_attempt,
     run_mixed_benchmark,
+    paper_native_optimistic_fast_path,
+    should_serialize_ycsb_observed_replay,
     should_serialize_tpcc_mixed_replay,
     should_use_paper_deferred_replay,
+    should_use_ycsb_observed_deferred_replay,
+    should_use_ycsb_warmed_low_write_replay,
+    ycsb_observed_replay_ready,
+    ycsb_observed_native_ready,
+    tpcc_replay_admission,
+    tpcc_replay_gate_pressure,
 )
 from agent.benchmarks.phases import PlannedPhase, PlannedTask, ReasoningProfile, plan_task_phases
 from agent.cli import compare, matrix, mixed, train_atcc
@@ -43,6 +52,7 @@ from agent.cc.atcc.reward import ATCCRewardConfig
 from scripts.train_paper_atcc_coordinated import (
     behavior_probabilities,
     behavior_probability,
+    coordinated_behavior_distribution,
     normalized_system_scores,
 )
 from scripts.unified_trace.generate_castdas_trace import (
@@ -51,11 +61,13 @@ from scripts.unified_trace.generate_castdas_trace import (
 )
 from scripts.unified_trace.run_castdas_trace_fair import (
     FixedCountRunCoordinator,
+    TPCCReplayPressureAdmission,
     cached_retry_scheduler_cooldown_s,
     continuous_background_rows,
     high_contention_cached_retry,
     paper_agent_admission_cap,
     paper_background_admission_cap,
+    paper_background_batch_size,
     result_row,
     run_background_row,
     run_rows,
@@ -69,6 +81,42 @@ from agent.workloads import AgentOperation, AgentTask, build_workload
 
 
 class CompareCliTests(unittest.TestCase):
+    def test_ycsb_replay_requires_repeated_observed_contention(self):
+        manager = AgentTransactionManager()
+        self.assertFalse(ycsb_observed_replay_ready(manager))
+
+        for _ in range(3):
+            manager.hotness_tracker.observe_contention(
+                "row", "validation-failure"
+            )
+
+        self.assertTrue(ycsb_observed_replay_ready(manager))
+
+    def test_ycsb_native_path_requires_stable_observed_warmup(self):
+        manager = AgentTransactionManager()
+        task = build_workload("ycsb", "high", "paper").generate_tasks(
+            1, seed=920104
+        )[0]
+        self.assertFalse(
+            ycsb_observed_native_ready(
+                manager, task, retry_count=0, background_workers=0
+            )
+        )
+
+        for index in range(32):
+            manager.hotness_tracker.observe_access(f"cold-{index}")
+
+        self.assertTrue(
+            ycsb_observed_native_ready(
+                manager, task, retry_count=0, background_workers=0
+            )
+        )
+        self.assertFalse(
+            ycsb_observed_native_ready(
+                manager, task, retry_count=1, background_workers=0
+            )
+        )
+
     def test_retry_plan_cache_covers_deterministic_high_contention_traces(self):
         self.assertTrue(
             high_contention_cached_retry(
@@ -125,15 +173,23 @@ class CompareCliTests(unittest.TestCase):
             ),
             rng,
         )
+        medium = cached_retry_scheduler_cooldown_s(
+            MixedBenchmarkConfig(
+                workload="ycsb", level="medium", clients=40, background_workers=0
+            ),
+            rng,
+        )
         self.assertGreaterEqual(all_agent, 0.5)
         self.assertLessEqual(all_agent, 1.0)
         self.assertGreaterEqual(mixed, 0.005)
         self.assertLessEqual(mixed, 0.020)
+        self.assertGreaterEqual(medium, 0.005)
+        self.assertLessEqual(medium, 0.020)
 
-    def test_paper_agent_admission_caps_only_saturated_high_contention(self):
+    def test_paper_agent_admission_decouples_ycsb_and_caps_saturated_tpcc(self):
         manager = AgentTransactionManager()
         self.assertEqual(
-            30,
+            40,
             paper_agent_admission_cap(
                 manager,
                 "paper-atcc",
@@ -144,7 +200,40 @@ class CompareCliTests(unittest.TestCase):
             ),
         )
         self.assertEqual(
-            20,
+            26,
+            paper_agent_admission_cap(
+                manager,
+                "paper-atcc",
+                MixedBenchmarkConfig(
+                    workload="ycsb", level="high", clients=32, background_workers=6
+                ),
+                agent_worker_count=26,
+            ),
+        )
+        self.assertEqual(
+            32,
+            paper_agent_admission_cap(
+                manager,
+                "paper-atcc",
+                MixedBenchmarkConfig(
+                    workload="ycsb", level="high", clients=40, background_workers=8
+                ),
+                agent_worker_count=32,
+            ),
+        )
+        self.assertEqual(
+            24,
+            paper_agent_admission_cap(
+                manager,
+                "paper-atcc",
+                MixedBenchmarkConfig(
+                    workload="ycsb", level="high", clients=24, background_workers=0
+                ),
+                agent_worker_count=24,
+            ),
+        )
+        self.assertEqual(
+            32,
             paper_agent_admission_cap(
                 manager,
                 "paper-atcc",
@@ -155,7 +244,7 @@ class CompareCliTests(unittest.TestCase):
             ),
         )
         self.assertEqual(
-            24,
+            13,
             paper_agent_admission_cap(
                 manager,
                 "paper-atcc",
@@ -199,6 +288,47 @@ class CompareCliTests(unittest.TestCase):
             ),
         )
 
+    def test_paper_background_batches_only_disjoint_ycsb_low_and_medium(self):
+        manager = AgentTransactionManager()
+        self.assertEqual(
+            40,
+            paper_background_batch_size(
+                manager,
+                "paper-atcc",
+                MixedBenchmarkConfig(
+                    workload="ycsb", level="low", clients=40, background_workers=8
+                ),
+            ),
+        )
+        self.assertEqual(
+            20,
+            paper_background_batch_size(
+                manager,
+                "paper-atcc",
+                MixedBenchmarkConfig(
+                    workload="ycsb", level="medium", clients=40, background_workers=8
+                ),
+            ),
+        )
+        self.assertEqual(
+            1,
+            paper_background_batch_size(
+                manager,
+                "paper-atcc",
+                MixedBenchmarkConfig(
+                    workload="ycsb", level="high", clients=40, background_workers=8
+                ),
+            ),
+        )
+        self.assertEqual(
+            1,
+            paper_background_batch_size(
+                manager,
+                "silo",
+                MixedBenchmarkConfig(workload="ycsb", level="low", background_workers=8),
+            ),
+        )
+
     def test_paper_deferred_replay_targets_tpcc_high_and_mixed_ycsb(self):
         read = AgentOperation.read("row")
         write = AgentOperation.write("row", "1")
@@ -238,18 +368,261 @@ class CompareCliTests(unittest.TestCase):
                 plan("ycsb", "medium"), background_workers=0
             )
         )
+        commit_only_ycsb = PlannedTask(
+            AgentTask(
+                task_id="ycsb-high-commit-only",
+                workload="ycsb",
+                task_type="update",
+                operations=(write,),
+                context={
+                    "level": "high",
+                    "access_distribution": "zipfian",
+                    "ycsb_zipf_theta": 0.99,
+                    "write_ratio": 0.9,
+                },
+            ),
+            (PlannedPhase("commit", (write,), 0, (1,)),),
+        )
+        self.assertTrue(
+            should_use_paper_deferred_replay(
+                commit_only_ycsb, background_workers=0
+            )
+        )
         self.assertTrue(
             should_serialize_tpcc_mixed_replay(
                 plan("tpcc", "high").task,
                 background_workers=8,
             )
         )
-        self.assertFalse(
+        self.assertTrue(
             should_serialize_tpcc_mixed_replay(
                 plan("tpcc", "high").task,
                 background_workers=0,
             )
         )
+
+    def test_ycsb_p0_native_and_p1_observed_deferred_shapes(self):
+        def ycsb_task(**context):
+            return AgentTask(
+                task_id="ycsb-shape",
+                workload="ycsb",
+                task_type="read-update",
+                operations=(
+                    AgentOperation.read("row"),
+                    AgentOperation.write("row", "1"),
+                ),
+                context={"level": "high", **context},
+            )
+
+        theta_half = ycsb_task(
+            access_distribution="zipfian",
+            ycsb_zipf_theta=0.5,
+            write_ratio=0.5,
+        )
+        low_write = ycsb_task(
+            access_distribution="zipfian",
+            ycsb_zipf_theta=0.99,
+            write_ratio=0.1,
+        )
+        hotset = ycsb_task(
+            access_distribution="hotspot",
+            ycsb_hotset_size=32,
+            ycsb_hotspot_access_probability=0.8,
+            write_ratio=0.5,
+        )
+        theta_moderate = ycsb_task(
+            access_distribution="zipfian",
+            ycsb_zipf_theta=0.8,
+            write_ratio=0.5,
+        )
+        broad_hotset = ycsb_task(
+            access_distribution="hotspot",
+            ycsb_hotset_size=2048,
+            ycsb_hotspot_access_probability=0.8,
+            write_ratio=0.5,
+        )
+        medium_hotset = ycsb_task(
+            access_distribution="hotspot",
+            ycsb_hotset_size=512,
+            ycsb_hotspot_access_probability=0.8,
+            write_ratio=0.5,
+        )
+        self.assertEqual(
+            "paper-ycsb-low-risk-native-silo",
+            paper_native_optimistic_fast_path(
+                theta_half, retry_count=0, background_workers=0
+            ),
+        )
+        self.assertEqual(
+            "",
+            paper_native_optimistic_fast_path(
+                theta_moderate, retry_count=0, background_workers=0
+            ),
+        )
+        self.assertEqual(
+            "",
+            paper_native_optimistic_fast_path(
+                broad_hotset, retry_count=0, background_workers=0
+            ),
+        )
+        self.assertEqual(
+            "paper-ycsb-low-risk-native-silo",
+            paper_native_optimistic_fast_path(
+                low_write, retry_count=0, background_workers=0
+            ),
+        )
+        self.assertEqual(
+            "",
+            paper_native_optimistic_fast_path(
+                low_write, retry_count=1, background_workers=0
+            ),
+        )
+        self.assertTrue(
+            should_use_ycsb_observed_deferred_replay(
+                hotset, background_workers=0
+            )
+        )
+        self.assertTrue(
+            should_use_ycsb_observed_deferred_replay(
+                medium_hotset, background_workers=0
+            )
+        )
+        self.assertTrue(
+            should_use_ycsb_observed_deferred_replay(
+                theta_moderate, background_workers=0
+            )
+        )
+        self.assertTrue(
+            should_use_ycsb_observed_deferred_replay(
+                broad_hotset, background_workers=0
+            )
+        )
+        self.assertFalse(
+            should_use_ycsb_observed_deferred_replay(
+                hotset, background_workers=8
+            )
+        )
+        manager = AgentTransactionManager()
+        self.assertFalse(
+            should_use_ycsb_warmed_low_write_replay(
+                manager, low_write, background_workers=0
+            )
+        )
+        self.assertFalse(
+            should_serialize_ycsb_observed_replay(manager, retry_count=0)
+        )
+        manager.hotness_tracker.observe_access("row")
+        self.assertTrue(
+            should_use_ycsb_warmed_low_write_replay(
+                manager, low_write, background_workers=0
+            )
+        )
+        self.assertFalse(
+            should_use_ycsb_warmed_low_write_replay(
+                manager, theta_half, background_workers=0
+            )
+        )
+        self.assertTrue(
+            should_serialize_ycsb_observed_replay(manager, retry_count=0)
+        )
+        self.assertTrue(
+            should_serialize_ycsb_observed_replay(manager, retry_count=1)
+        )
+
+    def test_tpcc_replay_admission_is_exact_per_root_and_reports_queue(self):
+        manager = AgentTransactionManager()
+        task = AgentTask(
+            task_id="tpcc-high-root",
+            workload="tpcc",
+            task_type="payment",
+            operations=(),
+            context={"level": "high", "warehouse": 7, "district": 3},
+        )
+        admission = tpcc_replay_admission(manager, task)
+        self.assertEqual(admission, tpcc_replay_admission(manager, task))
+        self.assertEqual(
+            "tpcc:warehouse:7:ytd:commit-replay",
+            admission.key,
+        )
+        new_order = AgentTask(
+            task_id="tpcc-high-new-order",
+            workload="tpcc",
+            task_type="new_order",
+            operations=(),
+            context={"level": "high", "warehouse": 7, "district": 3},
+        )
+        self.assertEqual(
+            "tpcc:district:7:3:next_order_id:commit-replay",
+            tpcc_replay_admission(manager, new_order).key,
+        )
+        admission.acquire()
+        admission.acquire()
+        acquired = threading.Event()
+
+        def wait_for_replay():
+            admission.acquire()
+            acquired.set()
+            admission.release()
+
+        waiter = threading.Thread(target=wait_for_replay)
+        waiter.start()
+        deadline = time.monotonic() + 1.0
+        while (
+            tpcc_replay_gate_pressure(manager)["waiters"] < 1
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.001)
+        pressure = tpcc_replay_gate_pressure(manager)
+        self.assertEqual(2, pressure["active"])
+        self.assertEqual(1, pressure["waiters"])
+        self.assertEqual(1, pressure["warehouses"])
+        self.assertEqual(2, pressure["roots"])
+        admission.release()
+        waiter.join(1.0)
+        self.assertTrue(acquired.is_set())
+        admission.release()
+        self.assertEqual(0, tpcc_replay_gate_pressure(manager)["active"])
+
+    def test_tpcc_replay_admission_prefers_priority_and_keeps_fifo_ties(self):
+        admission = TPCCReplayAdmission("root", capacity=1)
+        admission.acquire()
+        order = []
+
+        def wait_for_replay(label, priority):
+            admission.acquire(priority=priority)
+            order.append(label)
+            admission.release()
+
+        low = threading.Thread(target=wait_for_replay, args=("low", 1))
+        high = threading.Thread(target=wait_for_replay, args=("high", 9))
+        low.start()
+        deadline = time.monotonic() + 1.0
+        while admission.pressure()[0] < 1 and time.monotonic() < deadline:
+            time.sleep(0.001)
+        high.start()
+        deadline = time.monotonic() + 1.0
+        while admission.pressure()[0] < 2 and time.monotonic() < deadline:
+            time.sleep(0.001)
+        admission.release()
+        high.join(1.0)
+        low.join(1.0)
+        self.assertEqual(["high", "low"], order)
+
+    def test_tpcc_activity_window_shrinks_from_observed_replay_queue(self):
+        manager = AgentTransactionManager()
+        admission = TPCCReplayPressureAdmission(
+            manager,
+            full_limit=40,
+            pressure_limit=12,
+        )
+        admission._limit = 24
+        admission._last_adjusted = 0.0
+        with mock.patch(
+            "scripts.unified_trace.run_castdas_trace_fair.tpcc_replay_gate_pressure",
+            return_value={"waiters": 8, "active": 1, "warehouses": 1, "max_waiters": 8},
+        ):
+            admission._adjust_limit()
+        self.assertEqual(20, admission._limit)
 
     def test_retry_plan_cache_requires_atcc_conflict(self):
         atcc = SimpleNamespace(
@@ -515,6 +888,27 @@ class CompareCliTests(unittest.TestCase):
 
         self.assertEqual(0.5, behavior_probability(probabilities, "commit", 0, 1))
         self.assertEqual(1.0, behavior_probability(probabilities, "commit", 1, 1))
+
+    def test_coordinated_retry_distribution_expands_inherited_mask(self):
+        paths = ((0, 0), (0, 1), (0, 3), (0, 5), (1, 5), (3, 7))
+
+        refine = coordinated_behavior_distribution(
+            paths, "refine", 4, 0, stochastic=True
+        )
+        commit = coordinated_behavior_distribution(
+            paths, "commit", 4, 0, stochastic=True
+        )
+        repeated = coordinated_behavior_distribution(
+            paths, "commit", 5, 0, stochastic=False
+        )
+
+        self.assertAlmostEqual(4.0 / 6.0, refine[4])
+        self.assertAlmostEqual(1.0 / 6.0, refine[5])
+        self.assertAlmostEqual(1.0 / 6.0, refine[7])
+        self.assertAlmostEqual(0.25, commit[4])
+        self.assertAlmostEqual(0.50, commit[5])
+        self.assertAlmostEqual(0.25, commit[7])
+        self.assertEqual(1.0, repeated[5])
 
     def test_coordinated_mixed_reward_prioritizes_agent_tps_and_uses_background_tps(self):
         runs = [

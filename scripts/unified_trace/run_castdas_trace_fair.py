@@ -13,6 +13,7 @@ import argparse
 import csv
 import dataclasses
 import json
+import math
 import random
 import sys
 import threading
@@ -40,12 +41,15 @@ from agent.benchmarks.mixed import (  # noqa: E402
     run_agent_attempt,
     observe_atcc_admission_conflict,
     task_targets,
+    tpcc_replay_gate_pressure,
 )
 from agent.benchmarks.phases import PlannedPhase, PlannedTask, sleep_for_reasoning  # noqa: E402
 from agent.cc import LockConflict  # noqa: E402
 from agent.cc.atcc.ppo import DiscretePPOPolicy, EpsilonGreedyPolicy  # noqa: E402
 from agent.runtime import AgentTransactionManager  # noqa: E402
 from agent.runtime import CompiledPhasePolicy  # noqa: E402
+from agent.runtime.paper_policy import StaticThresholdPhasePolicy  # noqa: E402
+from agent.runtime.priority import PriorityConfig  # noqa: E402
 from agent.workloads import AgentOperation, AgentTask, apply_operation  # noqa: E402
 
 
@@ -261,6 +265,11 @@ FIELDS = [
     "raw_admission_yield_counts",
     "agent_avg_tokens",
     "agent_total_tokens",
+    "agent_committed_reasoning_tokens",
+    "agent_wasted_reasoning_tokens",
+    "agent_tokens_per_committed_txn",
+    "agent_wasted_tokens_per_commit",
+    "agent_wasted_token_ratio",
     "error",
 ]
 
@@ -301,13 +310,43 @@ def main() -> int:
     parser.add_argument("--paper-exploration-stay-probability", type=float, default=0.5)
     parser.add_argument("--paper-exploration-epsilon", type=float, default=0.2)
     parser.add_argument("--policy-mode", choices=("eval", "train", "online"), default="eval")
-    parser.add_argument("--max-attempts", type=int, default=5)
+    parser.add_argument("--paper-switching", choices=("dynamic", "static"), default="dynamic")
+    parser.add_argument("--paper-static-conflict-threshold", type=float, default=0.20)
+    parser.add_argument("--paper-static-protection-mask", type=int, default=4)
+    parser.add_argument("--paper-priority", choices=("enabled", "disabled"), default="enabled")
+    parser.add_argument("--paper-commit-admission-priority", action="store_true")
+    parser.add_argument(
+        "--paper-delayed-write-apply",
+        choices=("enabled", "disabled"),
+        default="disabled",
+    )
+    parser.add_argument("--priority-quantum-scale", type=float, default=1.0)
+    parser.add_argument("--disable-atcc-retry-cache", action="store_true")
+    parser.add_argument("--disable-paper-deferred-replay", action="store_true")
+    parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=1,
+        help="Maximum logical transaction attempts, including the first attempt.",
+    )
+    parser.add_argument(
+        "--allow-retries",
+        action="store_true",
+        help="Explicitly opt into comparative retry experiments.",
+    )
     parser.add_argument("--tokens-per-operation", type=int, default=2703)
     parser.add_argument("--warmup-seconds", type=float, default=0.0)
     parser.add_argument("--measure-seconds", type=float, default=0.0)
+    parser.add_argument("--execution-workers", type=int, default=0)
     parser.add_argument("--no-cycle-trace", action="store_false", dest="cycle_trace")
     parser.set_defaults(cycle_trace=True)
     args = parser.parse_args()
+    if args.max_attempts < 1:
+        raise SystemExit("--max-attempts must be positive")
+    if args.max_attempts != 1 and not args.allow_retries:
+        raise SystemExit(
+            "paper experiments disable retries by default; pass --allow-retries explicitly"
+        )
 
     rows = read_trace(args.trace)
     warmup_rows = read_trace(args.warmup_trace) if args.warmup_trace else []
@@ -327,10 +366,20 @@ def main() -> int:
                     paper_exploration_stay_probability=args.paper_exploration_stay_probability,
                     paper_exploration_epsilon=args.paper_exploration_epsilon,
                     policy_mode=args.policy_mode,
+                    paper_switching=args.paper_switching,
+                    paper_static_conflict_threshold=args.paper_static_conflict_threshold,
+                    paper_static_protection_mask=args.paper_static_protection_mask,
+                    paper_priority=args.paper_priority,
+                    paper_commit_admission_priority=args.paper_commit_admission_priority,
+                    paper_delayed_write_apply=args.paper_delayed_write_apply,
+                    priority_quantum_scale=args.priority_quantum_scale,
+                    atcc_retry_cache_enabled=not args.disable_atcc_retry_cache,
+                    paper_deferred_replay_enabled=not args.disable_paper_deferred_replay,
                     max_attempts=args.max_attempts,
                     tokens_per_operation=args.tokens_per_operation,
                     warmup_seconds=args.warmup_seconds,
                     measure_seconds=args.measure_seconds,
+                    execution_workers=args.execution_workers,
                     cycle_trace=bool(args.cycle_trace),
                 )
             )
@@ -374,10 +423,20 @@ def run_trace(
     paper_exploration_stay_probability: float = 0.5,
     paper_exploration_epsilon: float = 0.2,
     policy_mode: str = "eval",
+    paper_switching: str = "dynamic",
+    paper_static_conflict_threshold: float = 0.20,
+    paper_static_protection_mask: int = 4,
+    paper_priority: str = "enabled",
+    paper_commit_admission_priority: bool = False,
+    paper_delayed_write_apply: str = "disabled",
+    priority_quantum_scale: float = 1.0,
+    atcc_retry_cache_enabled: bool = True,
+    paper_deferred_replay_enabled: bool = True,
     max_attempts: int,
     tokens_per_operation: int,
     warmup_seconds: float = 0.0,
     measure_seconds: float = 0.0,
+    execution_workers: int = 0,
     cycle_trace: bool = True,
 ) -> dict[str, Any]:
     sample = rows[0]
@@ -402,7 +461,12 @@ def run_trace(
         background_retry_backoff_min_ms=10,
         background_retry_backoff_max_ms=30,
         tokens_per_operation=tokens_per_operation,
+        atcc_retry_cache_enabled=bool(atcc_retry_cache_enabled),
+        paper_deferred_replay_enabled=bool(paper_deferred_replay_enabled),
     ).normalized()
+    quantum_scale = float(priority_quantum_scale)
+    if quantum_scale <= 0.0:
+        raise ValueError("priority quantum scale must be positive")
     if paper_exploration_seed is not None:
         if cc not in {"paper-atcc", "paper-atcc-opt", "paper-atcc-oracle"}:
             raise ValueError("paper exploration is only valid for paper-atcc")
@@ -425,17 +489,38 @@ def run_trace(
             )
     else:
         compiled_policy = CompiledPhasePolicy.load(paper_policy) if paper_policy is not None else None
+    if str(paper_switching).strip().lower() == "static":
+        compiled_policy = StaticThresholdPhasePolicy(
+            conflict_abort_threshold=paper_static_conflict_threshold,
+            protection_mask=paper_static_protection_mask,
+        )
     manager = AgentTransactionManager(
         cc_registry=registry_for(config),
         record_traces=False,
         paper_policy=compiled_policy,
         collect_trajectories=trajectory_output is not None or paper_exploration_seed is not None,
-        low_conflict_occ_guard=cc in {
-            "paper-atcc",
-            "paper-atcc-opt",
-            "paper-atcc-oracle",
-        },
+        # Deterministic cold-path overrides change the sampled action and its
+        # propensity. Keep them confined to the explicit optimized ablation;
+        # the paper and oracle paths execute the policy action unchanged.
+        low_conflict_occ_guard=cc == "paper-atcc-opt",
+        performance_guards_enabled=cc == "paper-atcc-opt",
+        commit_admission_priority_enabled=bool(paper_commit_admission_priority),
+        delayed_write_apply_enabled=(
+            str(paper_delayed_write_apply).strip().lower() == "enabled"
+        ),
+        priority_config=PriorityConfig(
+            sql_quantum_ms=10.0 * quantum_scale,
+            interval_quantum_ms=10.0 * quantum_scale,
+            blocked_quantum_ms=100.0 * quantum_scale,
+        ),
+        priority_enabled=str(paper_priority).strip().lower() == "enabled",
     )
+    manager.paper_static_initial_mask = (
+        int(paper_static_protection_mask) & 0xF
+        if str(paper_switching).strip().lower() == "static"
+        else 0
+    )
+    manager.paper_force_runtime_path = not bool(paper_deferred_replay_enabled)
     all_rows = list(rows)
     if warmup_rows:
         all_rows.extend(warmup_rows)
@@ -463,6 +548,7 @@ def run_trace(
             max_attempts,
             duration_s=float(warmup_seconds),
             cycle_trace=cycle_trace,
+            execution_workers=execution_workers,
         )
         manager.trajectory_collector.clear()
         manager.reset_measurement_diagnostics()
@@ -474,6 +560,7 @@ def run_trace(
         max_attempts,
         duration_s=float(measure_seconds),
         cycle_trace=cycle_trace,
+        execution_workers=execution_workers,
     )
     result = result_row(sample, cc, counters, elapsed_s, tokens_per_operation, rows, manager)
     if trajectory_output is not None and cc in {
@@ -510,12 +597,24 @@ def run_rows(
     *,
     duration_s: float = 0.0,
     cycle_trace: bool = True,
+    execution_workers: int = 0,
 ) -> tuple[MixedCounters, float]:
     by_worker: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
-        by_worker[int(float(row["worker_id"]))].append(row)
+        original_worker = int(float(row["worker_id"]))
+        slot = (
+            original_worker % int(execution_workers)
+            if int(execution_workers) > 0
+            else original_worker
+        )
+        by_worker[slot].append(row)
     for worker_rows in by_worker.values():
-        worker_rows.sort(key=lambda row: int(float(row["sequence"])))
+        worker_rows.sort(
+            key=lambda row: (
+                int(float(row["sequence"])),
+                int(float(row["worker_id"])),
+            )
+        )
 
     worker_kinds = {
         worker_id: {str(row["client_type"]) for row in worker_rows}
@@ -544,11 +643,25 @@ def run_rows(
         config,
         agent_worker_count=agent_worker_count,
     )
-    agent_admission = (
-        threading.BoundedSemaphore(agent_admission_cap)
-        if 0 < agent_admission_cap < agent_worker_count
-        else None
-    )
+    if 0 < agent_admission_cap < agent_worker_count:
+        if (
+            str(config.workload).strip().lower() == "tpcc"
+            and str(config.level).strip().lower() == "high"
+            and int(config.background_workers) == 0
+        ):
+            agent_admission = TPCCReplayPressureAdmission(
+                manager,
+                full_limit=agent_worker_count,
+                pressure_limit=agent_admission_cap,
+            )
+        else:
+            agent_admission = ObservedPressureAdmission(
+                manager,
+                full_limit=agent_worker_count,
+                pressure_limit=agent_admission_cap,
+            )
+    else:
+        agent_admission = None
     background_admission_cap = paper_background_admission_cap(
         manager,
         cc,
@@ -657,6 +770,20 @@ def worker_main(
         measurement_deadline = (
             timed_window.deadline if timed_window is not None else float("inf")
         )
+        background_batch_size = paper_background_batch_size(manager, cc, config)
+        if client_type != "agent" and background_batch_size > 1:
+            run_paper_background_batches(
+                manager,
+                cc,
+                config,
+                selected_rows,
+                rng,
+                lock,
+                counters,
+                measurement_deadline,
+                batch_size=background_batch_size,
+            )
+            return
         for logical_instance, row in enumerate(selected_rows):
             if row["client_type"] == "agent":
                 logical_row = dict(row)
@@ -687,6 +814,12 @@ def worker_main(
                 finally:
                     if agent_admission is not None:
                         agent_admission.release()
+                client_think_ms = max(
+                    0,
+                    int(float(dict(row.get("_context", {}) or {}).get("client_think_ms", 0) or 0)),
+                )
+                if client_think_ms:
+                    time.sleep(client_think_ms / 1000.0)
             else:
                 admission_started = time.perf_counter()
                 if background_admission is not None:
@@ -716,6 +849,292 @@ def worker_main(
     finally:
         if fixed_count_coordination is not None and client_type == "agent":
             fixed_count_coordination.agent_worker_done()
+
+
+def paper_background_batch_size(
+    manager: AgentTransactionManager,
+    cc: str,
+    config: MixedBenchmarkConfig,
+) -> int:
+    """Group only disjoint short background procedures in paper ATCC."""
+
+    registry = getattr(manager, "cc_registry", None)
+    resolve = getattr(registry, "resolve", None)
+    if not callable(resolve) or getattr(resolve(cc), "name", "") != "paper-atcc-opt":
+        return 1
+    if int(config.background_workers) <= 0:
+        return 1
+    if str(config.workload).strip().lower() != "ycsb":
+        return 1
+    level = str(config.level).strip().lower()
+    clients = max(1, int(config.clients) or int(config.agent_workers) + int(config.background_workers))
+    background = max(1, int(config.background_workers))
+    pressure_window = max(2, min(64, (clients * background) // 8))
+    if level == "low":
+        return pressure_window
+    if level == "medium":
+        return max(2, pressure_window // 2)
+    return 1
+
+
+def run_paper_background_batches(
+    manager: AgentTransactionManager,
+    cc: str,
+    config: MixedBenchmarkConfig,
+    rows: Iterable[dict[str, Any]],
+    rng: random.Random,
+    lock: threading.Lock,
+    counters: MixedCounters,
+    measurement_deadline: float,
+    *,
+    batch_size: int,
+) -> None:
+    """Publish disjoint stored procedures as one serializable native batch.
+
+    Every row remains one logical background transaction in the reported
+    counters. Rows are grouped only when their complete background procedure
+    object sets are disjoint, so the atomic native publish is equivalent to a
+    serial order of the original transactions. Agent policy inputs remain
+    online-observed; this path consumes no Agent future target.
+    """
+
+    pending: list[
+        tuple[
+            dict[str, Any],
+            tuple[tuple[str, int], ...],
+            tuple[tuple[str, str], ...],
+        ]
+    ] = []
+    pending_objects: set[str] = set()
+    batch_sequence = 0
+
+    def flush() -> None:
+        nonlocal batch_sequence, pending, pending_objects
+        if not pending:
+            return
+        batch_sequence += 1
+        checks = tuple(item for _row, read_rows, _writes in pending for item in read_rows)
+        writes = tuple(item for _row, _reads, write_rows in pending for item in write_rows)
+        started = time.perf_counter()
+        handled, committed = manager.try_native_background_batch(
+            f"paper-bg-batch-{threading.get_ident()}-{batch_sequence}-{rng.randrange(10_000_000)}",
+            checks,
+            writes,
+            sample_metrics=True,
+            background_workers=config.background_workers,
+            allow_reader_bypass=False,
+        )
+        elapsed = time.perf_counter() - started
+        if handled and committed:
+            count = len(pending)
+            committed_at = time.perf_counter()
+            with lock:
+                counters.background_attempts += count
+                counters.background_commits += count
+                if committed_at <= float(measurement_deadline):
+                    counters.steady_background_commits += count
+                counters.background_commit_s += elapsed
+                counters.background_row_s += elapsed
+        else:
+            for row, _read_rows, _write_rows in pending:
+                run_background_row(
+                    manager,
+                    cc,
+                    config,
+                    row,
+                    rng,
+                    lock,
+                    counters,
+                    measurement_deadline,
+                )
+        pending = []
+        pending_objects = set()
+
+    for row in rows:
+        plan = native_background_rows(manager, row["_task"])
+        if plan is None:
+            flush()
+            run_background_row(
+                manager,
+                cc,
+                config,
+                row,
+                rng,
+                lock,
+                counters,
+                measurement_deadline,
+            )
+            continue
+        checks, writes = plan
+        objects = {str(key) for key, _version in checks}
+        objects.update(str(key) for key, _value in writes)
+        if pending and (
+            len(pending) >= max(2, int(batch_size))
+            or bool(objects & pending_objects)
+        ):
+            flush()
+        pending.append((row, checks, writes))
+        pending_objects.update(objects)
+    flush()
+
+
+class ObservedPressureAdmission:
+    """Shrink Agent concurrency only after online conflict evidence appears."""
+
+    def __init__(
+        self,
+        manager: AgentTransactionManager,
+        *,
+        full_limit: int,
+        pressure_limit: int,
+    ) -> None:
+        self._manager = manager
+        self._full_limit = max(1, int(full_limit))
+        self._pressure_limit = max(1, min(self._full_limit, int(pressure_limit)))
+        self._active = 0
+        # Begin at the requested worker count.  A cold YCSB trace must pay the
+        # same scheduling cost as native OCC; only observed waiters/conflicts
+        # are allowed to shrink the window.
+        self._limit = self._full_limit
+        self._last_adjusted = 0.0
+        self._cold_windows = 0
+        self._condition = threading.Condition()
+
+    def _adjust_limit(self) -> None:
+        now = time.monotonic()
+        if now - self._last_adjusted < 0.050:
+            return
+        self._last_adjusted = now
+        metrics = self._manager.paper_runtime_metrics()
+        waiter_count = int(metrics.get("waiter_count", 0) or 0)
+        conflict_rate = float(metrics.get("conflict_abort_rate", 0.0) or 0.0)
+        hot_objects = int(
+            self._manager.hotness_tracker.snapshot().get("hot_objects", 0) or 0
+        )
+        pressured = (
+            waiter_count >= 2 or conflict_rate >= 0.12 or hot_objects >= 4
+        )
+        if pressured:
+            self._cold_windows = 0
+            shrink = max(1, waiter_count // 2)
+            if conflict_rate >= 0.30 or hot_objects >= 4:
+                shrink = max(shrink, math.ceil(self._limit * 0.25))
+            self._limit = max(self._pressure_limit, self._limit - shrink)
+            return
+        self._cold_windows += 1
+        # Recovery is deliberately slower than pressure response so queues do
+        # not repeatedly synchronize at the same hot commit boundary.
+        if self._cold_windows >= 3 and self._limit < self._full_limit:
+            self._limit += 1
+            self._cold_windows = 0
+
+    def acquire(self) -> None:
+        with self._condition:
+            while True:
+                self._adjust_limit()
+                if self._active < self._limit:
+                    self._active += 1
+                    return
+                self._condition.wait(timeout=0.005)
+
+    def release(self) -> None:
+        with self._condition:
+            if self._active <= 0:
+                raise RuntimeError("Agent admission released without an owner")
+            self._active -= 1
+            self._condition.notify_all()
+
+
+class TPCCReplayPressureAdmission:
+    """Adapt the all-Agent TPC-C window from the real replay queue.
+
+    This is intentionally separate from the YCSB/global pressure controller.
+    The lower bound keeps enough deferred-reasoning tasks in flight to feed the
+    one-warehouse commit replay, while actual replay waiters drive fast shrink
+    and an empty queue drives slow recovery.
+    """
+
+    def __init__(
+        self,
+        manager: AgentTransactionManager,
+        *,
+        full_limit: int,
+        pressure_limit: int,
+    ) -> None:
+        self._manager = manager
+        self._full_limit = max(1, int(full_limit))
+        self._pressure_limit = max(
+            1, min(self._full_limit, int(pressure_limit))
+        )
+        self._active = 0
+        self._limit = self._full_limit
+        self._last_adjusted = 0.0
+        self._empty_windows = 0
+        self._wait_queue: list[tuple[object, float]] = []
+        self._max_bypass_wait_s = 1.200
+        self._condition = threading.Condition()
+
+    def _adjust_limit(self) -> None:
+        now = time.monotonic()
+        if now - self._last_adjusted < 0.020:
+            return
+        self._last_adjusted = now
+        pressure = tpcc_replay_gate_pressure(self._manager)
+        replay_waiters = int(pressure.get("waiters", 0) or 0)
+        replay_active = int(pressure.get("active", 0) or 0)
+        runtime = self._manager.paper_runtime_metrics()
+        lock_waiters = int(runtime.get("waiter_count", 0) or 0)
+
+        if replay_waiters > 0 or lock_waiters > 0:
+            self._empty_windows = 0
+            shrink = max(
+                1,
+                math.ceil(replay_waiters / 2),
+                math.ceil(lock_waiters / 2),
+            )
+            self._limit = max(
+                self._pressure_limit,
+                self._limit - shrink,
+            )
+            return
+
+        # A busy gate with no queue is the desired saturation point.  Reopen
+        # only after repeated empty observations, one worker at a time.
+        if replay_active:
+            self._empty_windows = 0
+            return
+        self._empty_windows += 1
+        if self._empty_windows >= 3 and self._limit < self._full_limit:
+            self._limit += 1
+            self._empty_windows = 0
+
+    def acquire(self) -> None:
+        with self._condition:
+            token = object()
+            self._wait_queue.append((token, time.monotonic()))
+            while True:
+                self._adjust_limit()
+                head_token, head_started = self._wait_queue[0]
+                oldest_wait_s = max(0.0, time.monotonic() - head_started)
+                bounded_bypass = oldest_wait_s < self._max_bypass_wait_s
+                if self._active < self._limit and (
+                    head_token is token or bounded_bypass
+                ):
+                    for index, (queued, _started) in enumerate(self._wait_queue):
+                        if queued is token:
+                            self._wait_queue.pop(index)
+                            break
+                    self._active += 1
+                    return
+                self._condition.wait(timeout=0.005)
+
+    def release(self) -> None:
+        with self._condition:
+            if self._active <= 0:
+                raise RuntimeError("TPC-C admission released without an owner")
+            self._active -= 1
+            self._adjust_limit()
+            self._condition.notify_all()
 
 
 class FixedCountRunCoordinator:
@@ -867,13 +1286,16 @@ def run_agent_row(
                 wait_s,
                 diagnostics,
             )
-            reuse_reasoning = True
+            reuse_reasoning = bool(config.atcc_retry_cache_enabled)
         else:
-            reuse_reasoning = should_reuse_atcc_retry_plan(
-                manager,
-                cc,
-                config,
-                result,
+            reuse_reasoning = bool(
+                config.atcc_retry_cache_enabled
+                and should_reuse_atcc_retry_plan(
+                    manager,
+                    cc,
+                    config,
+                    result,
+                )
             )
         final_result = result
         task_reservation_wait_s += float(wait_s)
@@ -921,6 +1343,8 @@ def run_agent_row(
                 else:
                     counters.agent_aborts += 1
                     counters.wasted_reasoning_ms += int(result.get("wasted_reasoning_ms", 0) or 0)
+                    if planned.total_reasoning_delay_ms > 0 and not used_cached_retry:
+                        counters.agent_wasted_reasoning_operation_units += operation_units
                     reason = str(result.get("failure_reason", "") or attempt_failure_reason(result))
                     if reason == "lock-timeout":
                         counters.lock_timeout_aborts += 1
@@ -992,7 +1416,7 @@ def run_background_row(
     paper_atcc = getattr(manager.cc_registry.resolve(cc), "family", "") == "paper-atcc"
     online_reader_bypass = bool(
         paper_atcc
-        and str(cc).strip().lower() == "paper-atcc"
+        and str(cc).strip().lower() == "paper-atcc-opt"
         and str(config.workload).strip().lower() == "ycsb"
         and str(config.level).strip().lower() == "high"
         and int(config.background_workers) > 0
@@ -1077,9 +1501,7 @@ def run_background_row(
                 }
                 if paper_atcc:
                     metadata["paper_atcc_backend"] = True
-                    metadata["paper_atcc_optimized"] = bool(
-                        cc == "paper-atcc-opt" or online_reader_bypass
-                    )
+                    metadata["paper_atcc_optimized"] = cc == "paper-atcc-opt"
                     metadata["access_set_visibility"] = (
                         "stored_procedure_declared"
                     )
@@ -1101,13 +1523,13 @@ def run_background_row(
             if txn is not None:
                 manager.atcc_locks.release_all(txn.context)
             committed = False
-            defer_current_update = paper_atcc
+            defer_current_update = str(cc).strip().lower() == "paper-atcc-opt"
 
         attempts_done += 1
         if committed:
             break
         aborts_done += 1
-        if paper_atcc:
+        if str(cc).strip().lower() == "paper-atcc-opt":
             manager.note_background_abort()
             # A conflicting short update is deferred to the next trace cycle
             # so this worker can schedule a disjoint row.  Retrying the same
@@ -1212,7 +1634,18 @@ def result_row(
         * int(tokens_per_operation)
     )
     counterfactual_no_cache_tokens = total_tokens + retry_cache_saved_tokens
+    wasted_reasoning_tokens = (
+        int(counters.agent_wasted_reasoning_operation_units)
+        * int(tokens_per_operation)
+    )
+    committed_reasoning_tokens = max(0, total_tokens - wasted_reasoning_tokens)
     avg_tokens = total_tokens / completed if completed else 0.0
+    wasted_tokens_per_commit = (
+        wasted_reasoning_tokens / completed if completed else 0.0
+    )
+    wasted_token_ratio = (
+        wasted_reasoning_tokens / total_tokens if total_tokens else 0.0
+    )
     agent_wait_ms_total = float(counters.agent_reservation_wait_s) * 1000.0
     overload_admission_wait_ms_total = (
         float(counters.agent_overload_admission_wait_s) * 1000.0
@@ -1587,6 +2020,11 @@ def result_row(
         ),
         "agent_avg_tokens": avg_tokens,
         "agent_total_tokens": total_tokens,
+        "agent_committed_reasoning_tokens": committed_reasoning_tokens,
+        "agent_wasted_reasoning_tokens": wasted_reasoning_tokens,
+        "agent_tokens_per_committed_txn": avg_tokens,
+        "agent_wasted_tokens_per_commit": wasted_tokens_per_commit,
+        "agent_wasted_token_ratio": wasted_token_ratio,
         "agent_initial_reasoning_invocations": counters.agent_initial_reasoning_invocations,
         "agent_retry_reasoning_invocations": counters.agent_retry_reasoning_invocations,
         "agent_cached_retry_replays": counters.agent_cached_retry_replays,
@@ -1717,6 +2155,13 @@ def cached_retry_scheduler_cooldown_s(
 ) -> float:
     """Yield enough to desynchronize cached hot-key retries without idling a worker."""
 
+    if (
+        str(config.workload).strip().lower() == "ycsb"
+        and str(config.level).strip().lower() == "medium"
+    ):
+        # Medium skew needs only a scheduler yield. Reusing the high-contention
+        # 0.5--1.0s window creates an artificial P99 spike after a rare retry.
+        return rng.uniform(0.005, 0.020)
     if int(config.background_workers) > 0:
         # Exact conflict objects are inherited from the previous online
         # attempt, so mixed retries need only a small desynchronization yield.
@@ -1735,42 +2180,21 @@ def paper_agent_admission_cap(
 
     registry = getattr(manager, "cc_registry", None)
     resolve = getattr(registry, "resolve", None)
-    if not callable(resolve) or getattr(resolve(cc), "family", "") != "paper-atcc":
+    if not callable(resolve) or getattr(resolve(cc), "name", "") != "paper-atcc-opt":
         return int(agent_worker_count)
     workload = str(config.workload).strip().lower()
-    level = str(config.level).strip().lower()
-    if workload == "ycsb" and level == "high" and int(config.background_workers) == 0:
-        return min(int(agent_worker_count), 30)
+    if workload == "ycsb" and int(config.background_workers) == 0:
+        # Keep reasoning parallelism independent from commit parallelism. Cold
+        # first attempts use native Silo; saturated YCSB serializes only the
+        # short replay suffix after online conflict evidence appears. A fixed
+        # 8-worker cap both taxed theta=0/0.5 and hid no useful conflict work.
+        return int(agent_worker_count)
     if (
         workload == "tpcc"
-        and level == "high"
         and int(config.background_workers) == 0
-        and int(config.clients) >= 32
+        and int(config.clients) >= 24
     ):
-        # One-warehouse TPC-C has only a small set of useful root writers.
-        # Keep every client queue, but prevent excess active replays from
-        # repeatedly wounding each other after the saturation point.
-        return min(int(agent_worker_count), 24)
-    if (
-        str(cc).strip().lower() == "paper-atcc"
-        and workload == "ycsb"
-        and level == "high"
-        and int(config.background_workers) > 0
-    ):
-        # Preserve every Agent client queue while limiting the number of long
-        # reasoning transactions that can simultaneously protect hot objects.
-        # The cap scales with the real background population and leaves enough
-        # Agent concurrency to retain the required Silo-relative gain.
-        clients = int(config.clients)
-        pressure_cap = 1 if clients <= 24 else 2
-        return min(int(agent_worker_count), pressure_cap)
-    if (
-        workload == "tpcc"
-        and level == "high"
-        and int(config.background_workers) > 0
-        and int(config.clients) >= 32
-    ):
-        return min(int(agent_worker_count), 20)
+        return min(int(agent_worker_count), max(12, int(agent_worker_count) // 3))
     return int(agent_worker_count)
 
 
@@ -1785,7 +2209,7 @@ def paper_background_admission_cap(
 
     registry = getattr(manager, "cc_registry", None)
     resolve = getattr(registry, "resolve", None)
-    if not callable(resolve) or getattr(resolve(cc), "family", "") != "paper-atcc":
+    if not callable(resolve) or getattr(resolve(cc), "name", "") != "paper-atcc-opt":
         return int(background_worker_count)
     if (
         str(config.workload).strip().lower() == "tpcc"

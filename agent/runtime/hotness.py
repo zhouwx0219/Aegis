@@ -11,7 +11,9 @@ from typing import Iterable
 @dataclasses.dataclass(frozen=True)
 class HotnessConfig:
     min_accesses: int = 3
-    absolute_hot_accesses: int = 8
+    # Access maintenance is sampled by the runtime, so three sampled hits are
+    # already strong repeated-access evidence.
+    absolute_hot_accesses: int = 3
     access_skew_multiple: float = 2.0
     min_access_share: float = 0.002
     min_conflict_events: int = 2

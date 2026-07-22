@@ -16,6 +16,7 @@ class TransactionHooks(Protocol):
     def after_write(self, txn: Any, object_id: str) -> None: ...
     def on_phase_change(self, txn: Any, phase: TransactionPhase) -> None: ...
     def on_action_change(self, txn: Any, old_action: LockAction, new_action: LockAction) -> None: ...
+    def on_operation_finished(self, txn: Any) -> None: ...
     def before_commit(self, txn: Any) -> None: ...
     def on_abort(self, txn: Any, reason: str) -> None: ...
     def on_finish(self, txn: Any) -> None: ...
@@ -29,6 +30,7 @@ class NoopTransactionHooks:
     def after_write(self, txn: Any, object_id: str) -> None: pass
     def on_phase_change(self, txn: Any, phase: TransactionPhase) -> None: pass
     def on_action_change(self, txn: Any, old_action: LockAction, new_action: LockAction) -> None: pass
+    def on_operation_finished(self, txn: Any) -> None: pass
     def before_commit(self, txn: Any) -> None: pass
     def on_abort(self, txn: Any, reason: str) -> None: pass
     def on_finish(self, txn: Any) -> None: pass
@@ -88,6 +90,7 @@ class OperationInterceptor:
         now = time.monotonic_ns()
         txn.context.last_operation_end_ns = now
         txn.context.last_agent_accounted_ns = now
+        self.hooks.on_operation_finished(txn)
 
     def begin(self, txn: Any) -> None:
         self.hooks.on_begin(txn)

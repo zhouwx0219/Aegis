@@ -11,11 +11,15 @@ venv/
 build/
 dist/
 tmp/
-output/
+outputs/
+docs/
+scripts/
 .codex-tmp/
+.codex/
 results/
 .pytest_cache/
 .mypy_cache/
+third_party/
 .ruff_cache/
 .DS_Store
 Thumbs.db
@@ -23,7 +27,7 @@ Thumbs.db
 *.swo
 astra_core.egg-info/
 *.egg-info/
-
+tools/
 # Local experiment outputs. Keep reports in README/docs and force-add any
 # artifact that must be versioned for a paper or release.
 /results/*.json

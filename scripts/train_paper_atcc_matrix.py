@@ -47,6 +47,15 @@ def main() -> int:
     parser.add_argument("--seeds", default="810104,810105,810106")
     parser.add_argument("--duration", type=float, default=4.0)
     parser.add_argument("--warmup-seconds", type=float, default=2.0)
+    parser.add_argument("--max-attempts", type=int, default=1)
+    parser.add_argument(
+        "--paper-deferred-replay",
+        action="store_true",
+        help=(
+            "Opt into the whole-transaction replay ablation. The paper main "
+            "path executes reasoning and accesses in their original order."
+        ),
+    )
     parser.add_argument("--reasoning-scale", type=float, default=1.0)
     parser.add_argument("--transactions-per-worker", type=int, default=128)
     parser.add_argument("--generation", type=int, default=1)
@@ -68,6 +77,8 @@ def main() -> int:
         raise SystemExit("--exploration-stay-probability must be in [0, 1]")
     if not 0.0 <= float(args.exploration_epsilon) <= 1.0:
         raise SystemExit("--exploration-epsilon must be in [0, 1]")
+    if args.max_attempts <= 0:
+        raise SystemExit("--max-attempts must be positive")
 
     variants = split_csv(args.variants)
     unknown = sorted(set(variants) - set(VARIANTS))
@@ -143,7 +154,8 @@ def main() -> int:
                             str(args.exploration_stay_probability),
                             "--measure-seconds", str(args.duration),
                             "--warmup-seconds", str(args.warmup_seconds),
-                            "--max-attempts", "5",
+                            "--max-attempts", str(args.max_attempts),
+                            "--disable-atcc-retry-cache",
                         ]
                         if args.initial_policy is not None:
                             command.extend(
@@ -154,6 +166,8 @@ def main() -> int:
                                     str(args.exploration_epsilon),
                                 ]
                             )
+                        if not args.paper_deferred_replay:
+                            command.append("--disable-paper-deferred-replay")
                         run_checked(command)
                     if not trajectory.exists():
                         detail = result.read_text(encoding="utf-8") if result.exists() else "missing result"
@@ -226,6 +240,13 @@ def main() -> int:
         "agent_ratios": ratios,
         "duration_s_per_run": args.duration,
         "warmup_s_per_run": args.warmup_seconds,
+        "max_attempts": args.max_attempts,
+        "paper_deferred_replay": bool(args.paper_deferred_replay),
+        "access_timing": (
+            "whole_transaction_replay_ablation"
+            if args.paper_deferred_replay
+            else "real_interleaved_operations"
+        ),
         "reasoning_scale": args.reasoning_scale,
         "runs": len(source_runs),
         "elapsed_s": time.time() - started,
@@ -237,6 +258,7 @@ def main() -> int:
         "selective_refinement": bool(compiled.refinement_actor),
         "refinement_distance_threshold": args.refinement_distance_threshold,
         "occ_cold_start_guard": compiled.occ_cold_start_guard,
+        "atcc_retry_cache_enabled": False,
         "policy_uses_workload_labels": False,
         "outcome_oracle": False,
         "action_space": "lock_protection_mask_4bit",
