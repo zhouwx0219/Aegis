@@ -328,8 +328,8 @@ class CreditReviewCursor:
             self._reason(label, "commit")
         # The external service completes before the final state-dependent read
         # for every concurrency-control system. Aegis may then admit the
-        # materialized suffix, but it does not receive a different operation
-        # order from the baselines.
+        # materialized hot suffix, but it does not receive a different
+        # operation order from the baselines.
         self.sleep_fn(self.workload.config.commit_apply_ms / 1000.0)
         if before_commit_batch is not None:
             self.commit_admission_wait_ms += max(

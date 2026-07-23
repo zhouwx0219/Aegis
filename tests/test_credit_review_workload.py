@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
-from agent.runtime import AgentTransactionManager, LockAction, LockClass
+from agent.runtime import AgentTransactionManager
 from agent.workloads.credit_review import CreditReviewConfig, CreditReviewWorkload
 from scripts.unified_trace.run_credit_review_experiment import (
     acquire_policy_commit_batch,
+    credit_retry_delay_ms,
     execute_attempt,
     summarize,
     transaction_metadata,
@@ -15,6 +17,55 @@ from scripts.unified_trace.run_credit_review_experiment import (
 
 
 class CreditReviewWorkloadTests(unittest.TestCase):
+    def test_credit_retry_delay_matches_paper_retry_semantics(self):
+        self.assertEqual(
+            0,
+            credit_retry_delay_ms(task_id="credit-retry", attempt=0),
+        )
+        retry_delay = credit_retry_delay_ms(
+            task_id="credit-retry",
+            attempt=1,
+        )
+        self.assertGreaterEqual(retry_delay, 500)
+        self.assertLessEqual(retry_delay, 5000)
+        self.assertEqual(
+            retry_delay,
+            credit_retry_delay_ms(task_id="credit-retry", attempt=1),
+        )
+        self.assertEqual(
+            0,
+            credit_retry_delay_ms(
+                task_id="credit-retry",
+                attempt=1,
+                retry_delay_scale=0.0,
+            ),
+        )
+
+    def test_retry_replanning_delay_precedes_attempt(self):
+        workload = CreditReviewWorkload(
+            CreditReviewConfig(company_count=16, reasoning_scale=0.0, commit_apply_ms=0)
+        )
+        manager = AgentTransactionManager(record_traces=False, collect_trajectories=False)
+        workload.register(manager)
+        task = workload.task_for(seed=19, worker_id=0, sequence=0)
+
+        with mock.patch(
+            "scripts.unified_trace.run_credit_review_experiment.sleep_for_reasoning"
+        ) as sleep:
+            result, _execution = execute_attempt(
+                manager,
+                workload,
+                task,
+                task_id="credit-retry-silo",
+                system="silo",
+                attempt=1,
+            )
+
+        self.assertTrue(result.committed)
+        sleep.assert_called_once_with(
+            credit_retry_delay_ms(task_id="credit-retry-silo", attempt=1)
+        )
+
     def test_cursor_reveals_targets_only_as_operations_execute(self):
         workload = CreditReviewWorkload(
             CreditReviewConfig(company_count=16, reasoning_scale=0.0, commit_apply_ms=0)
@@ -92,45 +143,87 @@ class CreditReviewWorkloadTests(unittest.TestCase):
         workload.register(manager)
         task = workload.task_for(seed=17, worker_id=0, sequence=0)
 
-        def unexpected_admission(*_args, **_kwargs):
-            self.fail("paper ATCC main path must not use the workload-specific admission gate")
-
-        manager.acquire_hotspot_admission = unexpected_admission
-        result, _execution = execute_attempt(
-            manager,
-            workload,
-            task,
-            task_id="credit-paper-policy-only",
-            system="paper-atcc",
-            attempt=0,
-        )
+        with mock.patch(
+            "scripts.unified_trace.run_credit_review_experiment.acquire_observed_commit_admission"
+        ) as workload_gate:
+            result, _execution = execute_attempt(
+                manager,
+                workload,
+                task,
+                task_id="credit-paper-policy-only",
+                system="paper-atcc",
+                attempt=0,
+            )
 
         self.assertTrue(result.committed)
+        workload_gate.assert_not_called()
         self.assertEqual(
             "policy_commit_batch",
             manager.traces()[-1]["metadata"]["admission_scope"],
         )
 
-    def test_policy_commit_batch_uses_action_and_hotness_not_object_names(self):
+    def test_policy_commit_batch_uses_hotness_not_object_names(self):
         manager = AgentTransactionManager(record_traces=False, collect_trajectories=False)
         manager.register_object("generic-hot", "0", kind="row")
         manager.register_object("generic-cold", "0", kind="row")
+        manager.register_object("generic-future-blind", "0", kind="row")
         for _ in range(16):
             manager.hotness_tracker.observe_access("generic-hot")
+        for _ in range(2):
+            manager.hotness_tracker.observe_contention(
+                "generic-hot", "validation-failure"
+            )
         txn = manager.begin(
             "generic-policy-batch",
             transaction_metadata("paper-atcc", retry_count=0),
             strategy="paper-atcc",
         )
-        txn.context.action = LockAction(LockClass.HOT_WRITE)
-
         acquire_policy_commit_batch(
             manager,
             txn,
-            ("generic-cold", "generic-hot"),
+            ("generic-cold", "generic-hot", "generic-future-blind"),
         )
 
-        self.assertEqual({"generic-hot"}, txn.context.held_write_locks)
+        self.assertEqual(
+            ["generic-hot"],
+            [
+                target
+                for target, _gate in txn.metadata["_observed_hotspot_admissions"]
+            ],
+        )
+        self.assertEqual(set(), txn.context.held_write_locks)
+        txn.abort("test complete", strategy="paper-atcc")
+
+    def test_policy_commit_batch_admits_materialized_hot_blind_write(self):
+        manager = AgentTransactionManager(record_traces=False, collect_trajectories=False)
+        manager.register_object("generic-observed", "0", kind="row")
+        manager.register_object("generic-future-blind", "0", kind="row")
+        for _ in range(16):
+            manager.hotness_tracker.observe_access("generic-observed")
+        for _ in range(16):
+            manager.hotness_tracker.observe_access("generic-future-blind")
+        for _ in range(2):
+            manager.hotness_tracker.observe_contention(
+                "generic-future-blind", "validation-failure"
+            )
+        txn = manager.begin(
+            "generic-observed-only",
+            transaction_metadata("paper-atcc", retry_count=0),
+            strategy="paper-atcc",
+        )
+        acquire_policy_commit_batch(
+            manager,
+            txn,
+            ("generic-observed", "generic-future-blind"),
+        )
+
+        self.assertEqual(
+            ["generic-future-blind"],
+            [
+                target
+                for target, _gate in txn.metadata["_observed_hotspot_admissions"]
+            ],
+        )
         txn.abort("test complete", strategy="paper-atcc")
 
     def test_observed_commit_admission_ablation_admits_the_observed_suffix(self):

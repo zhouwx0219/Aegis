@@ -1554,6 +1554,42 @@ class SmokeRuntimeTests(unittest.TestCase):
 
         self.assertEqual(1, int(policy.select(state).protected))
 
+    def test_ppo_compile_uses_paper_default_of_four_medoids_per_group(self):
+        policy = DiscretePPOPolicy(seed=3)
+        for index, inter_round_interval_ms in enumerate((0, 1, 2, 4, 8)):
+            state = PhaseAwareState(
+                phase="refine",
+                inter_round_interval_ms=inter_round_interval_ms,
+                read_set_size=1,
+                write_set_size=0,
+                read_set_growth=1,
+                write_set_growth=0,
+                access_overlap_ratio=0,
+                completed_rounds=1,
+                completed_operations=1,
+                recent_write_ratio=0,
+                hotspot_access_ratio=0,
+                blocked_time_ms=0,
+                retry_count=0,
+                current_action=0,
+                priority=0,
+            )
+            key = f"prototype-{index}"
+            policy.prototypes[key] = state
+            policy.prototype_counts[key] = index + 1
+
+        compiled = policy.compile(generation=1)
+        compact = policy.compile(generation=1, medoids_per_group=1)
+
+        self.assertEqual(4, compiled.medoids_per_group)
+        self.assertEqual(4, len(compiled.entries))
+        self.assertEqual(
+            4,
+            CompiledPhasePolicy.from_dict(compiled.to_dict()).medoids_per_group,
+        )
+        self.assertEqual(1, compact.medoids_per_group)
+        self.assertEqual(1, len(compact.entries))
+
     def test_compiled_policy_does_not_fallback_across_phases(self):
         policy = CompiledPhasePolicy(
             [CompiledPolicyEntry(phase="refine", current_action=0, action=3)],

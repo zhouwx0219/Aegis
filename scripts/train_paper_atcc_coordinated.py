@@ -17,7 +17,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from agent.cc.atcc.ppo import DiscretePPOPolicy, DiscretePPOTrainer, PPOConfig, audit_policy
+from agent.cc.atcc.ppo import (
+    DiscretePPOPolicy,
+    DiscretePPOTrainer,
+    PAPER_MEDOIDS_PER_GROUP,
+    PPOConfig,
+    audit_policy,
+)
 from agent.runtime import (
     CompiledPhasePolicy,
     CompiledPolicyEntry,
@@ -105,7 +111,12 @@ def main() -> int:
     parser.add_argument("--ppo-seed", type=int, default=810100)
     parser.add_argument("--shared-reward-weight", type=float, default=100.0)
     parser.add_argument("--refinement-distance-threshold", type=float)
-    parser.add_argument("--medoids-per-group", type=int, default=1)
+    parser.add_argument(
+        "--medoids-per-group",
+        type=int,
+        default=PAPER_MEDOIDS_PER_GROUP,
+        help="Representative state keys retained per phase/action group (paper default: 4).",
+    )
     parser.add_argument("--disable-occ-cold-start-guard", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(

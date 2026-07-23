@@ -78,6 +78,10 @@ FIELDS = [
     "paper_policy_path",
     "atcc_retry_cache_enabled",
     "paper_deferred_replay_enabled",
+    "tpcc_replay_capacity",
+    "ycsb_replay_capacity",
+    "max_attempts",
+    "retry_budget",
     "status",
     "elapsed_s",
     "measurement_window_s",
@@ -336,6 +340,8 @@ def main() -> int:
     parser.add_argument("--priority-quantum-scale", type=float, default=1.0)
     parser.add_argument("--disable-atcc-retry-cache", action="store_true")
     parser.add_argument("--disable-paper-deferred-replay", action="store_true")
+    parser.add_argument("--tpcc-replay-capacity", type=int, default=1)
+    parser.add_argument("--ycsb-replay-capacity", type=int, default=1)
     parser.add_argument(
         "--max-attempts",
         type=int,
@@ -356,6 +362,10 @@ def main() -> int:
     args = parser.parse_args()
     if args.max_attempts < 1:
         raise SystemExit("--max-attempts must be positive")
+    if args.tpcc_replay_capacity < 1:
+        raise SystemExit("--tpcc-replay-capacity must be positive")
+    if args.ycsb_replay_capacity < 1:
+        raise SystemExit("--ycsb-replay-capacity must be positive")
     if args.max_attempts != 1 and not args.allow_retries:
         raise SystemExit(
             "paper experiments disable retries by default; pass --allow-retries explicitly"
@@ -389,6 +399,8 @@ def main() -> int:
                     priority_quantum_scale=args.priority_quantum_scale,
                     atcc_retry_cache_enabled=not args.disable_atcc_retry_cache,
                     paper_deferred_replay_enabled=not args.disable_paper_deferred_replay,
+                    tpcc_replay_capacity=args.tpcc_replay_capacity,
+                    ycsb_replay_capacity=args.ycsb_replay_capacity,
                     max_attempts=args.max_attempts,
                     tokens_per_operation=args.tokens_per_operation,
                     warmup_seconds=args.warmup_seconds,
@@ -457,6 +469,8 @@ def run_trace(
     priority_quantum_scale: float = 1.0,
     atcc_retry_cache_enabled: bool = True,
     paper_deferred_replay_enabled: bool = True,
+    tpcc_replay_capacity: int = 1,
+    ycsb_replay_capacity: int = 1,
     max_attempts: int,
     tokens_per_operation: int,
     warmup_seconds: float = 0.0,
@@ -546,6 +560,8 @@ def run_trace(
         else 0
     )
     manager.paper_force_runtime_path = not bool(paper_deferred_replay_enabled)
+    manager.tpcc_replay_capacity = max(1, int(tpcc_replay_capacity))
+    manager.ycsb_replay_capacity = max(1, int(ycsb_replay_capacity))
     all_rows = list(rows)
     if warmup_rows:
         all_rows.extend(warmup_rows)
@@ -595,6 +611,10 @@ def run_trace(
             "paper_policy_path": str(paper_policy.resolve()) if paper_policy else "",
             "atcc_retry_cache_enabled": bool(atcc_retry_cache_enabled),
             "paper_deferred_replay_enabled": bool(paper_deferred_replay_enabled),
+            "tpcc_replay_capacity": int(tpcc_replay_capacity),
+            "ycsb_replay_capacity": int(ycsb_replay_capacity),
+            "max_attempts": int(max_attempts),
+            "retry_budget": max(0, int(max_attempts) - 1),
         },
     )
     if trajectory_output is not None and cc == "paper-atcc":
@@ -1725,6 +1745,10 @@ def result_row(
         "paper_deferred_replay_enabled": runtime.get(
             "paper_deferred_replay_enabled", ""
         ),
+        "tpcc_replay_capacity": runtime.get("tpcc_replay_capacity", ""),
+        "ycsb_replay_capacity": runtime.get("ycsb_replay_capacity", ""),
+        "max_attempts": runtime.get("max_attempts", ""),
+        "retry_budget": runtime.get("retry_budget", ""),
         "status": "ok",
         "elapsed_s": elapsed_s,
         "measurement_window_s": measurement_window_s,

@@ -20,6 +20,7 @@ if str(ROOT) not in sys.path:
 from agent.cc.atcc.ppo import (
     DiscretePPOPolicy,
     DiscretePPOTrainer,
+    PAPER_MEDOIDS_PER_GROUP,
     PPOConfig,
     audit_policy,
     state_key,
@@ -86,6 +87,12 @@ def main() -> int:
     parser.add_argument("--initial-policy", type=Path)
     parser.add_argument("--exploration-epsilon", type=float, default=0.2)
     parser.add_argument("--refinement-distance-threshold", type=float)
+    parser.add_argument(
+        "--medoids-per-group",
+        type=int,
+        default=PAPER_MEDOIDS_PER_GROUP,
+        help="Representative state keys retained per phase/action group (paper default: 4).",
+    )
     parser.add_argument("--disable-occ-cold-start-guard", action="store_true")
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
@@ -96,6 +103,8 @@ def main() -> int:
         raise SystemExit("--exploration-epsilon must be in [0, 1]")
     if args.max_attempts <= 0:
         raise SystemExit("--max-attempts must be positive")
+    if args.medoids_per_group <= 0:
+        raise SystemExit("--medoids-per-group must be positive")
     if args.ycsb_operations < 0:
         raise SystemExit("--ycsb-operations must be non-negative")
     if (
@@ -240,6 +249,7 @@ def main() -> int:
     training = DiscretePPOTrainer(config).train(policy, transitions)
     compiled = policy.compile(
         generation=args.generation,
+        medoids_per_group=args.medoids_per_group,
         refinement_distance_threshold=args.refinement_distance_threshold,
         occ_cold_start_guard=not args.disable_occ_cold_start_guard,
     )
@@ -297,6 +307,7 @@ def main() -> int:
         "policy_audit": policy_audit,
         "coverage": coverage,
         "compiled_entries": len(compiled.entries),
+        "medoids_per_group": compiled.medoids_per_group,
         "selective_refinement": bool(compiled.refinement_actor),
         "refinement_distance_threshold": args.refinement_distance_threshold,
         "occ_cold_start_guard": compiled.occ_cold_start_guard,

@@ -23,6 +23,7 @@ from agent.runtime.trajectory import PolicyTransition
 
 ALL_ACTIONS = tuple(range(16))
 LOCK_BITS = (1, 2, 4, 8)
+PAPER_MEDOIDS_PER_GROUP = 4
 
 
 @dataclasses.dataclass(frozen=True)
@@ -136,7 +137,7 @@ class DiscretePPOPolicy:
         self,
         *,
         generation: int,
-        medoids_per_group: int = 1,
+        medoids_per_group: int = PAPER_MEDOIDS_PER_GROUP,
         refinement_distance_threshold: float | None = None,
         occ_cold_start_guard: bool = False,
     ) -> CompiledPhasePolicy:

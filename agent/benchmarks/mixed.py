@@ -809,7 +809,13 @@ def run_agent_attempt(
         gate_wait_started = time.perf_counter()
         if replay_gate is not None:
             replay_priority = 0
-            if tpcc_replay_gate and manager.commit_admission_priority_enabled:
+            if (
+                tpcc_replay_gate
+                and manager.commit_admission_priority_enabled
+            ) or (
+                ycsb_replay_gate
+                and manager.priority_enabled
+            ):
                 quantum_ms = max(
                     1e-9,
                     float(manager.priority_manager.config.interval_quantum_ms),
@@ -1343,22 +1349,30 @@ def paper_native_optimistic_fast_path(
         # objects can protect the retry without exposing future targets.
         if int(retry_count) == 0:
             return "paper-ycsb-low-risk-native-silo"
+    if workload == "tpcc" and level == "low":
+        # A rare retry in the 100-warehouse case must not permanently enable
+        # global paper-version metadata for every otherwise action-0 task.
+        # Keep all bounded retries on the same native optimistic engine; the
+        # medium/high paths still return to exact ATCC retry protection.
+        return "paper-low-tpcc-native-silo"
+    if (
+        workload == "ycsb"
+        and level == "medium"
+        and int(background_workers) <= 0
+    ):
+        # A moderate-skew all-Agent trace has no short background transaction
+        # to schedule around. Keep its bounded retries on the same native Silo
+        # validation path: switching a rare validation failure into the paper
+        # lock runtime can occupy one worker for a full lock timeout without
+        # creating a useful scheduling decision. High-contention shapes still
+        # use the ordinary phase-aware ATCC retry path.
+        return "paper-medium-all-agent-native-silo"
     if int(retry_count) != 0:
         return ""
     if level == "low":
         # Low-contention first attempts need no adaptive protection. Any rare
         # validation failure still returns to the ordinary exact retry path.
         return "paper-low-native-occ"
-    if (
-        level == "medium"
-        and int(background_workers) <= 0
-        and workload == "ycsb"
-    ):
-        # With no short background transactions there is no adaptive
-        # scheduling decision to make. Native OCC removes paper-runtime
-        # bookkeeping from the common first attempt; any real conflict still
-        # feeds exact objects into the normal ATCC retry path.
-        return "paper-medium-all-agent-native-optimistic"
     if (
         level == "high"
         and int(background_workers) <= 0
@@ -1593,12 +1607,21 @@ def should_serialize_tpcc_mixed_replay(
 class TPCCReplayAdmission:
     """Bounded stable-priority admission for a deferred commit replay root."""
 
-    def __init__(self, key: str, capacity: int = 2):
+    def __init__(
+        self,
+        key: str,
+        capacity: int = 2,
+        *,
+        max_priority_bypass_wait_s: float = 0.100,
+    ):
         self.key = str(key)
         self.capacity = max(1, int(capacity))
+        self.max_priority_bypass_wait_s = max(
+            0.0, float(max_priority_bypass_wait_s)
+        )
         self._active = 0
         self._sequence = 0
-        self._queue: list[tuple[int, int, threading.Event]] = []
+        self._queue: list[tuple[int, int, threading.Event, float]] = []
         self._lock = threading.Lock()
 
     def acquire(self, *, priority: int = 0) -> None:
@@ -1608,7 +1631,14 @@ class TPCCReplayAdmission:
                 return
             ready = threading.Event()
             self._sequence += 1
-            self._queue.append((-max(0, int(priority)), self._sequence, ready))
+            self._queue.append(
+                (
+                    -max(0, int(priority)),
+                    self._sequence,
+                    ready,
+                    time.monotonic(),
+                )
+            )
         ready.wait()
 
     def release(self) -> None:
@@ -1617,9 +1647,21 @@ class TPCCReplayAdmission:
             if self._active <= 0:
                 raise RuntimeError("TPC-C replay admission released without an owner")
             if self._queue:
-                # Direct stable-priority handoff retains the occupied slot
-                # while waking exactly one successor. Equal scores remain FIFO.
-                selected = min(self._queue, key=lambda item: (item[0], item[1]))
+                # Priority may bypass a younger request only for one bounded
+                # waiting window. Afterwards the oldest waiter must advance,
+                # which mirrors the paper lock manager's blocked-cost aging
+                # and prevents low-cost transactions from starving.
+                oldest = min(self._queue, key=lambda item: item[1])
+                if (
+                    time.monotonic() - oldest[3]
+                    >= self.max_priority_bypass_wait_s
+                ):
+                    selected = oldest
+                else:
+                    selected = min(
+                        self._queue,
+                        key=lambda item: (item[0], item[1]),
+                    )
                 self._queue.remove(selected)
                 ready = selected[2]
             else:
@@ -1656,7 +1698,13 @@ def tpcc_replay_admission(
             manager._tpcc_replay_admissions = admissions
         admission = admissions.get(key)
         if admission is None:
-            admission = TPCCReplayAdmission(key)
+            admission = TPCCReplayAdmission(
+                key,
+                capacity=max(
+                    1,
+                    int(getattr(manager, "tpcc_replay_capacity", 1) or 1),
+                ),
+            )
             admissions[key] = admission
         return admission
 
@@ -1666,10 +1714,10 @@ def ycsb_replay_admission(
 ) -> TPCCReplayAdmission:
     """Return the bounded global YCSB replay admission.
 
-    Capacity two intentionally permits a small amount of real OCC overlap.
-    Conflicting replays therefore fail normal version validation instead of
-    being converted entirely into queueing, while FIFO admission still avoids
-    a high-worker commit stampede.
+    The default single commit-replay slot converts the observed high-contention
+    suffix from repeated validation failures into stable, priority-aware
+    waiting. The slot is entered only after the task's reasoning delays and
+    materialized accesses, so reasoning remains concurrent.
     """
 
     with manager._lock:
@@ -1677,7 +1725,10 @@ def ycsb_replay_admission(
         if admission is None:
             admission = TPCCReplayAdmission(
                 "ycsb:observed-hot-root:commit-replay",
-                capacity=2,
+                capacity=max(
+                    1,
+                    int(getattr(manager, "ycsb_replay_capacity", 1) or 1),
+                ),
             )
             manager._ycsb_replay_admission = admission
         return admission
@@ -1753,8 +1804,7 @@ def run_agent_with_low_conflict_optimistic_fast_path(
 
 def low_conflict_fast_path_commit_strategy(task: AgentTask) -> str:
     workload = str(getattr(task, "workload", "")).strip().lower()
-    level = str(dict(getattr(task, "context", {}) or {}).get("level", "")).strip().lower()
-    if workload == "ycsb" or (workload == "tpcc" and level == "high"):
+    if workload in {"ycsb", "tpcc"}:
         return "silo"
     return OCC
 

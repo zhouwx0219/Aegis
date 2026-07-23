@@ -43,6 +43,8 @@ GROUP_FIELDS = (
     "paper_policy_path",
     "atcc_retry_cache_enabled",
     "paper_deferred_replay_enabled",
+    "max_attempts",
+    "retry_budget",
     "priority_quantum_scale",
     "policy_invocation_ops",
     "throughput_metric",
