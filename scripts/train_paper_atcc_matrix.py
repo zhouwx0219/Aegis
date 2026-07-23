@@ -56,8 +56,25 @@ def main() -> int:
             "path executes reasoning and accesses in their original order."
         ),
     )
+    parser.add_argument(
+        "--paper-delayed-write-apply",
+        action="store_true",
+        help="Train with the paper's deferred-write commit path enabled.",
+    )
     parser.add_argument("--reasoning-scale", type=float, default=1.0)
     parser.add_argument("--transactions-per-worker", type=int, default=128)
+    parser.add_argument(
+        "--ycsb-operations",
+        type=int,
+        default=0,
+        help="Override YCSB transaction length for both training and warmup traces.",
+    )
+    parser.add_argument("--ycsb-write-ratio", type=float, default=None)
+    parser.add_argument(
+        "--paper-performance-guards",
+        choices=("enabled", "disabled"),
+        default="disabled",
+    )
     parser.add_argument("--generation", type=int, default=1)
     parser.add_argument("--ppo-seed", type=int, default=810100)
     parser.add_argument("--epochs", type=int, default=12)
@@ -79,6 +96,13 @@ def main() -> int:
         raise SystemExit("--exploration-epsilon must be in [0, 1]")
     if args.max_attempts <= 0:
         raise SystemExit("--max-attempts must be positive")
+    if args.ycsb_operations < 0:
+        raise SystemExit("--ycsb-operations must be non-negative")
+    if (
+        args.ycsb_write_ratio is not None
+        and not 0.0 <= args.ycsb_write_ratio <= 1.0
+    ):
+        raise SystemExit("--ycsb-write-ratio must be in [0, 1]")
 
     variants = split_csv(args.variants)
     unknown = sorted(set(variants) - set(VARIANTS))
@@ -122,6 +146,10 @@ def main() -> int:
                                 "--transactions-per-worker", str(args.transactions_per_worker),
                                 "--reasoning-profile", "agentic",
                                 "--reasoning-scale", str(args.reasoning_scale),
+                                *generator_workload_args(
+                                    args.ycsb_operations,
+                                    args.ycsb_write_ratio,
+                                ),
                             ]
                         )
                     if not (args.resume and warmup_trace.exists()):
@@ -138,6 +166,10 @@ def main() -> int:
                                 "--transactions-per-worker", str(args.transactions_per_worker),
                                 "--reasoning-profile", "agentic",
                                 "--reasoning-scale", str(args.reasoning_scale),
+                                *generator_workload_args(
+                                    args.ycsb_operations,
+                                    args.ycsb_write_ratio,
+                                ),
                             ]
                         )
                     if not (args.resume and result.exists() and trajectory.exists()):
@@ -156,7 +188,11 @@ def main() -> int:
                             "--warmup-seconds", str(args.warmup_seconds),
                             "--max-attempts", str(args.max_attempts),
                             "--disable-atcc-retry-cache",
+                            "--paper-performance-guards",
+                            args.paper_performance_guards,
                         ]
+                        if args.paper_delayed_write_apply:
+                            command.extend(("--paper-delayed-write-apply", "enabled"))
                         if args.initial_policy is not None:
                             command.extend(
                                 [
@@ -242,12 +278,18 @@ def main() -> int:
         "warmup_s_per_run": args.warmup_seconds,
         "max_attempts": args.max_attempts,
         "paper_deferred_replay": bool(args.paper_deferred_replay),
+        "paper_delayed_write_apply": bool(args.paper_delayed_write_apply),
         "access_timing": (
             "whole_transaction_replay_ablation"
             if args.paper_deferred_replay
             else "real_interleaved_operations"
         ),
         "reasoning_scale": args.reasoning_scale,
+        "ycsb_operations": int(args.ycsb_operations),
+        "ycsb_write_ratio": args.ycsb_write_ratio,
+        "performance_guards_enabled": (
+            args.paper_performance_guards == "enabled"
+        ),
         "runs": len(source_runs),
         "elapsed_s": time.time() - started,
         "config": dataclasses.asdict(config),
@@ -272,6 +314,17 @@ def main() -> int:
     report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(policy_path)
     return 0
+
+
+def generator_workload_args(
+    ycsb_operations: int,
+    ycsb_write_ratio: float | None = None,
+) -> list[str]:
+    operations = int(ycsb_operations)
+    result = ["--ycsb-operations", str(operations)] if operations > 0 else []
+    if ycsb_write_ratio is not None:
+        result.extend(["--ycsb-write-ratio", str(float(ycsb_write_ratio))])
+    return result
 
 
 def coverage_report(transitions):

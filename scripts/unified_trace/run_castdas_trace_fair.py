@@ -70,6 +70,14 @@ FIELDS = [
     "background_workers",
     "seed",
     "repeat",
+    "paper_switching",
+    "paper_priority",
+    "paper_performance_guards",
+    "paper_delayed_write_apply",
+    "paper_policy_mode",
+    "paper_policy_path",
+    "atcc_retry_cache_enabled",
+    "paper_deferred_replay_enabled",
     "status",
     "elapsed_s",
     "measurement_window_s",
@@ -316,6 +324,11 @@ def main() -> int:
     parser.add_argument("--paper-priority", choices=("enabled", "disabled"), default="enabled")
     parser.add_argument("--paper-commit-admission-priority", action="store_true")
     parser.add_argument(
+        "--paper-performance-guards",
+        choices=("enabled", "disabled"),
+        default="disabled",
+    )
+    parser.add_argument(
         "--paper-delayed-write-apply",
         choices=("enabled", "disabled"),
         default="disabled",
@@ -371,6 +384,7 @@ def main() -> int:
                     paper_static_protection_mask=args.paper_static_protection_mask,
                     paper_priority=args.paper_priority,
                     paper_commit_admission_priority=args.paper_commit_admission_priority,
+                    paper_performance_guards=args.paper_performance_guards,
                     paper_delayed_write_apply=args.paper_delayed_write_apply,
                     priority_quantum_scale=args.priority_quantum_scale,
                     atcc_retry_cache_enabled=not args.disable_atcc_retry_cache,
@@ -411,6 +425,16 @@ def read_trace(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def paper_performance_guards_enabled(
+    cc: str,
+    *,
+    setting: str,
+) -> bool:
+    return str(cc).strip().lower() == "paper-atcc" and str(
+        setting
+    ).strip().lower() == "enabled"
+
+
 def run_trace(
     rows: list[dict[str, Any]],
     *,
@@ -428,6 +452,7 @@ def run_trace(
     paper_static_protection_mask: int = 4,
     paper_priority: str = "enabled",
     paper_commit_admission_priority: bool = False,
+    paper_performance_guards: str = "disabled",
     paper_delayed_write_apply: str = "disabled",
     priority_quantum_scale: float = 1.0,
     atcc_retry_cache_enabled: bool = True,
@@ -500,7 +525,10 @@ def run_trace(
         paper_policy=compiled_policy,
         collect_trajectories=trajectory_output is not None or paper_exploration_seed is not None,
         low_conflict_occ_guard=cc == "paper-atcc",
-        performance_guards_enabled=cc == "paper-atcc",
+        performance_guards_enabled=paper_performance_guards_enabled(
+            cc,
+            setting=paper_performance_guards,
+        ),
         commit_admission_priority_enabled=bool(paper_commit_admission_priority),
         delayed_write_apply_enabled=(
             str(paper_delayed_write_apply).strip().lower() == "enabled"
@@ -546,7 +574,29 @@ def run_trace(
         cycle_trace=cycle_trace,
         execution_workers=execution_workers,
     )
-    result = result_row(sample, cc, counters, elapsed_s, tokens_per_operation, rows, manager)
+    result = result_row(
+        sample,
+        cc,
+        counters,
+        elapsed_s,
+        tokens_per_operation,
+        rows,
+        manager,
+        runtime_config={
+            "paper_switching": str(paper_switching).strip().lower(),
+            "paper_priority": str(paper_priority).strip().lower(),
+            "paper_performance_guards": str(
+                paper_performance_guards
+            ).strip().lower(),
+            "paper_delayed_write_apply": str(
+                paper_delayed_write_apply
+            ).strip().lower(),
+            "paper_policy_mode": str(policy_mode).strip().lower(),
+            "paper_policy_path": str(paper_policy.resolve()) if paper_policy else "",
+            "atcc_retry_cache_enabled": bool(atcc_retry_cache_enabled),
+            "paper_deferred_replay_enabled": bool(paper_deferred_replay_enabled),
+        },
+    )
     if trajectory_output is not None and cc == "paper-atcc":
         transitions = [
             {
@@ -1590,7 +1640,9 @@ def result_row(
     tokens_per_operation: int,
     rows: list[dict[str, Any]],
     manager: AgentTransactionManager,
+    runtime_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    runtime = dict(runtime_config or {})
     completed = max(0, int(counters.completed_agent_tasks))
     failed = max(0, int(counters.failed_agent_tasks))
     submitted = completed + failed
@@ -1657,6 +1709,22 @@ def result_row(
     steady_commits = steady_agent_commits + steady_background_commits
     return {
         **base_row(sample, cc),
+        "paper_switching": runtime.get("paper_switching", ""),
+        "paper_priority": runtime.get("paper_priority", ""),
+        "paper_performance_guards": runtime.get(
+            "paper_performance_guards", ""
+        ),
+        "paper_delayed_write_apply": runtime.get(
+            "paper_delayed_write_apply", ""
+        ),
+        "paper_policy_mode": runtime.get("paper_policy_mode", ""),
+        "paper_policy_path": runtime.get("paper_policy_path", ""),
+        "atcc_retry_cache_enabled": runtime.get(
+            "atcc_retry_cache_enabled", ""
+        ),
+        "paper_deferred_replay_enabled": runtime.get(
+            "paper_deferred_replay_enabled", ""
+        ),
         "status": "ok",
         "elapsed_s": elapsed_s,
         "measurement_window_s": measurement_window_s,

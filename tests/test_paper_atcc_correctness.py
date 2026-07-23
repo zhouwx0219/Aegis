@@ -285,6 +285,44 @@ class PaperATCCCorrectnessStressTests(unittest.TestCase):
 
         self.assertEqual(LockClass.HOT_WRITE, guarded.protected)
 
+    def test_high_pressure_allows_policy_selected_cold_classes(self):
+        hooks = PaperATCCHooks(
+            SimpleNamespace(
+                low_conflict_occ_guard=True,
+                performance_guards_enabled=False,
+            )
+        )
+        txn = SimpleNamespace(
+            metadata={
+                "workload": "ycsb",
+                "context": {"level": "high"},
+                "agentic": {"background_workers": 0},
+            },
+            context=SimpleNamespace(
+                retry_count=0,
+                retry_conflict_mask=0,
+                action=LockAction(),
+                phase=TransactionPhase.COMMIT,
+                read_versions={"cold-row": 0},
+                hot_read_targets=set(),
+                hot_write_targets=set(),
+            ),
+        )
+
+        guarded = hooks._apply_protection_guard(
+            txn,
+            SimpleNamespace(
+                global_conflict_abort_rate=0.25,
+                global_waiter_count=0,
+            ),
+            LockAction(LockClass.COLD_READ | LockClass.COLD_WRITE),
+        )
+
+        self.assertEqual(
+            LockClass.COLD_READ | LockClass.COLD_WRITE,
+            guarded.protected,
+        )
+
     def test_pure_policy_path_does_not_add_hot_read_protection(self):
         hooks = PaperATCCHooks(
             SimpleNamespace(
@@ -552,7 +590,7 @@ class PaperATCCCorrectnessStressTests(unittest.TestCase):
 
         self.assertTrue(PaperATCCHooks._tpcc_all_agent_exact_retry(txn))
 
-    def test_tpcc_high_deferred_retry_prelocks_only_observed_conflict_root(self):
+    def test_tpcc_high_online_retry_locks_observed_root_on_access(self):
         manager = AgentTransactionManager()
         root = "tpcc:warehouse:0:ytd"
         unrelated = "tpcc:district:0:0:next_order_id"
@@ -576,6 +614,8 @@ class PaperATCCCorrectnessStressTests(unittest.TestCase):
 
         retry.enter_phase("explore")
 
+        self.assertFalse(retry.context.held_write_locks)
+        retry.read(root)
         self.assertEqual({root}, retry.context.held_write_locks)
         self.assertNotIn(unrelated, retry.context.held_write_locks)
         retry.abort("test cleanup", strategy="paper-atcc")
@@ -1771,6 +1811,46 @@ class PaperATCCCorrectnessStressTests(unittest.TestCase):
         self.assertTrue(used_native)
         self.assertTrue(result)
 
+    def test_online_retry_pin_preserves_unknown_future_object_history(self):
+        manager = AgentTransactionManager()
+        manager.register_object("known-conflict", "0", kind="row")
+        manager.register_object("future-access", "7", kind="row")
+
+        txn = manager.begin(
+            "online-retry-pin",
+            {
+                "paper_atcc": True,
+                "access_set_visibility": "online_observed",
+                "retry_count": 1,
+                "retry_protection_mask": int(LockClass.HOT_READ),
+                "retry_conflict_read_targets": ["known-conflict"],
+            },
+            strategy="paper-atcc",
+        )
+
+        self.assertEqual({"known-conflict"}, set(txn.snapshot))
+        self.assertEqual(
+            {"known-conflict", "future-access"},
+            set(manager.version_manager._pin_coverage[txn.context.tid]),
+        )
+        self.assertIn(txn.context.tid, manager.version_manager._lazy_pins)
+        self.assertNotIn(txn.context.tid, manager.version_manager._materialized_pins)
+        base_version = manager.store.get_version("future-access")
+        self.assertTrue(
+            manager.version_manager.atomic_publish(
+                "concurrent-publisher",
+                (("future-access", "8"),),
+                lambda: manager.store.batch_put_if_version(
+                    (("future-access", base_version),),
+                    (("future-access", "8"),),
+                ),
+                published_version=manager.store.get_version,
+            )
+        )
+        self.assertEqual("8", manager.store.get("future-access").value)
+        self.assertEqual("7", txn.read("future-access").value)
+        txn.abort("test complete", strategy="paper-atcc")
+
     def test_agent_slow_admission_locks_only_conflicting_write_key(self):
         manager = AgentTransactionManager()
         manager.register_object("a", "0", kind="row")
@@ -2187,9 +2267,9 @@ class PaperATCCCorrectnessStressTests(unittest.TestCase):
             thread.join(2)
         self.assertTrue(all(not thread.is_alive() for thread in threads))
         self.assertEqual(2, len(finished))
-        # Wound-Wait preemption follows stable transaction age. Dynamic
-        # priority orders waiters after the owner releases its lock.
-        self.assertIn("low", finished)
+        # The higher accumulated-cost transaction wins the paper's dynamic
+        # (priority, startTS) Wound-Wait order.
+        self.assertIn("high", finished)
 
         owner = manager.begin("committing-owner")
         manager.atcc_locks.wlock("a", owner.context)

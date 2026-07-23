@@ -4,9 +4,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agent.runtime import AgentTransactionManager
+from agent.runtime import AgentTransactionManager, LockAction, LockClass
 from agent.workloads.credit_review import CreditReviewConfig, CreditReviewWorkload
 from scripts.unified_trace.run_credit_review_experiment import (
+    acquire_policy_commit_batch,
     execute_attempt,
     summarize,
     transaction_metadata,
@@ -79,11 +80,60 @@ class CreditReviewWorkloadTests(unittest.TestCase):
                 trace = manager.traces()[-1]
                 self.assertEqual([], trace["metadata"]["planned_write_targets"])
                 self.assertEqual(
-                    "observed_commit_suffix" if system == "paper-atcc" else "none",
+                    "policy_commit_batch" if system == "paper-atcc" else "none",
                     trace["metadata"]["admission_scope"],
                 )
 
-    def test_aegis_main_path_admits_the_observed_commit_suffix(self):
+    def test_aegis_main_path_does_not_use_workload_specific_admission(self):
+        workload = CreditReviewWorkload(
+            CreditReviewConfig(company_count=16, reasoning_scale=0.0, commit_apply_ms=0)
+        )
+        manager = AgentTransactionManager(record_traces=True, collect_trajectories=False)
+        workload.register(manager)
+        task = workload.task_for(seed=17, worker_id=0, sequence=0)
+
+        def unexpected_admission(*_args, **_kwargs):
+            self.fail("paper ATCC main path must not use the workload-specific admission gate")
+
+        manager.acquire_hotspot_admission = unexpected_admission
+        result, _execution = execute_attempt(
+            manager,
+            workload,
+            task,
+            task_id="credit-paper-policy-only",
+            system="paper-atcc",
+            attempt=0,
+        )
+
+        self.assertTrue(result.committed)
+        self.assertEqual(
+            "policy_commit_batch",
+            manager.traces()[-1]["metadata"]["admission_scope"],
+        )
+
+    def test_policy_commit_batch_uses_action_and_hotness_not_object_names(self):
+        manager = AgentTransactionManager(record_traces=False, collect_trajectories=False)
+        manager.register_object("generic-hot", "0", kind="row")
+        manager.register_object("generic-cold", "0", kind="row")
+        for _ in range(16):
+            manager.hotness_tracker.observe_access("generic-hot")
+        txn = manager.begin(
+            "generic-policy-batch",
+            transaction_metadata("paper-atcc", retry_count=0),
+            strategy="paper-atcc",
+        )
+        txn.context.action = LockAction(LockClass.HOT_WRITE)
+
+        acquire_policy_commit_batch(
+            manager,
+            txn,
+            ("generic-cold", "generic-hot"),
+        )
+
+        self.assertEqual({"generic-hot"}, txn.context.held_write_locks)
+        txn.abort("test complete", strategy="paper-atcc")
+
+    def test_observed_commit_admission_ablation_admits_the_observed_suffix(self):
         workload = CreditReviewWorkload(
             CreditReviewConfig(company_count=16, reasoning_scale=0.0, commit_apply_ms=0)
         )
@@ -107,6 +157,7 @@ class CreditReviewWorkloadTests(unittest.TestCase):
             task_id="credit-paper-observed",
             system="paper-atcc",
             attempt=0,
+            observed_commit_admission=True,
         )
         self.assertTrue(result.committed)
         self.assertEqual(1, len(admission_calls))

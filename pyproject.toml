@@ -34,3 +34,6 @@ include = ["agent*"]
 
 [tool.setuptools]
 include-package-data = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

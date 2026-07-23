@@ -14,6 +14,7 @@ from agent.workloads import AgentOperation, AgentTask
 class ReasoningProfile:
     name: str = "agentic"
     scale: float = 1.0
+    retry_scale: float | None = None
 
     def delay_ms(self, *, level: str, phase: str, task_id: str, attempt: int) -> int:
         if self.name in {"none", "off", "disabled"}:
@@ -39,8 +40,9 @@ class ReasoningProfile:
             low, high = (500, 5000)
         else:
             low, high = retry_delay_range_ms(level)
-        low = int(max(0, round(low * self.scale)))
-        high = int(max(low, round(high * self.scale)))
+        retry_scale = self.scale if self.retry_scale is None else self.retry_scale
+        low = int(max(0, round(low * retry_scale)))
+        high = int(max(low, round(high * retry_scale)))
         return deterministic_int(
             low,
             high,

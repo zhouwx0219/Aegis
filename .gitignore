@@ -22,7 +22,7 @@ results/
 third_party/
 .ruff_cache/
 
-tests/
+
 .DS_Store
 Thumbs.db
 *.swp
@@ -30,7 +30,9 @@ Thumbs.db
 astra_core.egg-info/
 *.egg-info/
 tools/
-# Local experiment outputs. Keep reports in README/docs and force-add any
-# artifact that must be versioned for a paper or release.
 /results/*.json
 /paper_*_results.json
+
+tests/
+pyproject.toml
+third_party/

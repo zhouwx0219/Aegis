@@ -1119,20 +1119,14 @@ class PaperATCCLockManager:
             return False
         if meta.committing and meta.writer == holder.tid:
             return False
-        # Dynamic priority orders queued waiters, but must not turn a younger
-        # transaction into an aggressive preemptor.  Wound-Wait uses the
-        # stable transaction age order to avoid cycles and repeated aborts;
-        # accumulated reasoning cost only decides who proceeds once the
-        # current owner releases the object.
-        return self._wound_order(requester) < self._wound_order(holder)
+        # Aegis compares the paper's lexicographic (priority, startTS) order.
+        # Priority is monotonic within an attempt, and pending requests are
+        # re-evaluated when their priority epoch changes.
+        return self._priority_order(requester) < self._priority_order(holder)
 
     @staticmethod
     def _priority_order(context: TransactionContext) -> tuple[int, int, str]:
         return (-int(context.priority), int(context.start_ts_ns), context.tid)
-
-    @staticmethod
-    def _wound_order(context: TransactionContext) -> tuple[int, str]:
-        return (int(context.start_ts_ns), context.tid)
 
     def _wound(
         self,

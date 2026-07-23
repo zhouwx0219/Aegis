@@ -260,12 +260,21 @@ def main() -> int:
     parser.add_argument("--reasoning-profile", default="agentic")
     parser.add_argument("--reasoning-scale", type=float, default=1.0)
     parser.add_argument("--max-attempts", type=int, default=5)
+    parser.add_argument("--allow-retries", action="store_true")
     parser.add_argument("--external-timeout", type=float, default=120.0)
     parser.add_argument("--budget-seconds", type=float, default=18000.0)
     parser.add_argument("--reserve-seconds", type=float, default=300.0)
     parser.add_argument("--skip-training", action="store_true")
     parser.add_argument("--policy", type=Path, default=None)
     parser.add_argument("--paper-policy", type=Path, default=None)
+    parser.add_argument("--paper-delayed-write-apply", action="store_true")
+    parser.add_argument(
+        "--paper-performance-guards",
+        choices=("enabled", "disabled"),
+        default="disabled",
+    )
+    parser.add_argument("--paper-deferred-replay", action="store_true")
+    parser.add_argument("--atcc-retry-cache", action="store_true")
     parser.add_argument("--trajectory-dir", type=Path, default=None)
     parser.add_argument("--training-episodes", type=int, default=3)
     parser.add_argument("--training-duration", type=float, default=2.0)
@@ -277,6 +286,10 @@ def main() -> int:
 
     if args.transactions_per_worker <= 0:
         raise SystemExit("--transactions-per-worker must be positive")
+    if args.max_attempts < 1:
+        raise SystemExit("--max-attempts must be positive")
+    if args.max_attempts != 1 and not args.allow_retries:
+        raise SystemExit("--max-attempts > 1 requires --allow-retries")
     if not 4 <= args.timed_trace_pool_size <= 8:
         raise SystemExit("--timed-trace-pool-size must be between 4 and 8")
     if args.background_trace_transactions_per_worker <= 0:
@@ -328,6 +341,10 @@ def main() -> int:
         "output_dir": str(output_dir),
         "policy": str(policy_path),
         "paper_policy": str(args.paper_policy.resolve()) if args.paper_policy else "",
+        "paper_delayed_write_apply": bool(args.paper_delayed_write_apply),
+        "paper_deferred_replay": bool(args.paper_deferred_replay),
+        "atcc_retry_cache_enabled": bool(args.atcc_retry_cache),
+        "allow_retries": bool(args.allow_retries),
         "trajectory_dir": str(trajectory_dir) if trajectory_dir else "",
         "variants": variants,
         "clients": clients,
@@ -344,7 +361,7 @@ def main() -> int:
         "internal_cc": internal_ccs,
         "atcc_policy_control": "policy_lock_action_only",
         "atcc_priority_control": "transaction_manager_formula",
-        "performance_guards_enabled": False,
+        "performance_guards_enabled": args.paper_performance_guards == "enabled",
         "atcc_runtime_fast_paths_enabled": True,
         "sparse_state_risk_prior": False,
         "safety_guards_enabled": True,
@@ -479,6 +496,17 @@ def main() -> int:
                     internal_cmd.extend(["--policy", str(policy_path)])
                 if args.paper_policy is not None:
                     internal_cmd.extend(["--paper-policy", str(args.paper_policy.resolve())])
+                if args.paper_delayed_write_apply:
+                    internal_cmd.extend(["--paper-delayed-write-apply", "enabled"])
+                internal_cmd.extend(
+                    ["--paper-performance-guards", args.paper_performance_guards]
+                )
+                if not args.paper_deferred_replay:
+                    internal_cmd.append("--disable-paper-deferred-replay")
+                if not args.atcc_retry_cache:
+                    internal_cmd.append("--disable-atcc-retry-cache")
+                if args.allow_retries:
+                    internal_cmd.append("--allow-retries")
                 if trajectory_dir is not None and "paper-atcc" in internal_ccs:
                     internal_cmd.extend(
                         ["--trajectory-output", str(trajectory_dir / f"{trace_id}.json")]

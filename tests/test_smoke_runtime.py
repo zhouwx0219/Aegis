@@ -1,6 +1,7 @@
 import dataclasses
 import math
 import threading
+import time
 import unittest
 import tempfile
 from pathlib import Path
@@ -462,7 +463,7 @@ class SmokeRuntimeTests(unittest.TestCase):
 
         self.assertEqual(TransactionStatus.ABORTED, agent.context.status)
 
-    def test_younger_dynamic_priority_does_not_wound_older_writer(self):
+    def test_higher_dynamic_priority_wounds_older_lower_priority_writer(self):
         manager = AgentTransactionManager()
         manager.register_object("row", "0", kind="row")
         lower = manager.begin("lower")
@@ -471,21 +472,19 @@ class SmokeRuntimeTests(unittest.TestCase):
         manager.atcc_locks.update_priority(higher.context, 9)
         manager.atcc_locks.wlock("row", lower.context, timeout_s=0.01)
 
-        with self.assertRaises(LockConflict):
-            manager.atcc_locks.wlock("row", higher.context, timeout_s=0.002)
+        manager.atcc_locks.wlock("row", higher.context, timeout_s=0.01)
 
-        self.assertEqual(TransactionStatus.ACTIVE, lower.context.status)
-        self.assertEqual(0, higher.context.agent_aborts_caused)
+        self.assertEqual(TransactionStatus.ABORTED, lower.context.status)
+        self.assertEqual(1, higher.context.agent_aborts_caused)
         diagnostics = manager.atcc_locks.snapshot_diagnostics()
-        self.assertEqual(0, diagnostics.get("wounds_agent_to_agent", 0))
-        self.assertEqual(lower.context.tid, manager.atcc_locks.snapshot("row")["writer"])
-        manager.atcc_locks.release_all(lower.context)
+        self.assertEqual(1, diagnostics.get("wounds_agent_to_agent", 0))
+        self.assertEqual(higher.context.tid, manager.atcc_locks.snapshot("row")["writer"])
         manager.atcc_locks.release_all(higher.context)
         self.assertEqual(
             0, manager.atcc_locks.snapshot_diagnostics()["live_contexts"]
         )
 
-    def test_older_transaction_wounds_younger_writer_independent_of_priority(self):
+    def test_older_lower_priority_transaction_waits_for_higher_priority_writer(self):
         manager = AgentTransactionManager()
         manager.register_object("row", "0", kind="row")
         older = manager.begin("older")
@@ -494,10 +493,12 @@ class SmokeRuntimeTests(unittest.TestCase):
         manager.atcc_locks.update_priority(younger.context, 9)
         manager.atcc_locks.wlock("row", younger.context, timeout_s=0.01)
 
-        manager.atcc_locks.wlock("row", older.context, timeout_s=0.01)
+        with self.assertRaises(LockConflict):
+            manager.atcc_locks.wlock("row", older.context, timeout_s=0.002)
 
-        self.assertEqual(TransactionStatus.ABORTED, younger.context.status)
-        self.assertEqual(older.context.tid, manager.atcc_locks.snapshot("row")["writer"])
+        self.assertEqual(TransactionStatus.ACTIVE, younger.context.status)
+        self.assertEqual(younger.context.tid, manager.atcc_locks.snapshot("row")["writer"])
+        manager.atcc_locks.release_all(younger.context)
         manager.atcc_locks.release_all(older.context)
 
     def test_aborted_context_cannot_reregister_for_a_lock(self):
@@ -556,22 +557,47 @@ class SmokeRuntimeTests(unittest.TestCase):
         self.assertEqual(older.context.tid, manager.atcc_locks.snapshot("row")["writer"])
         manager.atcc_locks.release_all(older.context)
 
-    def test_priority_enabled_commit_wait_protects_paid_work(self):
+    def test_priority_enabled_commit_wait_prioritizes_paid_work(self):
         manager = AgentTransactionManager(priority_enabled=True)
         manager.register_object("row", "0", kind="row")
-        older = manager.begin("older")
-        younger = manager.begin("younger")
-        older.context.phase = TransactionPhase.COMMIT
-        younger.context.phase = TransactionPhase.COMMIT
-        manager.atcc_locks.wlock("row", younger.context, timeout_s=0.01)
+        owner = manager.begin("owner")
+        owner.context.phase = TransactionPhase.COMMIT
+        manager.atcc_locks.wlock("row", owner.context, timeout_s=0.01)
+        self.assertTrue(manager.atcc_locks.begin_committing(owner.context))
 
-        with self.assertRaises(LockConflict):
-            manager.atcc_locks.wlock("row", older.context, timeout_s=0.002)
+        cheap = manager.begin("cheap")
+        costly = manager.begin("costly")
+        cheap.context.phase = TransactionPhase.COMMIT
+        costly.context.phase = TransactionPhase.COMMIT
+        costly.context.completed_operations = 50
+        costly.context.agent_cost_ms = 500.0
+        costly.context.retry_count = 2
+        manager.refresh_atcc_priority(costly)
+        order = []
 
-        self.assertEqual(TransactionStatus.ACTIVE, younger.context.status)
-        self.assertEqual(younger.context.tid, manager.atcc_locks.snapshot("row")["writer"])
-        manager.atcc_locks.release_all(younger.context)
-        manager.atcc_locks.release_all(older.context)
+        def acquire(txn):
+            manager.atcc_locks.wlock("row", txn.context, timeout_s=1.0)
+            order.append(txn.context.task_id)
+            manager.atcc_locks.release_all(txn.context)
+
+        cheap_thread = threading.Thread(target=acquire, args=(cheap,))
+        costly_thread = threading.Thread(target=acquire, args=(costly,))
+        cheap_thread.start()
+        deadline = time.perf_counter() + 1.0
+        while not cheap.context.pending_request and time.perf_counter() < deadline:
+            time.sleep(0.001)
+        costly_thread.start()
+        deadline = time.perf_counter() + 1.0
+        while not costly.context.pending_request and time.perf_counter() < deadline:
+            time.sleep(0.001)
+
+        manager.atcc_locks.release_all(owner.context)
+        cheap_thread.join(2.0)
+        costly_thread.join(2.0)
+
+        self.assertFalse(cheap_thread.is_alive())
+        self.assertFalse(costly_thread.is_alive())
+        self.assertEqual(["costly", "cheap"], order)
 
     def test_priority_matches_paper_runtime_cost_formula(self):
         manager = AgentTransactionManager()
@@ -645,6 +671,25 @@ class SmokeRuntimeTests(unittest.TestCase):
         self.assertTrue(txn.metadata["commit_admission_write_protection"])
         self.assertFalse(txn.context.held_write_locks)
         self.assertEqual({"row"}, txn.context.policy_write_lock_targets)
+        self.assertTrue(txn.commit("paper-atcc").committed)
+        self.assertEqual("1", manager.store.get("row").value)
+
+    def test_disabling_delayed_write_apply_acquires_selected_write_lock(self):
+        manager = AgentTransactionManager(delayed_write_apply_enabled=False)
+        manager.register_object("row", "0", kind="row")
+        txn = manager.begin(
+            "immediate-write-ablation",
+            {
+                "paper_atcc": True,
+                "retry_protection_mask": int(LockClass.COLD_WRITE),
+            },
+            strategy="paper-atcc",
+        )
+
+        txn.write("row", "1")
+
+        self.assertFalse(txn.metadata["_defer_policy_write_locks"])
+        self.assertEqual({"row"}, txn.context.held_write_locks)
         self.assertTrue(txn.commit("paper-atcc").committed)
         self.assertEqual("1", manager.store.get("row").value)
 
@@ -1700,6 +1745,33 @@ class SmokeRuntimeTests(unittest.TestCase):
         self.assertEqual("1", report["runtime_counter"])
         self.assertTrue(report["ycsb_task_committed"])
         self.assertTrue(report["tpcc_task_committed"])
+
+    def test_stable_low_conflict_runtime_enters_native_occ_fast_path(self):
+        manager = AgentTransactionManager(
+            low_conflict_occ_guard=True,
+            collect_trajectories=False,
+        )
+        manager.register_object("row", "0", kind="row")
+
+        for index in range(2):
+            txn = manager.begin(f"native-occ-warmup-{index}", strategy="paper-atcc")
+            self.assertFalse(txn.metadata["_cold_occ_fast_task"])
+            txn.write("row", str(index + 1))
+            self.assertTrue(txn.commit("paper-atcc").committed)
+            # Make the test deterministic without sleeping for the sampling interval.
+            manager._native_occ_last_window_at = 0.0
+
+        self.assertTrue(manager.native_occ_fast_enabled)
+
+        txn = manager.begin("native-occ-fast", strategy="paper-atcc")
+
+        self.assertTrue(txn.metadata["_cold_occ_fast_task"])
+        txn.write("row", "1")
+        self.assertTrue(txn.commit("paper-atcc").committed)
+        self.assertFalse(manager.paper_versioning_enabled)
+
+        manager.observe_native_occ_window(risk=True)
+        self.assertFalse(manager.native_occ_fast_enabled)
 
     def test_conflicting_transactions_abort_on_stale_version(self):
         manager = AgentTransactionManager()

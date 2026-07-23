@@ -55,11 +55,14 @@ from scripts.train_paper_atcc_coordinated import (
     coordinated_behavior_distribution,
     normalized_system_scores,
 )
+from scripts.train_paper_atcc_matrix import generator_workload_args
+from scripts.summarize_paper_matrix import system_label as paper_summary_system_label
 from scripts.unified_trace.generate_castdas_trace import (
     paper_trace_workload,
     resolve_background_trace_length,
 )
 from scripts.unified_trace.run_castdas_trace_fair import (
+    FIELDS as FAIR_RESULT_FIELDS,
     FixedCountRunCoordinator,
     TPCCReplayPressureAdmission,
     cached_retry_scheduler_cooldown_s,
@@ -68,12 +71,17 @@ from scripts.unified_trace.run_castdas_trace_fair import (
     paper_agent_admission_cap,
     paper_background_admission_cap,
     paper_background_batch_size,
+    paper_performance_guards_enabled,
     result_row,
     run_background_row,
     run_rows,
     should_reuse_atcc_retry_plan,
 )
 from scripts.unified_trace.run_dbx1000_trace import write_dbx1000_trace
+from scripts.unified_trace.run_aegis_two_hour_experiments import (
+    Case as TwoHourCase,
+    run_case as run_two_hour_case,
+)
 from scripts.unified_trace.run_unified_trace_matrix import summarize as summarize_unified_trace
 from agent.runtime import AgentTransactionManager
 from agent.runtime import CompiledPhasePolicy, CompiledPolicyEntry, LockClass
@@ -81,6 +89,97 @@ from agent.workloads import AgentOperation, AgentTask, build_workload
 
 
 class CompareCliTests(unittest.TestCase):
+    def test_paper_summary_uses_cc_for_generic_castdas_system(self):
+        self.assertEqual(
+            "paper-atcc",
+            paper_summary_system_label(
+                {"system": "cast-das", "cc": "paper-atcc"}
+            ),
+        )
+
+    def test_paper_summary_preserves_explicit_external_system(self):
+        self.assertEqual(
+            "PostgreSQL",
+            paper_summary_system_label(
+                {"system": "PostgreSQL", "cc": "mvcc"}
+            ),
+        )
+
+    def test_reasoning_profile_can_hold_retry_scale_constant(self):
+        base = ReasoningProfile("agentic", 1.0)
+        expensive = ReasoningProfile("agentic", 16.0, 1.0)
+
+        self.assertEqual(
+            base.retry_delay_ms(level="high", task_id="task", attempt=1),
+            expensive.retry_delay_ms(level="high", task_id="task", attempt=1),
+        )
+        self.assertGreater(
+            expensive.operation_delay_ms(
+                level="high",
+                phase="commit",
+                task_id="task",
+                attempt=0,
+                operation_index=0,
+            ),
+            base.operation_delay_ms(
+                level="high",
+                phase="commit",
+                task_id="task",
+                attempt=0,
+                operation_index=0,
+            ),
+        )
+
+    def test_fair_runner_performance_guards_are_explicit(self):
+        self.assertFalse(
+            paper_performance_guards_enabled(
+                "paper-atcc",
+                setting="disabled",
+            )
+        )
+        self.assertTrue(
+            paper_performance_guards_enabled(
+                "paper-atcc",
+                setting="enabled",
+            )
+        )
+        self.assertFalse(
+            paper_performance_guards_enabled("occ", setting="enabled")
+        )
+
+    def test_paper_training_ycsb_length_override_is_explicit(self):
+        self.assertEqual([], generator_workload_args(0))
+        self.assertEqual(
+            [
+                "--ycsb-operations",
+                "24",
+                "--ycsb-write-ratio",
+                "0.9",
+            ],
+            generator_workload_args(24, 0.9),
+        )
+
+    def test_two_hour_runner_enables_delayed_write_apply(self):
+        case = TwoHourCase("shape_sensitivity", "ycsb", "length", "24")
+        with mock.patch(
+            "scripts.unified_trace.run_aegis_two_hour_experiments.subprocess.run"
+        ) as run:
+            run_two_hour_case(
+                case,
+                Path("trace.csv"),
+                Path("result.csv"),
+                Path("policy.json"),
+                0.0,
+                1.0,
+                1,
+            )
+
+        command = run.call_args.args[0]
+        option = command.index("--paper-delayed-write-apply")
+        self.assertEqual("enabled", command[option + 1])
+        option = command.index("--paper-performance-guards")
+        self.assertEqual("enabled", command[option + 1])
+
     def test_ycsb_replay_requires_repeated_observed_contention(self):
         manager = AgentTransactionManager()
         self.assertFalse(ycsb_observed_replay_ready(manager))
@@ -683,6 +782,47 @@ class CompareCliTests(unittest.TestCase):
         self.assertEqual(2.0, row["agent_task_tps"])
         self.assertEqual(2.0, row["agent_tps"])
         self.assertEqual(0.8, row["agent_drain_task_tps"])
+
+    def test_result_row_records_paper_runtime_configuration(self):
+        row = result_row(
+            {},
+            "paper-atcc",
+            MixedCounters(),
+            elapsed_s=1.0,
+            tokens_per_operation=2703,
+            rows=[],
+            manager=AgentTransactionManager(),
+            runtime_config={
+                "paper_switching": "dynamic",
+                "paper_priority": "enabled",
+                "paper_performance_guards": "disabled",
+                "paper_delayed_write_apply": "enabled",
+                "paper_policy_mode": "eval",
+                "paper_policy_path": "/tmp/policy.json",
+                "atcc_retry_cache_enabled": False,
+                "paper_deferred_replay_enabled": False,
+            },
+        )
+
+        self.assertEqual("dynamic", row["paper_switching"])
+        self.assertEqual("enabled", row["paper_priority"])
+        self.assertEqual("disabled", row["paper_performance_guards"])
+        self.assertEqual("enabled", row["paper_delayed_write_apply"])
+        self.assertEqual("eval", row["paper_policy_mode"])
+        self.assertEqual("/tmp/policy.json", row["paper_policy_path"])
+        self.assertFalse(row["atcc_retry_cache_enabled"])
+        self.assertFalse(row["paper_deferred_replay_enabled"])
+        for field in (
+            "paper_switching",
+            "paper_priority",
+            "paper_performance_guards",
+            "paper_delayed_write_apply",
+            "paper_policy_mode",
+            "paper_policy_path",
+            "atcc_retry_cache_enabled",
+            "paper_deferred_replay_enabled",
+        ):
+            self.assertIn(field, FAIR_RESULT_FIELDS)
 
     def test_token_attribution_separates_retry_cache_from_reasoning(self):
         counters = MixedCounters(

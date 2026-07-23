@@ -54,6 +54,7 @@ class PaperATCCHooks(NoopTransactionHooks):
         # is promoted early.
         txn.metadata["_defer_policy_write_locks"] = bool(
             txn.metadata.get("commit_admission_write_protection", False)
+            and self.manager.delayed_write_apply_enabled
         )
         # Do not inspect the declared access set or static contention label.
         # All classification below is based on operations already executed.
@@ -64,6 +65,12 @@ class PaperATCCHooks(NoopTransactionHooks):
         txn.metadata["_cold_occ_fast_task"] = False
         txn.metadata["_native_occ_stable_windows"] = 0
         txn.metadata["_native_occ_fast_ready"] = False
+        if (
+            not self.manager.collect_trajectories
+            and self.manager.native_occ_fast_enabled
+        ):
+            txn.metadata["_cold_occ_fast_task"] = True
+            return
         # The switching ablation's Static arm is a fixed protection policy,
         # not an OCC policy that happens to consult a threshold later. Install
         # its mask before the first access so an immediate-write baseline
@@ -119,7 +126,8 @@ class PaperATCCHooks(NoopTransactionHooks):
             exact_write = True
         exact_retry_only = self._tpcc_all_agent_exact_retry(txn)
         if exact_retry_only:
-            exact_write = False
+            # Keep the exact prior-conflict write target, but do not broaden
+            # it into read or category protection for all-Agent TPC-C retries.
             exact_read = False
         if key in txn.context.held_write_locks:
             txn.context.policy_write_lock_targets.add(key)
@@ -278,8 +286,6 @@ class PaperATCCHooks(NoopTransactionHooks):
         key = str(object_id)
         exact_write = key in txn.context.retry_conflict_write_targets
         exact_retry_only = self._tpcc_all_agent_exact_retry(txn)
-        if exact_retry_only:
-            exact_write = False
         if key in txn.context.held_write_locks:
             txn.context.policy_write_lock_targets.add(key)
             return
@@ -496,7 +502,10 @@ class PaperATCCHooks(NoopTransactionHooks):
             txn.metadata["_tpcc_retry_root_prelock"] = True
         read_targets = set(txn.context.retry_conflict_read_targets)
         write_targets = set(txn.context.retry_conflict_write_targets)
-        defer_exact_writes = self.online_ycsb_high_mixed(txn)
+        # An online-observed retry knows a prior conflict key, but acquiring
+        # its WLock at begin would hold it across the whole reasoning loop.
+        # Reacquire it when that key is actually accessed instead.
+        defer_exact_writes = self.online_observed(txn)
         for object_id in sorted(() if defer_exact_writes else write_targets):
             if object_id in txn.context.held_write_locks:
                 continue
@@ -656,6 +665,11 @@ class PaperATCCHooks(NoopTransactionHooks):
             and txn.context.action.protected == LockClass.NONE
             and not txn.context.hot_read_targets
             and not txn.context.hot_write_targets
+            and float(
+                getattr(state, "global_conflict_abort_rate", 0.0) or 0.0
+            )
+            < 0.20
+            and int(getattr(state, "global_waiter_count", 0) or 0) == 0
         ):
             # Low/medium contention is sensitive to unnecessary first-attempt
             # locks. Let an observed retry conflict activate the learned
@@ -719,6 +733,11 @@ class PaperATCCHooks(NoopTransactionHooks):
             self.manager.low_conflict_occ_guard
             and txn.context.retry_count <= 0
             and not txn.context.retry_conflict_mask
+            and float(
+                getattr(state, "global_conflict_abort_rate", 0.0) or 0.0
+            )
+            < 0.20
+            and int(getattr(state, "global_waiter_count", 0) or 0) == 0
         ):
             # A system-wide pressure sample is insufficient evidence that a
             # particular transaction needs category-wide cold protection.
@@ -834,7 +853,14 @@ class PaperATCCHooks(NoopTransactionHooks):
         if not self.enabled(txn):
             return
         if txn.metadata.get("_cold_occ_fast_task", False):
+            self.manager.observe_native_occ_window(
+                risk=self._native_occ_outcome_risk(txn)
+            )
             return
+        if not self.manager.collect_trajectories:
+            self.manager.observe_native_occ_window(
+                risk=self._native_occ_outcome_risk(txn)
+            )
         if not self.manager.collect_trajectories:
             return
         state = self._state(txn)
@@ -849,6 +875,22 @@ class PaperATCCHooks(NoopTransactionHooks):
             blocked_time_ms=txn.context.blocked_time_ms,
             lock_count=self._lock_count(txn),
             **self._externality_metrics(txn),
+        )
+
+    @staticmethod
+    def _native_occ_outcome_risk(txn: Any) -> bool:
+        result = getattr(txn, "result", None)
+        reason = str(getattr(result, "reason", "") or "").strip().lower()
+        return bool(
+            txn.context.action.protected != LockClass.NONE
+            or txn.context.hot_read_targets
+            or txn.context.hot_write_targets
+            or reason in {
+                "version-conflict",
+                "lock-preempted",
+                "lock-timeout",
+                "lock-conflict",
+            }
         )
 
     def _start_online_observed_prefix(self, txn: Any) -> None:

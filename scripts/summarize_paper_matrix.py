@@ -37,6 +37,12 @@ GROUP_FIELDS = (
     "cc",
     "paper_switching",
     "paper_priority",
+    "paper_performance_guards",
+    "paper_delayed_write_apply",
+    "paper_policy_mode",
+    "paper_policy_path",
+    "atcc_retry_cache_enabled",
+    "paper_deferred_replay_enabled",
     "priority_quantum_scale",
     "policy_invocation_ops",
     "throughput_metric",
@@ -514,11 +520,14 @@ def config_key(row: dict[str, object]) -> tuple[str, ...]:
 
 
 def system_label(row: dict[str, object]) -> str:
-    for field in ("cc_label", "system", "cc"):
-        value = str(row.get(field, "") or "").strip()
-        if value:
-            return value
-    return ""
+    explicit = str(row.get("cc_label", "") or "").strip()
+    if explicit:
+        return explicit
+    system = str(row.get("system", "") or "").strip()
+    cc = str(row.get("cc", "") or "").strip()
+    if system.lower() in {"cast-das", "castdas"} and cc:
+        return cc
+    return system or cc
 
 
 def is_atcc(row: dict[str, object]) -> bool:

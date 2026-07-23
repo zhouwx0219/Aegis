@@ -208,10 +208,20 @@ class AgentTransaction:
             self.manager.paper_versioning_enabled
             and self.context.snapshot_epoch >= 0
         ):
-            self.snapshot[key] = self.manager.version_manager.read_at(
+            historical = self.manager.version_manager.read_at(
                 self.context.snapshot_epoch,
                 key,
             )
+            if not historical.exists and self.manager.store.get(key).exists:
+                detail = self.manager.version_manager.history_debug(
+                    key,
+                    tid=self.context.tid,
+                )
+                raise RuntimeError(
+                    f"registered object has no historical version at epoch "
+                    f"{self.context.snapshot_epoch}: {detail}"
+                )
+            self.snapshot[key] = historical
         else:
             current = self.manager.store.get(key)
             self.snapshot[key] = SnapshotValue(
@@ -395,7 +405,7 @@ class AgentTransactionManager:
         low_conflict_occ_guard: bool = False,
         performance_guards_enabled: bool = True,
         commit_admission_priority_enabled: bool = False,
-        delayed_write_apply_enabled: bool = False,
+        delayed_write_apply_enabled: bool = True,
         priority_config: PriorityConfig | None = None,
         priority_enabled: bool = True,
     ):
@@ -1290,10 +1300,21 @@ class AgentTransactionManager:
         metadata["snapshot_epoch"] = snapshot_epoch
         txn = AgentTransaction(self, str(task_id), snapshot, metadata)
         if materialize_initial_snapshot:
+            online_observed_snapshot = (
+                str(metadata.get("access_set_visibility", "")).strip().lower()
+                == "online_observed"
+            )
             snapshot_epoch, snapshot = self.version_manager.snapshot_and_pin(
                 txn.context.tid,
                 snapshot_ids,
-                materialized=bool(snapshot_ids),
+                # The known conflict subset is preloaded, but future accesses
+                # remain unknown and still require historical versions.
+                materialized=bool(snapshot_ids) and not online_observed_snapshot,
+                coverage_object_ids=(
+                    self._catalog
+                    if online_observed_snapshot
+                    else snapshot_ids
+                ),
             )
             txn.snapshot.update(snapshot)
             txn.context.snapshot_epoch = int(snapshot_epoch)

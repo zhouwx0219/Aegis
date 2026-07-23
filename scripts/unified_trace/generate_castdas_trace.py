@@ -118,6 +118,12 @@ def main() -> int:
     parser.add_argument("--background-trace-transactions-per-worker", type=int, default=0)
     parser.add_argument("--reasoning-profile", default="agentic")
     parser.add_argument("--reasoning-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--retry-delay-scale",
+        type=float,
+        default=None,
+        help="Scale retry replanning delay independently from operation reasoning.",
+    )
     parser.add_argument("--ycsb-access-distribution", choices=("", "zipfian", "hotspot"), default="")
     parser.add_argument("--ycsb-zipf-theta", type=float, default=None)
     parser.add_argument("--ycsb-hotset-size", type=int, default=0)
@@ -149,6 +155,8 @@ def main() -> int:
         raise SystemExit("--agent-ratio must be > 0 and <= 1")
     if args.transactions_per_worker <= 0:
         raise SystemExit("--transactions-per-worker must be positive")
+    if args.retry_delay_scale is not None and args.retry_delay_scale <= 0:
+        raise SystemExit("--retry-delay-scale must be positive")
     if args.background_trace_transactions_per_worker < 0:
         raise SystemExit("--background-trace-transactions-per-worker must be non-negative")
     if args.ycsb_hotset_size < 0 or args.ycsb_operations < 0 or args.tpcc_order_lines < 0:
@@ -206,7 +214,11 @@ def main() -> int:
     )
     agent_tasks = list(workload.generate_tasks(task_count, seed=args.seed))
     background_tasks = list(workload.generate_tasks(bg_task_count, seed=args.seed + 700_000))
-    profile = ReasoningProfile(args.reasoning_profile, args.reasoning_scale)
+    profile = ReasoningProfile(
+        args.reasoning_profile,
+        args.reasoning_scale,
+        args.retry_delay_scale,
+    )
 
     object_key_map: dict[str, int] = {}
     rows: list[dict[str, Any]] = []
@@ -282,6 +294,11 @@ def main() -> int:
         "background_trace_transactions_per_worker": background_transactions_per_worker,
         "reasoning_profile": args.reasoning_profile,
         "reasoning_scale": args.reasoning_scale,
+        "retry_delay_scale": (
+            args.reasoning_scale
+            if args.retry_delay_scale is None
+            else args.retry_delay_scale
+        ),
         "workload_config": experiment_context,
         "reasoning_timing": "fixed_seed_per_operation_delay",
         "retry_timing": "fixed_seed_per_attempt_delay",
