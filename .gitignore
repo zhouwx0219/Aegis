@@ -13,7 +13,6 @@ dist/
 tmp/
 outputs/
 docs/
-scripts/
 .codex-tmp/
 .codex/
 results/
@@ -33,6 +32,5 @@ tools/
 /results/*.json
 /paper_*_results.json
 
-tests/
 pyproject.toml
 third_party/
