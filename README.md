@@ -1,13 +1,8 @@
 # Aegis
 
-Aegis is a research prototype for agent-side transaction execution and adaptive
-concurrency control over a versioned key-value backend. It combines a Python
-transaction runtime with a small C++/pybind11 storage extension and provides
-repeatable YCSB, TPC-C, and enterprise credit-review experiments.
+Aegis is a research prototype for agent-side transaction execution and adaptive concurrency control over a versioned key-value backend. It combines a Python transaction runtime with a small C++/pybind11 storage extension and provides repeatable YCSB, TPC-C, and enterprise credit-review experiments.
 
-This repository contains the code from the `Aegis` branch of CAST-DAS. It is
-intended for mechanism evaluation and paper reproduction, not as a production
-database or transaction service.
+This repository is intended for mechanism evaluation and paper reproduction, not as a production database or transaction service.
 
 ## What Is Included
 
