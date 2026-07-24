@@ -1,7 +1,7 @@
 # External CC Agentic Workload Adapter
 
 This folder contains repeatable adapters for running DBx1000-family external
-systems, such as Plor, Polaris, and Bamboo, with CAST-DAS-style agent/background
+systems, such as Polaris and Bamboo, with CAST-DAS-style agent/background
 client behavior.
 
 The adapter intentionally does not modify CAST-DAS runtime concurrency control.
@@ -29,7 +29,7 @@ From Windows:
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\external_cc\run_node1_external_cc.ps1 `
   -RemoteRoot /home/chenht/castdas_external_cc `
-  -Systems bamboo,polaris,plor `
+  -Systems bamboo,polaris `
   -Workloads ycsb,tpcc `
   -Levels low,medium,high `
   -ClientCounts 8,16,24,32,40,48 `
@@ -38,13 +38,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\external_cc\run_node1_externa
   -Output results\external_cc_agentic.csv
 ```
 
-The remote root must contain external checkouts named `Bamboo-Public`,
-`polaris`, and/or `Plor`. For Plor, clone recursively with
-`git clone --recursive https://github.com/chenyoumin1993/Plor.git Plor`.
-The wrapper creates patched disposable copies with `_castdas` suffixes and
-copies the CSV back to the local workspace.
+The remote root must contain external checkouts named `Bamboo-Public` and/or
+`polaris`. The wrapper creates patched disposable copies with `_castdas`
+suffixes and copies the CSV back to the local workspace.
 
-`-Systems plor` runs Plor through its native `config.h` and `rundb` driver,
-with `PLOR` selected first and its native `SILO`, locking, HLOCK, and MOCC
-implementations available as companion baselines. The adapter recompiles each
-row because Plor selects its concurrency-control algorithm at compile time.

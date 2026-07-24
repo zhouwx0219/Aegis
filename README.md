@@ -1,77 +1,127 @@
 # Aegis
 
-Aegis is a minimal research prototype for a Data Agent System transaction
-runtime.  The storage layer is kept
-small on purpose: it exposes object reads, version reads, and conditional batch
-writes. Transaction boundaries, read/write sets, conflict validation, retry
-logic, and concurrency-control selection stay in the Python agent runtime.
+Aegis is a research prototype for agent-side transaction execution and adaptive
+concurrency control over a versioned key-value backend. It combines a Python
+transaction runtime with a small C++/pybind11 storage extension and provides
+repeatable YCSB, TPC-C, and enterprise credit-review experiments.
 
-## Current Layout
+This repository contains the code from the `Aegis` branch of CAST-DAS. It is
+intended for mechanism evaluation and paper reproduction, not as a production
+database or transaction service.
+
+## What Is Included
+
+- A versioned object store backed by embedded DBx1000 components.
+- Agent transactions with snapshots, read/write sets, conditional commit,
+  retry accounting, reasoning phases, token-cost accounting, and optional undo
+  logging.
+- Traditional CC baselines: OCC, 2PL No-Wait, 2PL Wait-Die, MVCC, Silo,
+  TicToc, Bamboo, and Polaris.
+- `paper-atcc`, the Aegis paper path with phase-aware protection, dynamic
+  priority, Wound-Wait lock handling, and delayed write application.
+- Legacy/static/trained ATCC variants used for comparison and ablation.
+- YCSB and TPC-C benchmark profiles, mixed agent/background execution, and a
+  streaming Credit Review workload.
+- Fixed-trace runners for replaying the same concrete workload across Aegis and
+  patched DBx1000-family baselines.
+- Training, ablation, bounded experiment, summarization, and archived-result
+  verification scripts.
+
+## Repository Layout
 
 ```text
-agent/runtime/       Transaction lifecycle, snapshots, validation, commit path.
-agent/cc/            Concurrency-control registry and strategy implementations.
-agent/cc/atcc/       ATCC actions, feature extraction, policy table, rewards.
-agent/workloads/     YCSB and TPC-C style agent workloads.
-agent/benchmarks/    Concurrent and mixed agent/background benchmark harnesses.
-agent/cli/           Smoke, compare, mixed, matrix, training, ablation commands.
-core/storage/        Versioned KV interface and DBx1000-backed implementation.
-core/intent/         Read/write intent DTOs exposed to Python bindings.
-core/bindings/       Pybind11 native extension.
-scripts/             PowerShell wrappers that run the Python CLIs through WSL.
-tests/               Runtime, benchmark, ATCC, and CLI regression tests.
-third_party/         Vendored DBx1000 reference code.
-results/             Local generated experiment outputs, ignored by git.
+agent/runtime/       Transaction lifecycle, versioning, ATCC locks, priority,
+                     trajectories, undo logging, and commit instrumentation.
+agent/cc/            Traditional CC strategies and ATCC policy implementations.
+agent/benchmarks/    Concurrent, mixed, and multi-seed benchmark harnesses.
+agent/workloads/     YCSB, TPC-C, and Credit Review workload definitions.
+agent/cli/           Smoke, comparison, matrix, training, and ablation CLIs.
+core/storage/        Versioned KV interfaces and the DBx1000-backed store.
+core/bindings/       pybind11 module definition for `cast_core`.
+core/intent/         Read/write intent types shared with the native layer.
+scripts/unified_trace/
+                     Fixed-trace generation, fair replay, paper matrices,
+                     Credit Review, sensitivity studies, and ablations.
+scripts/external_cc/ Adapters for native Bamboo/Polaris DBx1000 repositories.
+tests/               Runtime, CLI, workload, ATCC, and verifier tests.
+third_party/dbx1000/ Embedded DBx1000 sources used to build `cast_core`.
+results/             Generated local artifacts; ignored by Git.
 ```
 
-Removed or folded historical areas:
+## Requirements
 
-```text
-agent/evaluation/    Replaced by agent/benchmarks/ and agent/cli/.
-agent/experiments/   Replaced by explicit benchmark and matrix CLIs.
-agent/policies/      Folded into agent/cc/atcc/.
-scripts/research/    Replaced by scripts/*.ps1 wrappers.
-docs/                Folded into this README until stable paper docs are needed.
-```
+- Linux or WSL. The supplied native build script uses `g++`, `-fPIC`, and
+  POSIX threads.
+- Python 3.10 or newer, including the matching Python development headers.
+- A C++17 compiler.
+- `pybind11>=2.10`.
 
-## Build And Verify
+The repository stores C++ source code, not a prebuilt native module. Shared
+libraries are platform- and Python-ABI-specific and are ignored by Git, so
+`cast_core` must be built with the same Python interpreter that will run Aegis.
 
-The native extension is built for Linux, so use WSL or a Linux shell from the
-repository root.
+## Install And Build
+
+From the repository root in Linux or WSL:
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install --upgrade pip
 python3 -m pip install -e .
 bash build.sh
-python3 -m unittest tests.test_smoke_runtime tests.test_compare_cli -v
 ```
 
-For a full local sweep of available tests:
+`build.sh` compiles `core/bindings/cast_bindings.cpp`, the versioned storage
+implementation, and the required embedded DBx1000 sources into a module named
+`cast_core` in the repository root.
+
+Confirm that the Python and native layers load together:
+
+```bash
+python3 -c "import cast_core; print(cast_core.__file__)"
+python3 -m agent.cli.smoke --json
+```
+
+## Test
+
+Run the self-contained runtime and workload tests after building `cast_core`:
+
+```bash
+python3 -m unittest \
+  tests.test_smoke_runtime \
+  tests.test_compare_cli \
+  tests.test_credit_review_workload \
+  tests.test_paper_atcc_correctness \
+  tests.test_verify_aegis_reproduction -v
+```
+
+The two archived-matrix test modules additionally require acceptance manifests
+and their referenced files under `results/reproduction/`. Those generated
+artifacts are intentionally not committed to this repository. Run the complete
+discovery suite only after restoring that archive:
 
 ```bash
 python3 -m unittest discover -v
 ```
 
-## Main Commands
+## Quick Start
 
-Smoke check:
-
-```bash
-python3 -m agent.cli.smoke --json
-```
-
-Concurrent barrier benchmark:
+Compare all default CC strategies on a concurrent YCSB task batch:
 
 ```bash
 python3 -m agent.cli.compare \
   --workload ycsb \
   --level high \
-  --cc occ,dynamic-atcc \
+  --workload-profile paper \
+  --cc all \
   --tasks 64 \
   --workers 8 \
-  --reasoning-profile agentic
+  --reasoning-profile agentic \
+  --output results/ycsb_compare.json
 ```
 
-Mixed long-agent/short-background benchmark:
+Run mixed long-agent and short-background TPC-C transactions:
 
 ```bash
 python3 -m agent.cli.mixed \
@@ -79,249 +129,198 @@ python3 -m agent.cli.mixed \
   --level high \
   --workload-profile paper \
   --background-mode procedure \
-  --cc occ,dynamic-atcc \
+  --cc occ,2pl-wait-die,bamboo,silo,polaris,paper-atcc \
+  --clients 40 \
+  --agent-ratio 0.8 \
   --duration 5 \
-  --clients 48 \
-  --agent-ratio 1.0 \
-  --retry-until-commit
+  --retry-until-commit \
+  --output results/tpcc_mixed.json
 ```
 
-Paper-style matrix:
+Run the built-in paper-style multi-seed matrix:
 
 ```bash
 python3 -m agent.cli.matrix \
   --paper-style \
-  --cc occ,2pl-nowait,2pl-wait-die,mvcc,silo,tictoc,dynamic-atcc \
+  --cc 2pl-wait-die,bamboo,silo,polaris,paper-atcc \
   --duration 5 \
   --output results/paper_matrix.json
 ```
 
-All-agent client sweep:
+Use `--policy results/paper_policy.json --policy-mode eval` when evaluating a
+previously trained policy artifact.
+
+## Fixed-Trace Evaluation
+
+Fixed traces separate workload generation from execution. A trace contains the
+ordered reads and writes, client role, reasoning delays, seed, and workload
+metadata for every transaction. Replaying one file across systems avoids
+silently comparing different transaction streams.
+
+Generate a trace:
 
 ```bash
-python3 -m agent.cli.matrix \
-  --workloads ycsb,tpcc \
-  --levels medium,high \
-  --workload-profile paper \
-  --background-mode procedure \
-  --client-counts 8,16,24,32,40,48 \
+python3 scripts/unified_trace/generate_castdas_trace.py \
+  --output results/traces/ycsb_high_c24.csv \
+  --variant ycsb_high_z099 \
+  --clients 24 \
   --agent-ratio 1.0 \
-  --retry-until-commit \
-  --duration 5 \
-  --output results/all_agent_matrix.json
+  --seed 920104 \
+  --transactions-per-worker 128 \
+  --reasoning-profile agentic
 ```
 
-YCSB Zipfian override, for example medium with theta 0.8:
+Replay it through the internal fair runner:
 
 ```bash
-python3 -m agent.cli.matrix \
-  --workloads ycsb \
-  --levels medium \
-  --workload-profile paper \
-  --zipfian 0.8 \
-  --client-counts 8,16,24,32,40,48 \
-  --agent-ratio 1.0 \
-  --background-mode procedure \
-  --retry-until-commit \
-  --duration 5 \
-  --output results/ycsb_medium_zipf08_matrix.json
-```
-
-Train ATCC policy:
-
-```bash
-python3 -m agent.cli.train_atcc \
-  --benchmark mixed \
-  --workloads ycsb,tpcc \
-  --levels low,medium,high \
-  --workload-profile paper \
-  --background-mode procedure \
-  --budget-seconds 600 \
-  --duration 2 \
-  --clients 48 \
-  --agent-ratio 0.8 \
-  --retry-until-commit \
-  --output results/atcc_policy.json
-```
-
-ATCC ablation matrix:
-
-```bash
-python3 -m agent.cli.matrix \
-  --workloads ycsb,tpcc \
-  --levels low,medium,high \
-  --seeds 920104,920105,920106 \
-  --client-counts 8,16,24,32,40,48 \
-  --workload-profile paper \
-  --background-mode procedure \
-  --cc static-atcc,static-atcc-priority,trained-atcc,trained-atcc-priority \
-  --duration 5 \
-  --reasoning-profile agentic \
-  --retry-until-commit \
-  --policy results/atcc_policy.json \
+python3 scripts/unified_trace/run_castdas_trace_fair.py \
+  --trace results/traces/ycsb_high_c24.csv \
+  --output results/ycsb_high_c24_results.csv \
+  --cc 2pl-wait-die,bamboo,silo,polaris,paper-atcc \
+  --paper-policy results/paper_policy.json \
   --policy-mode eval \
-  --output results/atcc_2x2_ablation.json
+  --max-attempts 1 \
+  --measure-seconds 2
 ```
 
-PowerShell wrappers mirror these commands from Windows:
+Paper replay disables retries by default. For a retry experiment, set
+`--max-attempts` above `1` and explicitly pass `--allow-retries`.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\smoke.ps1 -Json
-powershell -ExecutionPolicy Bypass -File .\scripts\compare_cc.ps1 -Workload ycsb -Level high -Cc occ,dynamic-atcc
-powershell -ExecutionPolicy Bypass -File .\scripts\mixed_benchmark.ps1 -Workload tpcc -Level high -WorkloadProfile paper -BackgroundMode procedure -Clients 48 -RetryUntilCommit
-powershell -ExecutionPolicy Bypass -File .\scripts\mixed_matrix.ps1 -PaperStyle -Cc occ,2pl-nowait,2pl-wait-die,mvcc,silo,tictoc,dynamic-atcc
-powershell -ExecutionPolicy Bypass -File .\scripts\train_atcc.ps1 -Benchmark mixed -Workloads ycsb,tpcc -Levels low,medium,high -Output results\atcc_policy.json
-```
+The higher-level `run_unified_trace_matrix.py` command generates and runs the
+standard YCSB/TPC-C variants, client counts, agent ratios, and seeds. It can
+also invoke patched native Bamboo and Polaris repositories when those external
+checkouts are available.
 
-## Transaction Model
+## Paper ATCC
 
-Each workload task maps to one agent transaction. The runtime records a
-snapshot, read set, write set, metadata, and trace events. At commit, the
-selected CC strategy may acquire runtime locks or reservations, then the runtime
-validates versions and installs writes with `BatchPutIfVersion`.
+`paper-atcc` is the current Aegis mechanism. It is separate from the legacy
+`dynamic-atcc` strategy retained for earlier experiments.
 
-Workloads expose object-level `read` and `write` operations only. Business
-semantics such as append, delta, CAS, escrow, and commutative updates are not
-visible to the CC layer.
+At a high level, the runtime:
 
-Default strategy expansion for `--cc all`:
+1. Starts a transaction optimistically and records its observed access set.
+2. Invokes a phase policy as execution reveals contention and transaction
+   shape.
+3. Monotonically expands protection over hot/cold reads and writes.
+4. Validates already observed reads before retroactively acquiring protection.
+5. Resolves protected conflicts with dynamic-priority Wound-Wait.
+6. Enters a non-preemptible commit phase, validates remaining optimistic reads,
+   installs buffered writes, publishes the commit, and releases protection.
 
-```text
-occ, 2pl-nowait, 2pl-wait-die, mvcc, silo, tictoc, bamboo, polaris, paper-atcc
-```
+Delayed write application and priority are independent ablation switches. The
+runtime also records lock acquisition, lock wait, wounds, validation failures,
+commit-phase timing, retries, wasted reasoning, and token-cost metrics.
 
-Additional explicit ATCC ablation strategies:
-
-```text
-static-atcc             static threshold, no priority
-static-atcc-priority    static threshold with runtime priority
-trained-atcc            trained policy table, no priority
-trained-atcc-priority   trained policy table with runtime priority
-```
-
-## ATCC Mechanism
-
-### Paper-aligned runtime
-
-`paper-atcc` is the implementation corresponding to the current Aegis paper.
-It is separate from the legacy `dynamic-atcc` benchmark strategy. Paper ATCC
-starts each transaction in OCC, invokes a compiled phase policy through the
-operation interceptor, and monotonically expands a four-bit lock action over
-hot/cold reads/writes. Action changes retroactively validate prior reads before
-acquiring read/write locks. Lock conflicts use dynamic-priority Wound-Wait;
-commit acquires the remaining write set, validates optimistic reads, enters a
-non-preemptible committing state, flushes Undo records, atomically installs
-buffered writes, publishes COMMIT, and releases locks.
-
-Train a compiled policy from runtime trajectories:
+Train a compiled paper policy from one or more trajectory files:
 
 ```bash
 python3 scripts/train_paper_atcc.py \
-  --trajectory results/paper_trajectory.json \
+  --trajectory results/training/trajectory.json \
   --output results/paper_policy.json \
-  --report results/paper_train_report.json \
-  --generation 2
+  --report results/paper_policy_report.json \
+  --generation 1
 ```
 
-Run fixed-trace evaluation with the paper runtime:
+For coordinated or matrix training, use
+`scripts/train_paper_atcc_coordinated.py` or
+`scripts/train_paper_atcc_matrix.py`.
+
+## Credit Review Workload
+
+Credit Review models streaming enterprise credit decisions whose access sets
+are discovered online. Transactions combine company, sector, region,
+portfolio, committee, compliance, exposure, and review-queue objects under a
+Zipfian company distribution. This workload is used to evaluate expensive
+agent reasoning, commit admission, and tail latency without relying on a
+predeclared complete write set.
 
 ```bash
-python3 scripts/unified_trace/run_unified_trace_matrix.py \
-  --output-dir results/paper_main \
+python3 scripts/unified_trace/run_credit_review_experiment.py \
+  --output-dir results/credit_review \
   --paper-policy results/paper_policy.json \
-  --internal-cc occ,2pl-nowait,2pl-wait-die,mvcc,silo,tictoc,bamboo,polaris,paper-atcc
+  --clients 8,16,24,32,40 \
+  --systems 2pl-wait-die,bamboo,silo,polaris,paper-atcc \
+  --repeats 3 \
+  --measure-seconds 3
 ```
 
-`dynamic-atcc`, reservations, runtime performance overrides, and learned
-admission yield are retained only for legacy reproduction and are not part of
-the paper-aligned mechanism.
+## Bounded Experiment Groups
 
-`dynamic-atcc` chooses one action per agent transaction from the policy/action
-space below:
+The grouped runner covers scalability, agent/worker decoupling, contention,
+transaction shape, read/write ratio, reasoning ratio control, and ATCC
+ablations:
 
-```text
-occ, write-validate, reserve-hot, reserve-hot-rw,
-reserve-read-write-set, lock-before-commit, retry-protect
+```bash
+python3 scripts/unified_trace/run_aegis_two_hour_experiments.py \
+  --group all \
+  --output-dir results/aegis_groups \
+  --paper-policy results/paper_policy.json
 ```
 
-The feature key is built from workload, task type, conflict level, contention
-bucket, agent-cost bucket, write-set bucket, and retry stage. Training updates a
-JSON policy table from observed commit/abort outcomes, elapsed time, lock wait,
-lock hold time, wasted reasoning cost, skipped reasoning, and background
-pressure. Evaluation loads the policy with `--policy` and freezes it with
-`--policy-mode eval`.
+Use `--quick` for one repeat per configuration, `--points` to select specific
+parameter values, and `--force` to recompute existing rows. To refresh only
+Aegis rows in an existing group, use
+`scripts/unified_trace/refresh_aegis_group.py`.
 
-Runtime execution has three paths:
+Mechanism-only DWA and priority checks can be run separately:
 
-```text
-optimistic          execute first, validate at commit
-deferred-protect    reason first, begin/protect near commit
-early-protect       protect hot or retry transactions before object access
+```bash
+python3 scripts/unified_trace/run_atcc_mechanism_microbench.py \
+  --output results/atcc_mechanisms.csv \
+  --ablation-dir results/atcc_mechanism_ablation
 ```
 
-Priority is a runtime scheduling hint, not a separate CC protocol. It is derived
-from learned row priority, retry count, estimated wasted reasoning cost, risk
-score, and transaction start order. Current experiments show that priority can
-help under high client pressure, but hard-coded priority can also reduce total
-throughput, so the reliable claim should be based on the 2x2 ablation rather
-than on a single hand-tuned priority rule.
+## Workload And Retry Semantics
 
-## Benchmark Semantics
+The paper YCSB profile uses 10 operations per transaction. Low, medium, and
+high levels vary the read/write ratio and contention distribution; explicit
+Zipfian sweeps can override the profile with `--ycsb-zipf-theta` or
+`--zipfian`.
 
-`agent.cli.compare` runs fixed task batches. It creates a fresh runtime per
-strategy, uses the same seed-generated task sequence, and executes tasks in
-barrier batches controlled by `--workers`.
+The paper TPC-C profile uses NewOrder and Payment transactions with configurable
+warehouse counts. Mixed `procedure` mode executes short background procedures
+against the same store as agent transactions.
 
-`agent.cli.mixed` runs wall-clock mixed contention with long agent transactions
-and short background transactions. `--background-mode procedure` runs short
-YCSB/TPC-C tasks against the same store and is the preferred paper-style setup.
-Set `--agent-ratio 1.0` with `--clients` or `--client-counts` to run an all-agent
-sweep with zero background workers.
+Agent latency is measured from first submission through final outcome. When
+retries are enabled, it includes retry backoff and repeated reasoning. Token
+metrics use the configured `--tokens-per-operation` value, which defaults to
+2703.
 
-With `--retry-until-commit`, agent latency is measured from first submission to
-eventual commit, including retries and injected reasoning delay. Token cost
-uses:
+Do not mix no-retry and retry results in one claim. The fixed-trace runner uses
+one attempt unless retries are explicitly enabled, while the bounded paper
+runner defaults to six total attempts (the initial attempt plus five retries).
 
-```text
-T_avg = (1 + R_abort) * N_ops * omega
-omega = 2703 tokens per operation
+## External Bamboo And Polaris Baselines
+
+`scripts/external_cc/` patches disposable external DBx1000-family checkouts and
+runs CAST-DAS-shaped client mixes in their native engines. This path is a
+benchmark adapter; it does not port Aegis transaction semantics or ATCC into
+those systems. See `scripts/external_cc/README.md` for the required checkout
+names and remote wrapper command.
+
+## Reproduction Verification
+
+The verification scripts check archived file hashes, seed isolation, system
+coverage, retry invariants, and recomputed metrics. Generated archives are not
+part of the Git tree, so provide a manifest and all files referenced by it:
+
+```bash
+python3 scripts/verify_aegis_reproduction.py \
+  --manifest results/reproduction/experiment_manifest.json
+
+python3 scripts/verify_five_retry_paper_matrix.py \
+  --manifest results/reproduction/five_retry_paper_acceptance_manifest.json \
+  --require-all
+
+python3 scripts/verify_zero_retry_paper_matrix.py \
+  --manifest results/reproduction/zero_retry_paper_acceptance_manifest.json \
+  --require-full-paper-claims
 ```
-
-The paper YCSB profile uses 10 operations per transaction and these contention
-settings:
-
-```text
-low     95/5 read/write, uniform
-medium  90/10 read/write, 10% hot tuples receive about 50% of accesses
-high    50/50 read/write, 10% hot tuples receive about 75% of accesses
-```
-
-By default, these profiles keep the hotspot access model above. Passing
-`--zipfian <theta>` or `--ycsb-zipf-theta <theta>` switches YCSB to global
-Zipfian record sampling for that run and records the theta in the JSON output.
-This is intended for sweeps such as YCSB medium theta 0.7/0.8 and YCSB high
-theta 0.99.
-
-The paper TPC-C profile uses `NewOrder` and `Payment` transactions.
 
 ## Results Policy
 
-Generated JSON files in `results/` and root-level `paper_*_results.json` are
-local experiment outputs and are ignored by git. Keep only artifacts that are
-needed to reproduce a report or paper figure, and document the command that
-created them. If an artifact must be versioned, add it explicitly with
-`git add -f`.
-
-Recommended retained artifacts after the current ATCC work:
-
-```text
-results/paper_like_atcc_small_policy_v5_write_validate.json
-results/atcc_2x2_ablation_smoke_v2_priority_reservation.json
-results/atcc_2x2_ablation_high_clients_smoke_v1.json
-results/atcc_2x2_ablation_retry_priority_v1.json
-results/atcc_2x2_ablation_high_clients_retry_priority_v1.json
-```
-
-Older `paper_like_atcc_*_v*.json` and `force_tpcc_medium_*` files are historical
-tuning outputs. They should be deleted once their conclusions have been copied
-into the report or replaced by a final multi-seed matrix.
+`results/`, root-level paper result JSON files, native modules, build outputs,
+and external repositories are ignored by Git. Keep the command line, code
+revision, policy file, trace, seeds, retry budget, and manifest together for
+every result used in a report. A CSV or JSON file without that provenance is
+not sufficient for a reproducible comparison.

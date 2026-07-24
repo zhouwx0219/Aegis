@@ -39,15 +39,6 @@ SYSTEMS = {
             "/usr/bin/g++-10",
         ],
     },
-    "plor": {
-        "source_dir": "Plor",
-        "work_dir": "Plor_castdas",
-        "python": "",
-        "algorithms": ["PLOR", "SILO", "NO_WAIT", "WAIT_DIE", "WOUND_WAIT", "HLOCK", "MOCC"],
-        "compat": True,
-        "runner": "plor",
-        "compiler_candidates": [],
-    },
 }
 
 
@@ -193,7 +184,6 @@ def main() -> int:
                                 run_timeout=args.run_timeout,
                                 repeat=repeat,
                                 alg=alg,
-                                runner=meta.get("runner", "dbx1000"),
                             )
                             rows.append(row)
                             write_rows(output, rows)
@@ -214,8 +204,6 @@ def prepare_repo(root: Path, system: str, meta: dict, patch_script: Path) -> Pat
     (dst / "outputs").mkdir(exist_ok=True)
     (dst / "log").mkdir(exist_ok=True)
     cmd = [sys.executable, str(patch_script), str(dst)]
-    if meta.get("runner") == "plor":
-        cmd.append("--plor")
     if meta.get("compat"):
         cmd.append("--compat")
     compiler = first_existing(meta.get("compiler_candidates", []))
@@ -226,9 +214,6 @@ def prepare_repo(root: Path, system: str, meta: dict, patch_script: Path) -> Pat
 
 
 def run_one(repo: Path, **kwargs) -> dict:
-    if kwargs.get("runner") == "plor":
-        return run_one_plor(repo, **kwargs)
-
     workload = kwargs["workload"]
     level_key = kwargs["level_key"]
     duration = kwargs["duration"]
@@ -280,7 +265,7 @@ def run_one(repo: Path, **kwargs) -> dict:
         "warmup_s": kwargs["warmup"],
         "repeat": kwargs["repeat"],
         "status": "ok" if parsed and not timed_out else "error",
-        "throughput": parsed.get("throughput", parsed.get("rxn_rate", "")),
+        "throughput": parsed.get("throughput", ""),
         "txn_cnt": parsed.get("txn_cnt", ""),
         "abort_cnt": parsed.get("abort_cnt", ""),
         "user_abort_cnt": parsed.get("user_abort_cnt", ""),
@@ -300,116 +285,6 @@ def run_one(repo: Path, **kwargs) -> dict:
     )
     (log_dir / log_name).write_text(out)
     return row
-
-
-def run_one_plor(repo: Path, **kwargs) -> dict:
-    """Compile and run Plor, whose native driver is config.h plus rundb."""
-    workload = kwargs["workload"]
-    level_key = kwargs["level_key"]
-    defines = {
-        "CORE_CNT": kwargs["clients"],
-        "CORO_CNT": 1,
-        "CC_ALG": kwargs["alg"],
-        "CASTDAS_AGENTIC": "true",
-        "CASTDAS_AGENT_RATIO": kwargs["agent_ratio"],
-        "CASTDAS_REASONING_SCALE": 1.0,
-        "CASTDAS_RUN_SECONDS": max(1, int(round(kwargs["duration"]))),
-    }
-    if workload == "ycsb":
-        defines.update(plor_defines(YCSB_LEVELS[level_key]))
-        defines["WORKLOAD"] = "YCSB"
-    elif workload == "tpcc":
-        defines.update(plor_defines(TPCC_LEVELS[level_key]))
-        defines["WORKLOAD"] = "TPCC"
-    else:
-        raise ValueError(workload)
-    update_c_defines(repo / "config.h", defines)
-
-    started = time.time()
-    build = subprocess.run(
-        ["make", "-j"],
-        cwd=str(repo),
-        env=run_env(),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        universal_newlines=True,
-    )
-    build_output = build.stdout
-    summary_path = repo / "outputs" / "castdas_summary.log"
-    run_output = ""
-    timed_out = False
-    if build.returncode == 0:
-        cmd = ["./rundb", f"-t{kwargs['clients']}", "-o", str(summary_path)]
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(repo),
-            env=run_env(),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            universal_newlines=True,
-            preexec_fn=os.setsid if os.name != "nt" else None,
-        )
-        try:
-            run_output, _ = proc.communicate(
-                timeout=float(kwargs.get("run_timeout", 0.0) or 0.0) or None
-            )
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            terminate_process_tree(proc)
-            run_output, _ = proc.communicate()
-    elapsed = time.time() - started
-    summary = summary_path.read_text() if summary_path.exists() else ""
-    output = build_output + "\n" + run_output + "\n" + summary
-    parsed = parse_summary(output)
-    ok = build.returncode == 0 and bool(parsed) and not timed_out
-    row = {
-        "system": kwargs["system"],
-        "cc": kwargs["alg"],
-        "workload": workload,
-        "workload_variant": kwargs["workload_variant"],
-        "level": kwargs["level"],
-        "clients": kwargs["clients"],
-        "agent_ratio": kwargs["agent_ratio"],
-        "duration_s": kwargs["duration"],
-        "warmup_s": kwargs["warmup"],
-        "repeat": kwargs["repeat"],
-        "status": "ok" if ok else "error",
-        "throughput": parsed.get("rxn_rate", ""),
-        "txn_cnt": parsed.get("txn_cnt", ""),
-        "abort_cnt": parsed.get("abort_cnt", ""),
-        "user_abort_cnt": "",
-        "agent_txn_cnt": parsed.get("castdas_agent_txn_cnt", ""),
-        "agent_abort_cnt": parsed.get("castdas_agent_abort_cnt", ""),
-        "background_txn_cnt": parsed.get("castdas_background_txn_cnt", ""),
-        "background_abort_cnt": parsed.get("castdas_background_abort_cnt", ""),
-        "agent_delay_ms": ns_to_ms(parsed.get("castdas_agent_delay_ns", "")),
-        "run_seconds": f"{elapsed:.3f}",
-        "error": "" if ok else ("timeout; " + tail(output) if timed_out else tail(output)),
-    }
-    log_dir = repo / "outputs" / "castdas_logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_name = (
-        f"{kwargs['system']}_{kwargs['alg']}_{kwargs['workload_variant']}_"
-        f"c{kwargs['clients']}_a{kwargs['agent_ratio']}_r{kwargs['repeat']}.log"
-    )
-    (log_dir / log_name).write_text(output)
-    return row
-
-
-def plor_defines(values: dict) -> dict:
-    """Keep only config.h knobs Plor exposes as compile-time constants."""
-    supported = {"SYNTH_TABLE_SIZE", "REQ_PER_QUERY", "READ_PERC", "ZIPF_THETA", "NUM_WH", "PERC_PAYMENT"}
-    return {key: value for key, value in values.items() if key in supported}
-
-
-def update_c_defines(path: Path, values: dict) -> None:
-    text = path.read_text()
-    for key, value in values.items():
-        pattern = re.compile(rf"^(#define\s+{re.escape(key)}\s+).*$", re.MULTILINE)
-        text, count = pattern.subn(rf"\g<1>{value}", text, count=1)
-        if count != 1:
-            raise SystemExit(f"cannot set {key} in {path}")
-    path.write_text(text)
 
 
 def common_overrides(**kwargs) -> dict:
