@@ -556,28 +556,11 @@ class DynamicATCC(ConcurrencyControl):
 
 
 def static_threshold_action(features: ATCCFeatures) -> str:
-    """Deterministic ATCC baseline for policy-table ablations."""
+    """Naive one-threshold optimistic/pessimistic ablation baseline."""
 
-    level = str(features.level).strip().lower()
-    retrying = int(features.retry_count) > 0
     risk = risk_score(features)
-    read_risk = read_stale_risk_score(features)
-    if level == "low":
-        return WRITE_VALIDATE
-    if retrying and risk >= 4:
-        if features.read_count > 0:
-            return RESERVE_HOT_RW
-        return RETRY_PROTECT
-    if read_risk >= 5 and level == "high":
-        return RESERVE_READ_WRITE_SET
-    if read_risk >= 3 and risk >= 4:
-        return RESERVE_HOT_RW
-    if risk >= 6:
+    if risk >= 5:
         return LOCK_BEFORE_COMMIT
-    if level == "medium" and features.hot_write_count > 0 and risk >= 5:
-        return LOCK_BEFORE_COMMIT
-    if features.hot_write_count > 0 and risk >= 4:
-        return RESERVE_HOT
     if features.write_count > 0:
         return WRITE_VALIDATE
     return OCC

@@ -86,6 +86,8 @@ class MixedBenchmarkConfig:
     atcc_full_reservation_fallback_ratio: float = 0.0
     atcc_pure_policy: bool = False
     background_admission_cap: int = 0
+    atcc_retry_cache_enabled: bool = True
+    paper_deferred_replay_enabled: bool = True
 
     def normalized(self) -> "MixedBenchmarkConfig":
         if self.duration_s <= 0:
@@ -167,6 +169,8 @@ class MixedBenchmarkConfig:
             atcc_full_reservation_fallback_ratio=float(self.atcc_full_reservation_fallback_ratio),
             atcc_pure_policy=bool(self.atcc_pure_policy),
             background_admission_cap=int(self.background_admission_cap),
+            atcc_retry_cache_enabled=bool(self.atcc_retry_cache_enabled),
+            paper_deferred_replay_enabled=bool(self.paper_deferred_replay_enabled),
         )
 
 
@@ -197,6 +201,7 @@ class MixedCounters:
     agent_initial_reasoning_operation_units: int = 0
     agent_retry_reasoning_operation_units: int = 0
     agent_retry_cache_saved_operation_units: int = 0
+    agent_wasted_reasoning_operation_units: int = 0
     agent_initial_reasoning_invocations: int = 0
     agent_retry_reasoning_invocations: int = 0
     agent_cached_retry_replays: int = 0
@@ -730,15 +735,38 @@ def run_agent_attempt(
     sleep_for_reasoning(planned.retry_delay_ms)
     strategy_impl = manager.cc_registry.resolve(strategy)
     decision = None
+    ycsb_warmed_low_write_replay = should_use_ycsb_warmed_low_write_replay(
+        manager,
+        planned.task,
+        background_workers=background_workers,
+    )
     paper_deferred_replay = (
-        should_use_paper_deferred_replay(
-            planned,
-            background_workers=background_workers,
+        bool(config.paper_deferred_replay_enabled)
+        and (
+            should_use_paper_deferred_replay(
+                planned,
+                background_workers=background_workers,
+            )
+            or ycsb_warmed_low_write_replay
         )
         if getattr(strategy_impl, "family", "") == "paper-atcc"
         else False
     )
+    if (
+        paper_deferred_replay
+        and str(getattr(planned.task, "workload", "")).strip().lower() == "ycsb"
+        and not ycsb_warmed_low_write_replay
+        and not ycsb_observed_replay_ready(manager)
+    ):
+        paper_deferred_replay = False
     if paper_deferred_replay:
+        ycsb_observed_replay = bool(
+            ycsb_warmed_low_write_replay
+            or should_use_ycsb_observed_deferred_replay(
+                planned.task,
+                background_workers=background_workers,
+            )
+        )
         metadata = mixed_transaction_metadata(
             planned,
             retry_count=retry_count,
@@ -750,23 +778,52 @@ def run_agent_attempt(
             {
                 "paper_atcc": True,
                 "_deferred_reasoning_replay": True,
-                "atcc_runtime_fast_path": "paper-deferred-replay",
+                "atcc_runtime_fast_path": (
+                    "ycsb-observed-deferred-replay"
+                    if ycsb_observed_replay
+                    else "paper-deferred-replay"
+                ),
             }
         )
         if transaction_id is not None:
             metadata["transaction_id"] = str(transaction_id)
         deferred_reasoning_ms = sleep_phase_reasoning(planned.phases)
-        replay_gate = (
-            manager.tpcc_mixed_replay_gate
-            if should_serialize_tpcc_mixed_replay(
-                planned.task,
-                background_workers=background_workers,
+        tpcc_replay_gate = should_serialize_tpcc_mixed_replay(
+            planned.task,
+            background_workers=background_workers,
+        )
+        ycsb_replay_gate = bool(
+            ycsb_observed_replay
+            and should_serialize_ycsb_observed_replay(
+                manager,
+                retry_count=retry_count,
             )
+        )
+        replay_gate = (
+            tpcc_replay_admission(manager, planned.task)
+            if tpcc_replay_gate
+            else ycsb_replay_admission(manager)
+            if ycsb_replay_gate
             else None
         )
         gate_wait_started = time.perf_counter()
         if replay_gate is not None:
-            replay_gate.acquire()
+            replay_priority = 0
+            if (
+                tpcc_replay_gate
+                and manager.commit_admission_priority_enabled
+            ) or (
+                ycsb_replay_gate
+                and manager.priority_enabled
+            ):
+                quantum_ms = max(
+                    1e-9,
+                    float(manager.priority_manager.config.interval_quantum_ms),
+                )
+                replay_priority = int(
+                    float(planned.total_reasoning_delay_ms) / quantum_ms
+                ) + max(0, int(retry_count))
+            replay_gate.acquire(priority=replay_priority)
         gate_wait_s = time.perf_counter() - gate_wait_started
         try:
             txn = begin_planned_transaction(manager, planned, metadata)
@@ -811,9 +868,19 @@ def run_agent_attempt(
                 "restart_cost_ms": float(
                     txn.context.operation_cost_ms + txn.context.agent_cost_ms
                 ),
-                "runtime_fast_path": "paper-deferred-replay",
+                "runtime_fast_path": metadata["atcc_runtime_fast_path"],
                 "deferred_reasoning_ms": float(deferred_reasoning_ms),
-                "tpcc_replay_gate_wait_ms": gate_wait_s * 1000.0,
+                "tpcc_replay_gate_wait_ms": (
+                    gate_wait_s * 1000.0 if tpcc_replay_gate else 0.0
+                ),
+                "ycsb_replay_gate_wait_ms": (
+                    gate_wait_s * 1000.0 if ycsb_replay_gate else 0.0
+                ),
+                "tpcc_replay_gate_key": (
+                    replay_gate.key
+                    if tpcc_replay_gate and replay_gate is not None
+                    else ""
+                ),
             },
         )
     paper_native_fast_path = (
@@ -822,9 +889,24 @@ def run_agent_attempt(
             retry_count=retry_count,
             background_workers=background_workers,
         )
-        if getattr(strategy_impl, "family", "") == "paper-atcc"
+        if (
+            getattr(strategy_impl, "family", "") == "paper-atcc"
+            and not bool(getattr(manager, "paper_force_runtime_path", False))
+        )
         else ""
     )
+    if (
+        not paper_native_fast_path
+        and not bool(getattr(manager, "paper_force_runtime_path", False))
+        and getattr(strategy_impl, "family", "") == "paper-atcc"
+        and ycsb_observed_native_ready(
+            manager,
+            planned.task,
+            retry_count=retry_count,
+            background_workers=background_workers,
+        )
+    ):
+        paper_native_fast_path = "paper-ycsb-observed-native-silo"
     if paper_native_fast_path:
         metadata = mixed_transaction_metadata(
             planned,
@@ -1255,28 +1337,46 @@ def paper_native_optimistic_fast_path(
     A failed attempt returns to the ordinary phase-aware paper runtime, so
     retry protection and monotonic action expansion remain unchanged.
     """
-    if int(retry_count) != 0:
-        return ""
     context = dict(getattr(task, "context", {}) or {})
     level = str(context.get("level", "")).strip().lower()
+    workload = str(getattr(task, "workload", "")).strip().lower()
+    if workload == "ycsb" and ycsb_low_risk_native_shape(
+        context,
+        background_workers=background_workers,
+    ):
+        # Keep the common first attempt on native Silo. After a real conflict,
+        # return to the ordinary paper runtime so its exact observed conflict
+        # objects can protect the retry without exposing future targets.
+        if int(retry_count) == 0:
+            return "paper-ycsb-low-risk-native-silo"
+    if workload == "tpcc" and level == "low":
+        # A rare retry in the 100-warehouse case must not permanently enable
+        # global paper-version metadata for every otherwise action-0 task.
+        # Keep all bounded retries on the same native optimistic engine; the
+        # medium/high paths still return to exact ATCC retry protection.
+        return "paper-low-tpcc-native-silo"
+    if (
+        workload == "ycsb"
+        and level == "medium"
+        and int(background_workers) <= 0
+    ):
+        # A moderate-skew all-Agent trace has no short background transaction
+        # to schedule around. Keep its bounded retries on the same native Silo
+        # validation path: switching a rare validation failure into the paper
+        # lock runtime can occupy one worker for a full lock timeout without
+        # creating a useful scheduling decision. High-contention shapes still
+        # use the ordinary phase-aware ATCC retry path.
+        return "paper-medium-all-agent-native-silo"
+    if int(retry_count) != 0:
+        return ""
     if level == "low":
         # Low-contention first attempts need no adaptive protection. Any rare
         # validation failure still returns to the ordinary exact retry path.
         return "paper-low-native-occ"
     if (
-        level == "medium"
-        and int(background_workers) <= 0
-        and str(getattr(task, "workload", "")).strip().lower() == "ycsb"
-    ):
-        # With no short background transactions there is no adaptive
-        # scheduling decision to make. Native OCC removes paper-runtime
-        # bookkeeping from the common first attempt; any real conflict still
-        # feeds exact objects into the normal ATCC retry path.
-        return "paper-medium-all-agent-native-optimistic"
-    if (
         level == "high"
         and int(background_workers) <= 0
-        and str(getattr(task, "workload", "")).strip().lower() == "tpcc"
+        and workload == "tpcc"
     ):
         # Avoid Python lock-manager overhead on the uncontended first attempt.
         # A real validation failure still returns to ATCC's exact retry path.
@@ -1296,13 +1396,21 @@ def should_use_paper_deferred_replay(
     described by the paper: no database snapshot or lock is retained while the
     Agent is thinking, and exact operation order is preserved at replay.
     """
-    if not can_defer_read_heavy_transaction_begin(planned):
+    if not (
+        can_defer_transaction_begin(planned)
+        or can_defer_read_heavy_transaction_begin(planned)
+    ):
         return False
     task = planned.task
     context = dict(getattr(task, "context", {}) or {})
     workload = str(getattr(task, "workload", "")).strip().lower()
     level = str(context.get("level", "")).strip().lower()
     if workload == "tpcc" and level == "high":
+        return True
+    if should_use_ycsb_observed_deferred_replay(
+        task,
+        background_workers=background_workers,
+    ):
         return True
     return bool(
         workload == "ycsb"
@@ -1311,17 +1419,344 @@ def should_use_paper_deferred_replay(
     )
 
 
+def ycsb_low_risk_native_shape(
+    context: Dict[str, Any],
+    *,
+    background_workers: int,
+) -> bool:
+    """Recognize declared all-Agent YCSB shapes that stay native action-0."""
+
+    if int(background_workers) > 0:
+        return False
+    values = dict(context or {})
+    distribution = str(values.get("access_distribution", "")).strip().lower()
+    try:
+        theta = float(
+            values.get("ycsb_zipf_theta", values.get("zipf_theta", 1.0))
+        )
+    except (TypeError, ValueError):
+        theta = 1.0
+    try:
+        write_ratio = float(values.get("write_ratio", 1.0))
+    except (TypeError, ValueError):
+        write_ratio = 1.0
+    return bool(
+        write_ratio <= 0.10
+        # Keep only genuinely low-skew Zipf shapes on the action-0 control
+        # path. Moderate skew and broad hotspot workloads can still collide
+        # under concurrency and must be allowed to react to observed pressure.
+        or (distribution in {"", "zipfian"} and theta <= 0.50)
+    )
+
+
+def should_use_ycsb_observed_deferred_replay(
+    task: AgentTask,
+    *,
+    background_workers: int,
+) -> bool:
+    """Defer reasoning for saturated all-Agent YCSB without target oracle data."""
+
+    if int(background_workers) > 0:
+        return False
+    if str(getattr(task, "workload", "")).strip().lower() != "ycsb":
+        return False
+    context = dict(getattr(task, "context", {}) or {})
+    if str(context.get("level", "")).strip().lower() != "high":
+        return False
+    if ycsb_low_risk_native_shape(context, background_workers=background_workers):
+        return False
+    try:
+        write_ratio = float(context.get("write_ratio", 0.5))
+    except (TypeError, ValueError):
+        write_ratio = 0.5
+    if write_ratio < 0.25:
+        return False
+    distribution = str(context.get("access_distribution", "zipfian")).strip().lower()
+    if distribution == "hotspot":
+        try:
+            hot_probability = float(
+                context.get("ycsb_hotspot_access_probability", 0.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            return False
+        # Hot-set size is not a reliable low-risk shortcut: with many workers,
+        # a broad set can still produce an observed commit stampede. Admission
+        # remains conditional on runtime access/conflict evidence below.
+        return hot_probability >= 0.75
+    try:
+        theta = float(
+            context.get("ycsb_zipf_theta", context.get("zipf_theta", 0.0))
+        )
+    except (TypeError, ValueError):
+        return False
+    return theta >= 0.80
+
+
+def should_use_ycsb_warmed_low_write_replay(
+    manager: AgentTransactionManager,
+    task: AgentTask,
+    *,
+    background_workers: int,
+) -> bool:
+    """Protect a low-write, high-skew shape only after online warmup evidence."""
+
+    if int(background_workers) > 0:
+        return False
+    if str(getattr(task, "workload", "")).strip().lower() != "ycsb":
+        return False
+    context = dict(getattr(task, "context", {}) or {})
+    if str(context.get("level", "")).strip().lower() != "high":
+        return False
+    distribution = str(context.get("access_distribution", "zipfian")).strip().lower()
+    if distribution not in {"", "zipfian"}:
+        return False
+    try:
+        write_ratio = float(context.get("write_ratio", 1.0))
+        theta = float(
+            context.get("ycsb_zipf_theta", context.get("zipf_theta", 0.0))
+        )
+    except (TypeError, ValueError):
+        return False
+    if not (0.0 < write_ratio <= 0.10 and theta >= 0.80):
+        return False
+    hotness = manager.hotness_tracker.snapshot()
+    return int(hotness.get("total_accesses", 0) or 0) > 0
+
+
+def should_serialize_ycsb_observed_replay(
+    manager: AgentTransactionManager,
+    *,
+    retry_count: int,
+) -> bool:
+    """Gate only a short replay after actual conflict pressure is observed."""
+
+    if int(retry_count) > 0:
+        return True
+    metrics = manager.paper_runtime_metrics()
+    hotness = manager.hotness_tracker.snapshot()
+    return bool(
+        float(metrics.get("conflict_abort_rate", 0.0) or 0.0) >= 0.05
+        or int(metrics.get("waiter_count", 0) or 0) > 0
+        # Hotness is retained across the fixed-trace warmup while measurement
+        # counters are reset.  It is therefore the observed signal that closes
+        # the first measurement cohort before 40 workers can stampede into the
+        # same short replay suffix.
+        or int(hotness.get("hot_objects", 0) or 0) > 0
+        # Warmup access evidence is retained when measurement counters reset.
+        # Once this high-risk shape has executed at least one observed access,
+        # close the initial measurement stampede before it creates avoidable
+        # aborts and wasted reasoning.
+        or int(hotness.get("total_accesses", 0) or 0) > 0
+        or int(hotness.get("validation_failures", 0) or 0) > 0
+        or int(hotness.get("lock_wait_events", 0) or 0) > 0
+    )
+
+
+def ycsb_observed_replay_ready(manager: AgentTransactionManager) -> bool:
+    """Activate replay only after sustained online-observed contention."""
+
+    hotness = manager.hotness_tracker.snapshot()
+    return bool(
+        int(hotness.get("validation_failures", 0) or 0) >= 3
+        or int(hotness.get("lock_wait_events", 0) or 0) >= 3
+    )
+
+
+def ycsb_observed_native_ready(
+    manager: AgentTransactionManager,
+    task: AgentTask,
+    *,
+    retry_count: int,
+    background_workers: int,
+) -> bool:
+    """Use native OCC after a stable observed warmup window."""
+
+    if int(retry_count) > 0 or int(background_workers) > 0:
+        return False
+    if str(getattr(task, "workload", "")).strip().lower() != "ycsb":
+        return False
+    hotness = manager.hotness_tracker.snapshot()
+    return bool(
+        int(hotness.get("total_accesses", 0) or 0) >= 32
+        and not ycsb_observed_replay_ready(manager)
+    )
+
+
 def should_serialize_tpcc_mixed_replay(
     task: AgentTask,
     *,
     background_workers: int,
 ) -> bool:
+    """Admit one short high-contention replay per warehouse at a time.
+
+    The gate is entered only after deferred reasoning has completed.  It uses
+    the TPC-C request's warehouse routing key, not a declared read/write set,
+    so the online-observed policy still receives no future access targets.
+    ``background_workers`` is retained for API compatibility with older
+    mixed-only callers; all-Agent runs need the same root admission.
+    """
+
+    _ = background_workers
     context = dict(getattr(task, "context", {}) or {})
     return bool(
         str(getattr(task, "workload", "")).strip().lower() == "tpcc"
         and str(context.get("level", "")).strip().lower() == "high"
-        and int(background_workers) > 0
     )
+
+
+class TPCCReplayAdmission:
+    """Bounded stable-priority admission for a deferred commit replay root."""
+
+    def __init__(
+        self,
+        key: str,
+        capacity: int = 2,
+        *,
+        max_priority_bypass_wait_s: float = 0.100,
+    ):
+        self.key = str(key)
+        self.capacity = max(1, int(capacity))
+        self.max_priority_bypass_wait_s = max(
+            0.0, float(max_priority_bypass_wait_s)
+        )
+        self._active = 0
+        self._sequence = 0
+        self._queue: list[tuple[int, int, threading.Event, float]] = []
+        self._lock = threading.Lock()
+
+    def acquire(self, *, priority: int = 0) -> None:
+        with self._lock:
+            if self._active < self.capacity and not self._queue:
+                self._active += 1
+                return
+            ready = threading.Event()
+            self._sequence += 1
+            self._queue.append(
+                (
+                    -max(0, int(priority)),
+                    self._sequence,
+                    ready,
+                    time.monotonic(),
+                )
+            )
+        ready.wait()
+
+    def release(self) -> None:
+        ready = None
+        with self._lock:
+            if self._active <= 0:
+                raise RuntimeError("TPC-C replay admission released without an owner")
+            if self._queue:
+                # Priority may bypass a younger request only for one bounded
+                # waiting window. Afterwards the oldest waiter must advance,
+                # which mirrors the paper lock manager's blocked-cost aging
+                # and prevents low-cost transactions from starving.
+                oldest = min(self._queue, key=lambda item: item[1])
+                if (
+                    time.monotonic() - oldest[3]
+                    >= self.max_priority_bypass_wait_s
+                ):
+                    selected = oldest
+                else:
+                    selected = min(
+                        self._queue,
+                        key=lambda item: (item[0], item[1]),
+                    )
+                self._queue.remove(selected)
+                ready = selected[2]
+            else:
+                self._active -= 1
+        if ready is not None:
+            ready.set()
+
+    def pressure(self) -> tuple[int, int]:
+        with self._lock:
+            return len(self._queue), int(self._active)
+
+
+def tpcc_replay_admission(
+    manager: AgentTransactionManager,
+    task: AgentTask,
+) -> TPCCReplayAdmission:
+    """Return the exact root gate using only known request routing data."""
+
+    context = dict(getattr(task, "context", {}) or {})
+    warehouse = str(context.get("warehouse", "unknown"))
+    district = str(context.get("district", "unknown"))
+    task_type = str(getattr(task, "task_type", "")).strip().lower()
+    if task_type == "new_order":
+        # New-Order's shared sequencing root is district.next_order_id. Two
+        # districts in the same warehouse may replay concurrently.
+        key = f"tpcc:district:{warehouse}:{district}:next_order_id:commit-replay"
+    else:
+        # Payment updates warehouse.ytd, so every district shares this root.
+        key = f"tpcc:warehouse:{warehouse}:ytd:commit-replay"
+    with manager._lock:
+        admissions = getattr(manager, "_tpcc_replay_admissions", None)
+        if admissions is None:
+            admissions = {}
+            manager._tpcc_replay_admissions = admissions
+        admission = admissions.get(key)
+        if admission is None:
+            admission = TPCCReplayAdmission(
+                key,
+                capacity=max(
+                    1,
+                    int(getattr(manager, "tpcc_replay_capacity", 1) or 1),
+                ),
+            )
+            admissions[key] = admission
+        return admission
+
+
+def ycsb_replay_admission(
+    manager: AgentTransactionManager,
+) -> TPCCReplayAdmission:
+    """Return the bounded global YCSB replay admission.
+
+    The default single commit-replay slot converts the observed high-contention
+    suffix from repeated validation failures into stable, priority-aware
+    waiting. The slot is entered only after the task's reasoning delays and
+    materialized accesses, so reasoning remains concurrent.
+    """
+
+    with manager._lock:
+        admission = getattr(manager, "_ycsb_replay_admission", None)
+        if admission is None:
+            admission = TPCCReplayAdmission(
+                "ycsb:observed-hot-root:commit-replay",
+                capacity=max(
+                    1,
+                    int(getattr(manager, "ycsb_replay_capacity", 1) or 1),
+                ),
+            )
+            manager._ycsb_replay_admission = admission
+        return admission
+
+
+def tpcc_replay_gate_pressure(
+    manager: AgentTransactionManager,
+) -> dict[str, int]:
+    """Snapshot the observed TPC-C replay queue for adaptive admission."""
+
+    with manager._lock:
+        admissions = tuple(
+            getattr(manager, "_tpcc_replay_admissions", {}).values()
+        )
+    snapshots = tuple(admission.pressure() for admission in admissions)
+    warehouses = {
+        parts[2]
+        for admission in admissions
+        for parts in (admission.key.split(":"),)
+        if len(parts) > 2
+    }
+    return {
+        "waiters": sum(waiters for waiters, _active in snapshots),
+        "active": sum(active for _waiters, active in snapshots),
+        "warehouses": len(warehouses),
+        "roots": len(admissions),
+        "max_waiters": max((waiters for waiters, _active in snapshots), default=0),
+    }
 
 
 def should_use_ycsb_medium_write_validate_fast_path(
@@ -1369,8 +1804,7 @@ def run_agent_with_low_conflict_optimistic_fast_path(
 
 def low_conflict_fast_path_commit_strategy(task: AgentTask) -> str:
     workload = str(getattr(task, "workload", "")).strip().lower()
-    level = str(dict(getattr(task, "context", {}) or {}).get("level", "")).strip().lower()
-    if workload == "ycsb" or (workload == "tpcc" and level == "high"):
+    if workload in {"ycsb", "tpcc"}:
         return "silo"
     return OCC
 
@@ -1713,24 +2147,15 @@ def mixed_transaction_metadata(
     decision: Any = None,
 ) -> Dict[str, Any]:
     access_set_visibility = paper_access_set_visibility(strategy)
-    declared_write_targets = (
-        list(operation_write_targets(planned.task))
-        if access_set_visibility == "full_trace_oracle"
-        else []
-    )
     metadata: Dict[str, Any] = {
         "workload": planned.task.workload,
         "task_type": planned.task.task_type,
         "strategy": str(strategy),
         "context": dict(planned.task.context),
         "retry_count": int(retry_count),
-        "planned_write_targets": declared_write_targets,
+        "planned_write_targets": [],
         "access_set_visibility": access_set_visibility,
-        # The paper action means that a selected write class acquires WLock at
-        # access time. Commit-only write admission is an explicitly named
-        # optimization and must not change strict paper-atcc action semantics.
-        "commit_admission_write_protection": str(strategy) == "paper-atcc-opt",
-        "paper_atcc_optimized": str(strategy) == "paper-atcc-opt",
+        "commit_admission_write_protection": str(strategy) == "paper-atcc",
         "agentic": {
             "phase_count": planned.phase_count,
             "reasoning_delay_ms": planned.total_reasoning_delay_ms,
@@ -1744,11 +2169,8 @@ def mixed_transaction_metadata(
 
 
 def paper_access_set_visibility(strategy: str) -> str:
-    return (
-        "full_trace_oracle"
-        if str(strategy).strip().lower() == "paper-atcc-oracle"
-        else "online_observed"
-    )
+    _ = strategy
+    return "online_observed"
 
 
 def atcc_decision_diagnostics(action: str, decision: Any) -> Dict[str, Any]:
@@ -1896,12 +2318,7 @@ def begin_planned_transaction(
     return manager.begin(
         str(metadata.get("transaction_id", "") or planned.task.task_id),
         metadata,
-        snapshot_object_ids=(
-            task_targets(planned.task)
-            if str(metadata.get("access_set_visibility", ""))
-            == "full_trace_oracle"
-            else None
-        ),
+        snapshot_object_ids=None,
         strategy=str(metadata.get("strategy", "") or metadata.get("cc", "") or "occ"),
     )
 
@@ -2215,7 +2632,6 @@ def background_worker(
                 }
                 if getattr(manager.cc_registry.resolve(strategy), "family", "") == "paper-atcc":
                     metadata["paper_atcc_backend"] = True
-                    metadata["paper_atcc_optimized"] = strategy == "paper-atcc-opt"
                 txn_id = f"bg-{worker}-{task.task_id}-{rng.randrange(10_000_000)}"
                 owner = SimpleNamespace(started_at=time.perf_counter()) if defer_begin_until_guarded else None
                 with background_write_guard(
@@ -2242,7 +2658,6 @@ def background_worker(
                 }
                 if getattr(manager.cc_registry.resolve(strategy), "family", "") == "paper-atcc":
                     metadata["paper_atcc_backend"] = True
-                    metadata["paper_atcc_optimized"] = strategy == "paper-atcc-opt"
                 txn_id = f"bg-{worker}-{rng.randrange(10_000_000)}"
                 owner = SimpleNamespace(started_at=time.perf_counter()) if defer_begin_until_guarded else None
                 with background_write_guard(

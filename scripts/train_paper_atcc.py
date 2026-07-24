@@ -16,6 +16,7 @@ if str(ROOT) not in sys.path:
 from agent.cc.atcc.ppo import (
     DiscretePPOPolicy,
     DiscretePPOTrainer,
+    PAPER_MEDOIDS_PER_GROUP,
     PPOConfig,
     audit_policy,
     state_key,
@@ -44,6 +45,12 @@ def main() -> int:
     parser.add_argument("--coordinated-reward-weight", type=float)
     parser.add_argument("--coordinated-original-weight", type=float, default=100.0)
     parser.add_argument("--refinement-distance-threshold", type=float)
+    parser.add_argument(
+        "--medoids-per-group",
+        type=int,
+        default=PAPER_MEDOIDS_PER_GROUP,
+        help="Representative state keys retained per phase/action group (paper default: 4).",
+    )
     parser.add_argument("--disable-occ-cold-start-guard", action="store_true")
     args = parser.parse_args()
 
@@ -51,6 +58,8 @@ def main() -> int:
         raise SystemExit(
             "--coordinated-reward-weight is incompatible with the paper reward formula"
         )
+    if args.medoids_per_group <= 0:
+        raise SystemExit("--medoids-per-group must be positive")
     transitions = []
     for path in args.trajectory:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -80,6 +89,7 @@ def main() -> int:
     training = DiscretePPOTrainer(config).train(policy, transitions)
     compiled = policy.compile(
         generation=args.generation,
+        medoids_per_group=args.medoids_per_group,
         refinement_distance_threshold=args.refinement_distance_threshold,
         occ_cold_start_guard=not args.disable_occ_cold_start_guard,
     )
@@ -101,6 +111,7 @@ def main() -> int:
                 "policy_audit": policy_audit,
                 "coverage": coverage,
                 "compiled_entries": len(compiled.entries),
+                "medoids_per_group": compiled.medoids_per_group,
                 "selective_refinement": bool(compiled.refinement_actor),
                 "refinement_distance_threshold": args.refinement_distance_threshold,
                 "occ_cold_start_guard": compiled.occ_cold_start_guard,

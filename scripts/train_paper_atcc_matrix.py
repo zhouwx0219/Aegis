@@ -20,6 +20,7 @@ if str(ROOT) not in sys.path:
 from agent.cc.atcc.ppo import (
     DiscretePPOPolicy,
     DiscretePPOTrainer,
+    PAPER_MEDOIDS_PER_GROUP,
     PPOConfig,
     audit_policy,
     state_key,
@@ -47,8 +48,34 @@ def main() -> int:
     parser.add_argument("--seeds", default="810104,810105,810106")
     parser.add_argument("--duration", type=float, default=4.0)
     parser.add_argument("--warmup-seconds", type=float, default=2.0)
+    parser.add_argument("--max-attempts", type=int, default=1)
+    parser.add_argument(
+        "--paper-deferred-replay",
+        action="store_true",
+        help=(
+            "Opt into the whole-transaction replay ablation. The paper main "
+            "path executes reasoning and accesses in their original order."
+        ),
+    )
+    parser.add_argument(
+        "--paper-delayed-write-apply",
+        action="store_true",
+        help="Train with the paper's deferred-write commit path enabled.",
+    )
     parser.add_argument("--reasoning-scale", type=float, default=1.0)
     parser.add_argument("--transactions-per-worker", type=int, default=128)
+    parser.add_argument(
+        "--ycsb-operations",
+        type=int,
+        default=0,
+        help="Override YCSB transaction length for both training and warmup traces.",
+    )
+    parser.add_argument("--ycsb-write-ratio", type=float, default=None)
+    parser.add_argument(
+        "--paper-performance-guards",
+        choices=("enabled", "disabled"),
+        default="disabled",
+    )
     parser.add_argument("--generation", type=int, default=1)
     parser.add_argument("--ppo-seed", type=int, default=810100)
     parser.add_argument("--epochs", type=int, default=12)
@@ -60,6 +87,12 @@ def main() -> int:
     parser.add_argument("--initial-policy", type=Path)
     parser.add_argument("--exploration-epsilon", type=float, default=0.2)
     parser.add_argument("--refinement-distance-threshold", type=float)
+    parser.add_argument(
+        "--medoids-per-group",
+        type=int,
+        default=PAPER_MEDOIDS_PER_GROUP,
+        help="Representative state keys retained per phase/action group (paper default: 4).",
+    )
     parser.add_argument("--disable-occ-cold-start-guard", action="store_true")
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
@@ -68,6 +101,17 @@ def main() -> int:
         raise SystemExit("--exploration-stay-probability must be in [0, 1]")
     if not 0.0 <= float(args.exploration_epsilon) <= 1.0:
         raise SystemExit("--exploration-epsilon must be in [0, 1]")
+    if args.max_attempts <= 0:
+        raise SystemExit("--max-attempts must be positive")
+    if args.medoids_per_group <= 0:
+        raise SystemExit("--medoids-per-group must be positive")
+    if args.ycsb_operations < 0:
+        raise SystemExit("--ycsb-operations must be non-negative")
+    if (
+        args.ycsb_write_ratio is not None
+        and not 0.0 <= args.ycsb_write_ratio <= 1.0
+    ):
+        raise SystemExit("--ycsb-write-ratio must be in [0, 1]")
 
     variants = split_csv(args.variants)
     unknown = sorted(set(variants) - set(VARIANTS))
@@ -111,6 +155,10 @@ def main() -> int:
                                 "--transactions-per-worker", str(args.transactions_per_worker),
                                 "--reasoning-profile", "agentic",
                                 "--reasoning-scale", str(args.reasoning_scale),
+                                *generator_workload_args(
+                                    args.ycsb_operations,
+                                    args.ycsb_write_ratio,
+                                ),
                             ]
                         )
                     if not (args.resume and warmup_trace.exists()):
@@ -127,6 +175,10 @@ def main() -> int:
                                 "--transactions-per-worker", str(args.transactions_per_worker),
                                 "--reasoning-profile", "agentic",
                                 "--reasoning-scale", str(args.reasoning_scale),
+                                *generator_workload_args(
+                                    args.ycsb_operations,
+                                    args.ycsb_write_ratio,
+                                ),
                             ]
                         )
                     if not (args.resume and result.exists() and trajectory.exists()):
@@ -143,8 +195,13 @@ def main() -> int:
                             str(args.exploration_stay_probability),
                             "--measure-seconds", str(args.duration),
                             "--warmup-seconds", str(args.warmup_seconds),
-                            "--max-attempts", "5",
+                            "--max-attempts", str(args.max_attempts),
+                            "--disable-atcc-retry-cache",
+                            "--paper-performance-guards",
+                            args.paper_performance_guards,
                         ]
+                        if args.paper_delayed_write_apply:
+                            command.extend(("--paper-delayed-write-apply", "enabled"))
                         if args.initial_policy is not None:
                             command.extend(
                                 [
@@ -154,6 +211,8 @@ def main() -> int:
                                     str(args.exploration_epsilon),
                                 ]
                             )
+                        if not args.paper_deferred_replay:
+                            command.append("--disable-paper-deferred-replay")
                         run_checked(command)
                     if not trajectory.exists():
                         detail = result.read_text(encoding="utf-8") if result.exists() else "missing result"
@@ -190,6 +249,7 @@ def main() -> int:
     training = DiscretePPOTrainer(config).train(policy, transitions)
     compiled = policy.compile(
         generation=args.generation,
+        medoids_per_group=args.medoids_per_group,
         refinement_distance_threshold=args.refinement_distance_threshold,
         occ_cold_start_guard=not args.disable_occ_cold_start_guard,
     )
@@ -226,7 +286,20 @@ def main() -> int:
         "agent_ratios": ratios,
         "duration_s_per_run": args.duration,
         "warmup_s_per_run": args.warmup_seconds,
+        "max_attempts": args.max_attempts,
+        "paper_deferred_replay": bool(args.paper_deferred_replay),
+        "paper_delayed_write_apply": bool(args.paper_delayed_write_apply),
+        "access_timing": (
+            "whole_transaction_replay_ablation"
+            if args.paper_deferred_replay
+            else "real_interleaved_operations"
+        ),
         "reasoning_scale": args.reasoning_scale,
+        "ycsb_operations": int(args.ycsb_operations),
+        "ycsb_write_ratio": args.ycsb_write_ratio,
+        "performance_guards_enabled": (
+            args.paper_performance_guards == "enabled"
+        ),
         "runs": len(source_runs),
         "elapsed_s": time.time() - started,
         "config": dataclasses.asdict(config),
@@ -234,9 +307,11 @@ def main() -> int:
         "policy_audit": policy_audit,
         "coverage": coverage,
         "compiled_entries": len(compiled.entries),
+        "medoids_per_group": compiled.medoids_per_group,
         "selective_refinement": bool(compiled.refinement_actor),
         "refinement_distance_threshold": args.refinement_distance_threshold,
         "occ_cold_start_guard": compiled.occ_cold_start_guard,
+        "atcc_retry_cache_enabled": False,
         "policy_uses_workload_labels": False,
         "outcome_oracle": False,
         "action_space": "lock_protection_mask_4bit",
@@ -250,6 +325,17 @@ def main() -> int:
     report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(policy_path)
     return 0
+
+
+def generator_workload_args(
+    ycsb_operations: int,
+    ycsb_write_ratio: float | None = None,
+) -> list[str]:
+    operations = int(ycsb_operations)
+    result = ["--ycsb-operations", str(operations)] if operations > 0 else []
+    if ycsb_write_ratio is not None:
+        result.extend(["--ycsb-write-ratio", str(float(ycsb_write_ratio))])
+    return result
 
 
 def coverage_report(transitions):

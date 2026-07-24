@@ -266,6 +266,7 @@ class VersionManager:
         object_ids: Iterable[str],
         *,
         materialized: bool = True,
+        coverage_object_ids: Iterable[str] | None = None,
     ) -> tuple[int, dict[str, SnapshotValue]]:
         """Capture a snapshot and expose its pin as one admission operation.
 
@@ -275,7 +276,17 @@ class VersionManager:
         """
         pin_tid = str(tid)
         keys = tuple(dict.fromkeys(str(value) for value in object_ids))
-        boundary = self._enter_snapshot(keys)
+        coverage = tuple(
+            dict.fromkeys(
+                str(value)
+                for value in (
+                    coverage_object_ids
+                    if coverage_object_ids is not None
+                    else keys
+                )
+            )
+        )
+        boundary = self._enter_snapshot(coverage)
         try:
             with self._lock:
                 epoch = int(self._epoch)
@@ -303,7 +314,7 @@ class VersionManager:
                 self._set_pin_locked(
                     pin_tid,
                     epoch,
-                    frozenset(keys),
+                    frozenset(coverage),
                     materialized=materialized,
                 )
                 self._transaction_states.setdefault(pin_tid, "active")
@@ -371,6 +382,28 @@ class VersionManager:
                 if entry.commit_epoch <= int(epoch):
                     return SnapshotValue(entry.value, entry.version, entry.exists)
             return SnapshotValue("", 0, False)
+
+    def history_debug(self, object_id: str, *, tid: str = "") -> dict[str, object]:
+        key = str(object_id)
+        pin_tid = str(tid)
+        with self._lock:
+            versions = tuple(self._history.get(key, ()))
+            coverage = self._pin_coverage.get(pin_tid, frozenset())
+            current = self.store.get(key)
+            return {
+                "object_id": key,
+                "current_epoch": int(self._epoch),
+                "current_version": int(current.version),
+                "current_exists": bool(current.exists),
+                "history": tuple(
+                    (int(row.commit_epoch), int(row.version), bool(row.exists))
+                    for row in versions
+                ),
+                "pin_epoch": self._pins.get(pin_tid),
+                "pin_coverage_size": len(coverage),
+                "pin_covers_object": key in coverage or not coverage,
+                "materialized_pin": pin_tid in self._materialized_pins,
+            }
 
     def read_many_at(
         self,

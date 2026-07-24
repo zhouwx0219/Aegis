@@ -23,6 +23,7 @@ from agent.runtime.trajectory import PolicyTransition
 
 ALL_ACTIONS = tuple(range(16))
 LOCK_BITS = (1, 2, 4, 8)
+PAPER_MEDOIDS_PER_GROUP = 4
 
 
 @dataclasses.dataclass(frozen=True)
@@ -47,6 +48,10 @@ class DiscretePPOPolicy:
             lambda: [0.0] * len(LOCK_BITS)
         )
         self.observed_group_actions: Dict[str, set[int]] = defaultdict(set)
+        # PPO learns shared bit logits, but deployment must choose a complete
+        # lock-mask action that has direct behavior support.  The calibrated
+        # head prevents independent bits from synthesizing an untested mask.
+        self.calibrated_group_actions: Dict[str, int] = {}
         self.critic_weights = [0.0] * FEATURE_COUNT
         self.rng = random.Random(int(seed))
         self.stay_probability = max(0.0, min(1.0, float(stay_probability)))
@@ -132,14 +137,20 @@ class DiscretePPOPolicy:
         self,
         *,
         generation: int,
-        medoids_per_group: int = 1,
+        medoids_per_group: int = PAPER_MEDOIDS_PER_GROUP,
         refinement_distance_threshold: float | None = None,
         occ_cold_start_guard: bool = False,
     ) -> CompiledPhasePolicy:
         grouped: Dict[tuple[str, int, int], list[tuple[CompiledPolicyEntry, PhaseAwareState, int]]] = defaultdict(list)
         for key, state in sorted(self.prototypes.items()):
             probabilities = self.probabilities(state)
-            action = max(valid_actions(state.current_action), key=lambda candidate: probabilities[candidate])
+            valid = valid_actions(state.current_action)
+            calibrated = self.calibrated_group_actions.get(policy_group_key(state))
+            action = (
+                int(calibrated)
+                if calibrated is not None and int(calibrated) in valid
+                else max(valid, key=lambda candidate: probabilities[candidate])
+            )
             entry = compiled_entry(state, action)
             grouped[(state.phase, int(state.current_action), action)].append(
                 (entry, state, max(1, int(self.prototype_counts.get(key, 0))))
@@ -264,6 +275,16 @@ class DiscretePPOTrainer:
         }
         raw_returns = [value for _transition, value in samples]
         normalized_returns, normalization = normalize_returns_by_source(samples)
+        calibration = calibrate_supported_group_actions(
+            policy,
+            samples,
+            normalized_returns,
+            min_action_support=max(
+                2,
+                int(self.config.min_group_samples)
+                // max(2, int(self.config.min_group_actions)),
+            ),
+        )
         return_mean = sum(raw_returns) / len(raw_returns)
         return_scale = math.sqrt(
             sum((value - return_mean) ** 2 for value in raw_returns) / len(raw_returns)
@@ -384,6 +405,7 @@ class DiscretePPOTrainer:
             "source_run_count": len(normalization),
             "excluded_transitions": dict(sorted(exclusion_counts.items())),
             "behavior_initialization": behavior_initialization,
+            "supported_action_calibration": calibration,
             "group_residual_training": {
                 "min_samples": max(1, int(self.config.min_group_samples)),
                 "min_actions": max(1, int(self.config.min_group_actions)),
@@ -412,7 +434,6 @@ def state_key(state: PhaseAwareState) -> str:
             f"blocked={bucket_log(state.blocked_time_ms)}",
             f"retry={min(3, state.retry_count)}",
             f"action={int(state.current_action)}",
-            f"priority={bucket_log(state.priority)}",
             f"conflict={normalize_conflict_kind(state.recent_conflict_kind)}",
             f"active={bucket_size(state.global_active_transactions)}",
             f"waiters={bucket_size(state.global_waiter_count)}",
@@ -431,27 +452,26 @@ def state_key(state: PhaseAwareState) -> str:
 
 
 def policy_group_key(state: PhaseAwareState) -> str:
-    """Stable paper-state aggregation used by the compiled-table PPO actor."""
+    """Pre-decision aggregation shared by coordinated behavior rollouts.
+
+    Keep action-dependent system outcomes and TM priority out of this key.
+    Including them splits otherwise comparable behavior paths into disjoint
+    groups, leaving PPO without multi-action support for an ablation state.
+    """
     return "|".join(
         (
             f"phase={state.phase}",
             f"action={int(state.current_action)}",
-            f"active={bucket_size(state.global_active_transactions)}",
             f"waiters={bucket_size(state.global_waiter_count)}",
             f"abort={bucket_ratio(state.global_abort_rate)}",
-            f"throughput={bucket_log(state.global_throughput)}",
-            f"tail={bucket_log(state.global_tail_latency_ms)}",
-            f"agent_tps={bucket_log(state.global_agent_task_throughput)}",
-            f"agent_tail={bucket_log(state.global_agent_task_tail_latency_ms)}",
             f"conflict_abort={bucket_ratio(state.global_conflict_abort_rate)}",
-            f"background_tps={bucket_log(state.global_background_throughput)}",
-            f"background_abort={bucket_ratio(state.global_background_abort_rate)}",
             f"hot={bucket_ratio(state.hotspot_access_ratio)}",
             f"retry={min(3, state.retry_count)}",
             f"conflict={normalize_conflict_kind(state.recent_conflict_kind)}",
             f"recent_write={bucket_ratio(state.recent_write_ratio)}",
-            f"priority={bucket_log(state.priority)}",
             f"rounds={bucket_size(state.completed_rounds)}",
+            f"rs={bucket_size(state.read_set_size)}",
+            f"ws={bucket_size(state.write_set_size)}",
         )
     )
 
@@ -490,7 +510,7 @@ def state_features(state: PhaseAwareState) -> tuple[float, ...]:
         math.log1p(max(0.0, state.inter_round_interval_ms)) / 10.0,
         math.log1p(max(0, state.completed_rounds)) / 4.0,
         math.log1p(max(0, state.completed_operations)) / 5.0,
-        math.log1p(max(0, state.priority)) / 10.0,
+        0.0,  # Priority is a deterministic TM output, not a policy input.
         math.log1p(max(0.0, state.global_agent_task_throughput)) / 8.0,
         math.log1p(max(0.0, state.global_agent_task_avg_latency_ms)) / 10.0,
         math.log1p(max(0.0, state.global_agent_task_tail_latency_ms)) / 10.0,
@@ -520,7 +540,7 @@ def compiled_entry(state: PhaseAwareState, action: int) -> CompiledPolicyEntry:
         blocked_bucket=bucket_log(state.blocked_time_ms),
         retry_bucket=min(3, state.retry_count),
         current_action=int(state.current_action),
-        priority_bucket=bucket_log(state.priority),
+        priority_bucket=0,
         recent_conflict_kind=normalize_conflict_kind(state.recent_conflict_kind),
         active_bucket=bucket_size(state.global_active_transactions),
         waiter_bucket=bucket_size(state.global_waiter_count),
@@ -853,6 +873,115 @@ def reconstruct_behavior_distribution(
 
 def excluded_policy_transition(transition: PolicyTransition) -> bool:
     return bool(policy_transition_exclusion_reason(transition))
+
+
+def calibrate_supported_group_actions(
+    policy: DiscretePPOPolicy,
+    samples: Sequence[tuple[PolicyTransition, float]],
+    normalized_returns: Sequence[float],
+    *,
+    min_action_support: int = 2,
+) -> dict[str, object]:
+    """Project the deployment head onto empirically supported full actions.
+
+    The factorized actor is useful for sharing signal between lock bits, but
+    its independent Bernoulli heads can combine individually useful bits into
+    a mask that was never beneficial as a whole.  Deployment therefore uses
+    the highest-return complete action with direct behavior support in the
+    same pre-decision state group.
+    """
+
+    grouped: Dict[str, Dict[int, List[float]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    current_actions: Dict[str, int] = {}
+    for (transition, _raw_return), normalized_return in zip(
+        samples, normalized_returns
+    ):
+        group_key = policy_group_key(transition.state)
+        current_actions.setdefault(
+            group_key, int(transition.state.current_action) & 0xF
+        )
+        grouped[group_key][int(transition.action)].append(
+            float(normalized_return)
+        )
+
+    minimum = max(1, int(min_action_support))
+    audit_minimum = max(3, minimum)
+    trusted_action_groups: Dict[int, int] = defaultdict(int)
+    for by_action in grouped.values():
+        audited = {
+            action: values
+            for action, values in by_action.items()
+            if len(values) >= audit_minimum
+        }
+        if len(audited) < 2:
+            continue
+        selected = min(
+            audited,
+            key=lambda action: (-sum(audited[action]) / len(audited[action]), action),
+        )
+        trusted_action_groups[int(selected)] += 1
+    trusted_actions = set(trusted_action_groups)
+
+    calibrated: Dict[str, int] = {}
+    supported_groups = 0
+    multi_action_groups = 0
+    action_counts: Dict[int, int] = defaultdict(int)
+    for key, by_action in grouped.items():
+        eligible = {
+            action: values
+            for action, values in by_action.items()
+            if len(values) >= minimum
+        }
+        trusted_eligible = {
+            action: values
+            for action, values in eligible.items()
+            if action in trusted_actions
+        }
+        if trusted_actions:
+            eligible = trusted_eligible
+        if not eligible:
+            supported = {
+                action: values
+                for action, values in by_action.items()
+                if action in trusted_actions
+            }
+            if not supported:
+                retained = int(current_actions.get(key, 0)) & 0xF
+                supported = {retained: [0.0]}
+            largest = max(len(values) for values in supported.values())
+            eligible = {
+                action: values
+                for action, values in supported.items()
+                if len(values) == largest
+            }
+        if len(eligible) >= 2:
+            multi_action_groups += 1
+        selected = min(
+            eligible,
+            key=lambda action: (-sum(eligible[action]) / len(eligible[action]), action),
+        )
+        calibrated[key] = int(selected)
+        action_counts[int(selected)] += 1
+        supported_groups += 1
+
+    policy.calibrated_group_actions = calibrated
+    return {
+        "min_action_support": minimum,
+        "calibrated_groups": supported_groups,
+        "multi_action_groups": multi_action_groups,
+        "audit_min_action_support": audit_minimum,
+        "trusted_action_groups": {
+            str(action): trusted_action_groups[action]
+            for action in sorted(trusted_action_groups)
+        },
+        "trusted_actions": sorted(trusted_actions),
+        "selected_action_counts": {
+            str(action): action_counts[action] for action in sorted(action_counts)
+        },
+        "projection": "highest_normalized_return_supported_complete_action",
+    }
 
 
 def policy_transition_exclusion_reason(transition: PolicyTransition) -> str:

@@ -17,7 +17,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from agent.cc.atcc.ppo import DiscretePPOPolicy, DiscretePPOTrainer, PPOConfig, audit_policy
+from agent.cc.atcc.ppo import (
+    DiscretePPOPolicy,
+    DiscretePPOTrainer,
+    PAPER_MEDOIDS_PER_GROUP,
+    PPOConfig,
+    audit_policy,
+)
 from agent.runtime import (
     CompiledPhasePolicy,
     CompiledPolicyEntry,
@@ -72,7 +78,21 @@ def main() -> int:
     )
     parser.add_argument("--duration", type=float, default=1.0)
     parser.add_argument("--warmup-seconds", type=float, default=2.0)
+    parser.add_argument("--max-attempts", type=int, default=1)
+    parser.add_argument(
+        "--paper-deferred-replay",
+        action="store_true",
+        help=(
+            "Opt into the oracle-like whole-transaction reasoning replay ablation. "
+            "The default trains the paper main path with real interleaved accesses."
+        ),
+    )
     parser.add_argument("--transactions-per-worker", type=int, default=128)
+    parser.add_argument("--reasoning-scale", type=float, default=2.0)
+    parser.add_argument("--ycsb-operations", type=int, default=0)
+    parser.add_argument("--ycsb-write-ratio", type=float, default=None)
+    parser.add_argument("--ycsb-zipf-theta", type=float, default=None)
+    parser.add_argument("--paper-delayed-write-apply", action="store_true")
     parser.add_argument(
         "--reduced-transaction-variants",
         default="",
@@ -91,7 +111,12 @@ def main() -> int:
     parser.add_argument("--ppo-seed", type=int, default=810100)
     parser.add_argument("--shared-reward-weight", type=float, default=100.0)
     parser.add_argument("--refinement-distance-threshold", type=float)
-    parser.add_argument("--medoids-per-group", type=int, default=1)
+    parser.add_argument(
+        "--medoids-per-group",
+        type=int,
+        default=PAPER_MEDOIDS_PER_GROUP,
+        help="Representative state keys retained per phase/action group (paper default: 4).",
+    )
     parser.add_argument("--disable-occ-cold-start-guard", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
@@ -154,6 +179,16 @@ def main() -> int:
         raise SystemExit("PPO learning rates and clip ratio must be positive")
     if args.medoids_per_group <= 0:
         raise SystemExit("--medoids-per-group must be positive")
+    if args.max_attempts <= 0:
+        raise SystemExit("--max-attempts must be positive")
+    if args.reasoning_scale <= 0.0:
+        raise SystemExit("--reasoning-scale must be positive")
+    if args.ycsb_operations < 0:
+        raise SystemExit("--ycsb-operations must be non-negative")
+    if args.ycsb_write_ratio is not None and not 0.0 <= args.ycsb_write_ratio <= 1.0:
+        raise SystemExit("--ycsb-write-ratio must be in [0, 1]")
+    if args.ycsb_zipf_theta is not None and args.ycsb_zipf_theta < 0.0:
+        raise SystemExit("--ycsb-zipf-theta must be non-negative")
 
     output = args.output_dir.resolve()
     trace_dir, run_dir, trajectory_dir, policy_dir = (
@@ -188,7 +223,12 @@ def main() -> int:
                         and warmup_trace.exists()
                     )
                     if not reuse_trace_pair:
-                        generate_trace(trace, config_id, variant, client_count, ratio, seed, transactions_per_worker)
+                        generate_trace(
+                            trace, config_id, variant, client_count, ratio, seed,
+                            transactions_per_worker, args.reasoning_scale,
+                            args.ycsb_operations, args.ycsb_write_ratio,
+                            args.ycsb_zipf_theta,
+                        )
                         generate_trace(
                             warmup_trace,
                             f"{config_id}-warmup",
@@ -197,6 +237,10 @@ def main() -> int:
                             ratio,
                             seed + 500_000,
                             transactions_per_worker,
+                            args.reasoning_scale,
+                            args.ycsb_operations,
+                            args.ycsb_write_ratio,
+                            args.ycsb_zipf_theta,
                         )
                     coordinated_runs = []
                     for refine_action, commit_action in variant_paths:
@@ -212,6 +256,9 @@ def main() -> int:
                                 policies[(refine_action, commit_action)],
                                 args.duration,
                                 args.warmup_seconds,
+                                args.max_attempts,
+                                args.paper_deferred_replay,
+                                args.paper_delayed_write_apply,
                             )
                         result_row = next(csv.DictReader(result.open(newline="", encoding="utf-8-sig")))
                         payload = json.loads(trajectory.read_text(encoding="utf-8"))
@@ -229,24 +276,25 @@ def main() -> int:
                     for coordinated, score in zip(coordinated_runs, shared_scores):
                         refine_action, commit_action = coordinated["path"]
                         path_id = coordinated["path_id"]
+                        seen_phase_decisions = set()
                         for row in coordinated["rows"]:
                             state = phase_aware_state_from_dict(row["state"])
-                            try:
-                                probability = behavior_probability(
-                                    action_probabilities,
-                                    state.phase,
-                                    int(state.current_action),
-                                    int(row["action"]),
-                                )
-                            except KeyError:
-                                # Conflict inheritance and the runtime safety
-                                # guard can deterministically add protection
-                                # after the behavior policy samples its action.
-                                # Such a transition is not another stochastic
-                                # policy choice; retain the probability recorded
-                                # at the actual control point.
-                                probability = float(
-                                    row.get("behavior_probability", 1.0) or 1.0
+                            decision_key = (str(row["txn_id"]), str(state.phase))
+                            first_phase_decision = decision_key not in seen_phase_decisions
+                            seen_phase_decisions.add(decision_key)
+                            distribution = coordinated_behavior_distribution(
+                                variant_paths,
+                                state.phase,
+                                int(state.current_action),
+                                refine_action,
+                                stochastic=first_phase_decision,
+                            )
+                            probability = distribution[int(row["action"])]
+                            if probability <= 0.0:
+                                raise RuntimeError(
+                                    "behavior policy produced an action outside its "
+                                    f"declared support: phase={state.phase} "
+                                    f"current={state.current_action} action={row['action']}"
                                 )
                             transition = policy_transition_from_dict(
                                 row, source_id=config_id
@@ -256,6 +304,7 @@ def main() -> int:
                                     transition,
                                     txn_id=f"{path_id}:{row['txn_id']}",
                                     behavior_probability=probability,
+                                    behavior_action_probabilities=distribution,
                                     system_delta=(
                                         max(-3.0, min(3.0, float(score)))
                                         if transition.done
@@ -331,6 +380,13 @@ def main() -> int:
         },
         "rollout_duration_seconds": args.duration,
         "warmup_seconds": args.warmup_seconds,
+        "max_attempts": args.max_attempts,
+        "paper_deferred_replay": bool(args.paper_deferred_replay),
+        "access_timing": (
+            "whole_transaction_replay_ablation"
+            if args.paper_deferred_replay
+            else "real_interleaved_operations"
+        ),
         "transactions_per_worker": args.transactions_per_worker,
         "transactions_per_worker_by_variant": {
             variant: (
@@ -430,41 +486,157 @@ def behavior_probability(probabilities, phase, current_action, action):
     raise KeyError(key)
 
 
+def behavior_action_distribution(probabilities, phase, current_action):
+    """Return the coordinated sampler's full distribution for one control point."""
+
+    normalized_phase = str(phase)
+    normalized_current = int(current_action)
+    distribution = [0.0] * 16
+    for (candidate_phase, candidate_current, action), probability in probabilities.items():
+        if (
+            str(candidate_phase) == normalized_phase
+            and int(candidate_current) == normalized_current
+        ):
+            distribution[int(action)] = float(probability)
+    if sum(distribution) <= 0.0:
+        distribution[normalized_current] = 1.0
+    return tuple(distribution)
+
+
+def coordinated_behavior_distribution(
+    paths, phase, current_action, refine_branch, *, stochastic=True
+):
+    """Exact propensity for a monotonic coordinated behavior path.
+
+    A retry may begin with an exact conflict bit already present.  Behavior
+    actions therefore expand the current mask with the path action instead of
+    falling back to a deterministic no-op.  The path is sampled once: refine
+    is distributed over all paths, commit is conditional on the sampled
+    refine branch, and repeated checkpoints in the same phase retain the
+    already-selected action deterministically.
+    """
+
+    current = int(current_action) & 0xF
+    distribution = [0.0] * 16
+    if not stochastic or str(phase) == "explore":
+        distribution[current] = 1.0
+        return tuple(distribution)
+    if str(phase) == "refine":
+        candidates = [int(refine) for refine, _commit in paths]
+    elif str(phase) == "commit":
+        candidates = [
+            int(commit)
+            for refine, commit in paths
+            if int(refine) == int(refine_branch)
+        ]
+    else:
+        candidates = []
+    if not candidates:
+        distribution[current] = 1.0
+        return tuple(distribution)
+    probability = 1.0 / len(candidates)
+    for candidate in candidates:
+        distribution[current | (candidate & 0xF)] += probability
+    return tuple(distribution)
+
+
 def write_behavior_policies(directory, paths):
     result = {}
     for index, (refine_action, commit_action) in enumerate(paths):
-        policy = CompiledPhasePolicy(
-            (
-                CompiledPolicyEntry(phase="explore", current_action=0, action=0),
-                CompiledPolicyEntry(phase="refine", current_action=0, action=refine_action),
-                CompiledPolicyEntry(phase="commit", current_action=refine_action, action=commit_action),
-            ),
-            generation=1000 + index,
-        )
+        entries = []
+        for current_action in range(16):
+            entries.extend(
+                (
+                    CompiledPolicyEntry(
+                        phase="explore",
+                        current_action=current_action,
+                        action=current_action,
+                    ),
+                    CompiledPolicyEntry(
+                        phase="refine",
+                        current_action=current_action,
+                        action=current_action | int(refine_action),
+                    ),
+                    CompiledPolicyEntry(
+                        phase="commit",
+                        current_action=current_action,
+                        action=current_action | int(commit_action),
+                    ),
+                )
+            )
+        policy = CompiledPhasePolicy(tuple(entries), generation=1000 + index)
         path = directory / f"path_{refine_action}_{commit_action}.json"
         path.write_text(json.dumps(policy.to_dict(), indent=2) + "\n", encoding="utf-8")
         result[(refine_action, commit_action)] = path
     return result
 
 
-def generate_trace(path, trace_id, variant, clients, ratio, seed, transactions_per_worker):
-    run_checked(
-        [sys.executable, str(ROOT / "scripts/unified_trace/generate_castdas_trace.py"), "--output", str(path),
-         "--trace-id", trace_id, "--variant", variant, "--clients", str(clients), "--agent-ratio", str(ratio),
-         "--seed", str(seed), "--transactions-per-worker", str(transactions_per_worker),
-         "--reasoning-profile", "agentic", "--reasoning-scale", "2.0"]
-    )
+def generate_trace(
+    path, trace_id, variant, clients, ratio, seed, transactions_per_worker,
+    reasoning_scale, ycsb_operations, ycsb_write_ratio, ycsb_zipf_theta,
+):
+    command = [
+        sys.executable, str(ROOT / "scripts/unified_trace/generate_castdas_trace.py"),
+        "--output", str(path), "--trace-id", trace_id, "--variant", variant,
+        "--clients", str(clients), "--agent-ratio", str(ratio), "--seed", str(seed),
+        "--transactions-per-worker", str(transactions_per_worker),
+        "--reasoning-profile", "agentic", "--reasoning-scale", str(reasoning_scale),
+    ]
+    if int(ycsb_operations) > 0:
+        command.extend(("--ycsb-operations", str(ycsb_operations)))
+    if ycsb_write_ratio is not None:
+        command.extend(("--ycsb-write-ratio", str(ycsb_write_ratio)))
+    if ycsb_zipf_theta is not None:
+        command.extend(
+            ("--ycsb-access-distribution", "zipfian", "--ycsb-zipf-theta", str(ycsb_zipf_theta))
+        )
+    run_checked(command)
 
 
-def run_trace(trace, warmup_trace, result, trajectory, policy, duration, warmup_seconds):
-    run_checked(
-        [sys.executable, str(ROOT / "scripts/unified_trace/run_castdas_trace_fair.py"), "--trace", str(trace),
-         "--warmup-trace", str(warmup_trace),
-         "--output", str(result), "--cc", "paper-atcc", "--paper-policy", str(policy),
-         "--trajectory-output", str(trajectory), "--policy-mode", "eval", "--measure-seconds", str(duration),
-         "--warmup-seconds", str(warmup_seconds),
-         "--max-attempts", "5"]
-    )
+def run_trace(
+    trace,
+    warmup_trace,
+    result,
+    trajectory,
+    policy,
+    duration,
+    warmup_seconds,
+    max_attempts,
+    paper_deferred_replay,
+    paper_delayed_write_apply,
+):
+    command = [
+        sys.executable,
+        str(ROOT / "scripts/unified_trace/run_castdas_trace_fair.py"),
+        "--trace",
+        str(trace),
+        "--warmup-trace",
+        str(warmup_trace),
+        "--output",
+        str(result),
+        "--cc",
+        "paper-atcc",
+        "--paper-policy",
+        str(policy),
+        "--trajectory-output",
+        str(trajectory),
+        "--policy-mode",
+        "eval",
+        "--measure-seconds",
+        str(duration),
+        "--warmup-seconds",
+        str(warmup_seconds),
+        "--max-attempts",
+        str(max_attempts),
+        "--disable-atcc-retry-cache",
+    ]
+    if int(max_attempts) > 1:
+        command.append("--allow-retries")
+    if not paper_deferred_replay:
+        command.append("--disable-paper-deferred-replay")
+    if paper_delayed_write_apply:
+        command.extend(("--paper-delayed-write-apply", "enabled"))
+    run_checked(command)
 
 
 def validate_paths(paths):

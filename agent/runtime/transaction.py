@@ -30,7 +30,7 @@ from agent.runtime.context import (
 )
 from agent.runtime.operation_interceptor import OperationInterceptor, TransactionHooks
 from agent.runtime.atcc_lock_manager import PaperATCCLockManager
-from agent.runtime.priority import PriorityManager
+from agent.runtime.priority import PriorityConfig, PriorityManager
 from agent.runtime.state_collector import StateCollector
 from agent.runtime.undo_log import UndoLog
 from agent.runtime.version_manager import VersionManager
@@ -208,10 +208,20 @@ class AgentTransaction:
             self.manager.paper_versioning_enabled
             and self.context.snapshot_epoch >= 0
         ):
-            self.snapshot[key] = self.manager.version_manager.read_at(
+            historical = self.manager.version_manager.read_at(
                 self.context.snapshot_epoch,
                 key,
             )
+            if not historical.exists and self.manager.store.get(key).exists:
+                detail = self.manager.version_manager.history_debug(
+                    key,
+                    tid=self.context.tid,
+                )
+                raise RuntimeError(
+                    f"registered object has no historical version at epoch "
+                    f"{self.context.snapshot_epoch}: {detail}"
+                )
+            self.snapshot[key] = historical
         else:
             current = self.manager.store.get(key)
             self.snapshot[key] = SnapshotValue(
@@ -308,6 +318,7 @@ class AgentTransaction:
             self.manager._record(self)
             self.manager.interceptor.finish(self)
             self.manager.atcc_locks.release_all(self.context)
+            self.manager.release_hotspot_admission(self)
             if self.manager.paper_versioning_enabled:
                 self.manager.version_manager.finish(self.context.tid, committed=False)
             self.manager._live_transactions.pop(self.context.tid, None)
@@ -355,30 +366,6 @@ class AgentTransaction:
         }
 
 
-def use_targeted_paper_atcc_optimization(
-    metadata: Dict[str, Any],
-    *,
-    strategy_name: str,
-) -> bool:
-    """Enable the measured high-contention optimization only for mixed YCSB."""
-    if str(strategy_name).strip().lower() not in {
-        "paper-atcc",
-        "paper-atcc-oracle",
-    }:
-        return False
-    context = dict(metadata.get("context", {}) or {})
-    if (
-        str(metadata.get("workload", "")).strip().lower() != "ycsb"
-        or str(context.get("level", "")).strip().lower() != "high"
-    ):
-        return False
-    agentic = dict(metadata.get("agentic", {}) or {})
-    return bool(
-        metadata.get("runtime_background", False)
-        or int(agentic.get("background_workers", 0) or 0) > 0
-    )
-
-
 class AgentTransactionManager:
     """Thread-safe transaction manager backed by versioned KV primitives."""
 
@@ -416,6 +403,11 @@ class AgentTransactionManager:
         paper_policy: Optional[CompiledPhasePolicy] = None,
         collect_trajectories: bool = True,
         low_conflict_occ_guard: bool = False,
+        performance_guards_enabled: bool = True,
+        commit_admission_priority_enabled: bool = False,
+        delayed_write_apply_enabled: bool = True,
+        priority_config: PriorityConfig | None = None,
+        priority_enabled: bool = True,
     ):
         self.store = store if store is not None else cc.Dbx1000VersionedKVStore()
         self.version_manager = VersionManager(self.store)
@@ -425,24 +417,39 @@ class AgentTransactionManager:
         self.reservations = ReservationTable()
         self._lock = threading.RLock()
         self.tpcc_mixed_replay_gate = threading.Lock()
+        # Saturated all-Agent YCSB can defer long reasoning before begin().
+        # Once online conflict evidence exists, this gate serializes only the
+        # short replay suffix and never receives a future access set.
+        self.ycsb_observed_replay_gate = threading.Lock()
         self._online_prefix_condition = threading.Condition()
         self._online_prefix_agents = 0
         self._catalog: Dict[str, Any] = {}
         self._traces: list[Dict[str, Any]] = []
         self._record_traces = bool(record_traces)
         self.state_collector = StateCollector()
-        self.priority_manager = PriorityManager()
+        self.priority_manager = PriorityManager(priority_config)
+        self.priority_enabled = bool(priority_enabled)
         self.hotness_tracker = HotnessTracker()
         self.paper_policy = AtomicPolicyManager(paper_policy)
         self.trajectory_collector = TrajectoryCollector()
         self.collect_trajectories = bool(collect_trajectories)
         self.low_conflict_occ_guard = bool(low_conflict_occ_guard)
+        self.performance_guards_enabled = bool(performance_guards_enabled)
+        self.commit_admission_priority_enabled = bool(
+            commit_admission_priority_enabled
+        )
+        # Orthogonal ablation switch: retain the policy-selected write class,
+        # but buffer the private write and acquire its exact WLock only in the
+        # short commit window. This remains an orthogonal ablation switch.
+        self.delayed_write_apply_enabled = bool(delayed_write_apply_enabled)
         hooks = transaction_hooks or PaperATCCHooks(self)
         self.interceptor = OperationInterceptor(hooks, state_collector=self.state_collector)
         self._live_transactions: Dict[str, AgentTransaction] = {}
         self.atcc_locks = PaperATCCLockManager(
             wound_callback=self._wound_context,
-            priority_callback=self.priority_manager.compute,
+            priority_callback=(
+                self.priority_manager.compute if self.priority_enabled else None
+            ),
             contention_callback=self.hotness_tracker.observe_contention,
         )
         self.undo_log = UndoLog(undo_log_path)
@@ -460,7 +467,13 @@ class AgentTransactionManager:
         self._retry_conflict_objects: Dict[str, int] = collections.defaultdict(int)
         self._paper_versioning_enabled = False
         self._native_dirty_objects: set[str] = set()
+        self._native_occ_stable_windows = 0
+        self._native_occ_fast_enabled = False
+        self._native_occ_last_window_at = 0.0
+        self._hotspot_admission_guard = threading.Lock()
+        self._hotspot_admissions: Dict[str, threading.Lock] = {}
         self._background_sampling = threading.local()
+        self._hotness_sampling = threading.local()
         self._native_background_plan_cache: Dict[
             int, tuple[tuple[str, ...], tuple[tuple[str, str], ...]] | None
         ] = {}
@@ -479,7 +492,67 @@ class AgentTransactionManager:
         with self._lock:
             return bool(self._paper_versioning_enabled)
 
+    @property
+    def native_occ_fast_enabled(self) -> bool:
+        with self._lock:
+            return bool(
+                self.low_conflict_occ_guard and self._native_occ_fast_enabled
+            )
+
+    def observe_native_occ_window(self, *, risk: bool) -> bool:
+        """Global two-window hysteresis for the native action-0 path."""
+        with self._lock:
+            if risk:
+                self._native_occ_stable_windows = 0
+                self._native_occ_fast_enabled = False
+                return False
+            now = time.monotonic()
+            if now - self._native_occ_last_window_at < 0.020:
+                return bool(self._native_occ_fast_enabled)
+            self._native_occ_last_window_at = now
+            self._native_occ_stable_windows = min(
+                2, self._native_occ_stable_windows + 1
+            )
+            if self._native_occ_stable_windows >= 2:
+                self._native_occ_fast_enabled = True
+            return bool(self._native_occ_fast_enabled)
+
+    def acquire_hotspot_admission(
+        self,
+        txn: AgentTransaction,
+        object_ids: Iterable[str],
+        *,
+        timeout_s: float = 5.0,
+    ) -> bool:
+        """Reserve already-observed hotspots in canonical order."""
+        targets = tuple(sorted({str(value) for value in object_ids}))
+        held = list(txn.metadata.get("_observed_hotspot_admissions", ()))
+        held_targets = {str(target) for target, _gate in held}
+        targets = tuple(target for target in targets if target not in held_targets)
+        if not targets:
+            return False
+        acquired: list[tuple[str, threading.Lock]] = []
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        for target in targets:
+            with self._hotspot_admission_guard:
+                gate = self._hotspot_admissions.setdefault(target, threading.Lock())
+            remaining = max(0.0, deadline - time.monotonic())
+            if not gate.acquire(timeout=remaining):
+                for _key, held in reversed(acquired):
+                    held.release()
+                return False
+            acquired.append((target, gate))
+        txn.metadata["_observed_hotspot_admissions"] = held + acquired
+        return True
+
+    @staticmethod
+    def release_hotspot_admission(txn: AgentTransaction) -> None:
+        acquired = list(txn.metadata.pop("_observed_hotspot_admissions", ()))
+        for _target, gate in reversed(acquired):
+            gate.release()
+
     def _enable_paper_versioning(self) -> None:
+        self.observe_native_occ_window(risk=True)
         with self._lock:
             if self._paper_versioning_enabled:
                 return
@@ -494,7 +567,19 @@ class AgentTransactionManager:
             injector(str(stage), txn)
 
     def is_hot(self, object_id: str) -> bool:
-        return self.hotness_tracker.observe_access(str(object_id))
+        """Sample access heat; contention events are always recorded separately.
+
+        The first two accesses on a worker are sampled so a newly contended run
+        can react quickly.  Steady-state accesses then update the shared heat
+        table once every eight operations, avoiding metadata work on every
+        native OCC operation.
+        """
+        count = int(getattr(self._hotness_sampling, "count", 0) or 0) + 1
+        self._hotness_sampling.count = count
+        key = str(object_id)
+        if count <= 2 or count % 8 == 0:
+            return self.hotness_tracker.observe_access(key)
+        return False
 
     def peek_hot(self, object_id: str, *, total_accesses: int | None = None) -> bool:
         _ = total_accesses
@@ -514,7 +599,7 @@ class AgentTransactionManager:
             str(txn.metadata.get("access_set_visibility", "")).strip().lower()
             == "online_observed"
         )
-        if txn.metadata.get("paper_atcc_optimized", False) and not online_observed:
+        if not online_observed:
             self.ensure_snapshot_epoch(txn)
         previous = txn.context.action
         added = action.added_since(previous)
@@ -523,8 +608,7 @@ class AgentTransactionManager:
             txn.metadata.get("_defer_policy_write_locks", False)
         )
         allow_historical_read_lock = bool(
-            txn.metadata.get("paper_atcc_optimized", False)
-            and not online_observed
+            not online_observed
             and not txn.context.planned_write_targets
             and not txn.write_set
         )
@@ -551,6 +635,21 @@ class AgentTransactionManager:
                     txn.context.policy_write_lock_targets.add(str(object_id))
                 else:
                     write_targets[object_id] = int(write.base_version)
+        if online_observed and len(read_targets) > 1:
+            # One exact observed root is sufficient to desynchronize the long
+            # reasoning window. Holding several RLocks and later upgrading a
+            # subset creates a multi-key upgrade convoy.
+            read_targets = [
+                max(
+                    read_targets,
+                    key=lambda row: int(
+                        self.hotness_tracker.object_snapshot(row[0]).get(
+                            "accesses", 0
+                        )
+                        or 0
+                    ),
+                )
+            ]
         try:
             for object_id, version in sorted(read_targets):
                 self.atcc_locks.validate_and_rlock(
@@ -571,7 +670,7 @@ class AgentTransactionManager:
                     timeout_s=timeout_s,
                 )
                 txn.context.policy_read_lock_targets.add(str(object_id))
-                if online_observed and txn.metadata.get("paper_atcc_optimized", False):
+                if online_observed:
                     txn.metadata.setdefault(
                         "_online_bypass_read_targets", set()
                     ).add(str(object_id))
@@ -598,6 +697,8 @@ class AgentTransactionManager:
             raise
 
     def refresh_atcc_priority(self, txn: AgentTransaction) -> int:
+        if not self.priority_enabled:
+            return 0
         return self.priority_manager.refresh(txn.context, self.atcc_locks)
 
     def paper_runtime_metrics(self) -> Dict[str, float | int]:
@@ -1086,16 +1187,15 @@ class AgentTransactionManager:
             metadata.setdefault("strategy", strategy_impl.name)
             if strategy_impl.family == "paper-atcc":
                 metadata["paper_atcc"] = True
-                targeted_optimization = use_targeted_paper_atcc_optimization(
-                    metadata,
-                    strategy_name=strategy_impl.name,
-                )
-                metadata["paper_atcc_optimized"] = bool(
-                    metadata.get("paper_atcc_optimized", False)
-                    or strategy_impl.name == "paper-atcc-opt"
-                    or targeted_optimization
-                )
-                if targeted_optimization:
+                metadata["commit_admission_write_protection"] = True
+                agentic = dict(metadata.get("agentic", {}) or {})
+                if (
+                    str(metadata.get("workload", "")).strip().lower() == "ycsb"
+                    and (
+                        metadata.get("runtime_background", False)
+                        or int(agentic.get("background_workers", 0) or 0) > 0
+                    )
+                ):
                     metadata["paper_atcc_engineering_profile"] = "ycsb-high-mixed"
         task_key = str(task_id)
         runtime_background = bool(metadata.get("runtime_background", False))
@@ -1140,8 +1240,14 @@ class AgentTransactionManager:
                     )
                     self._retry_protection_diagnostics["inherited_attempts"] += 1
             metadata["retry_protection_mask"] = int(explicit_mask)
-        if metadata.get("paper_atcc", False) or metadata.get("paper_atcc_backend", False):
+        if metadata.get("paper_atcc_backend", False):
+            # Coordinated background publication uses private versions even
+            # when no Agent has selected protection yet.
             self._enable_paper_versioning()
+        # Paper Agent transactions start on the native OCC path. Version metadata
+        # is materialized lazily by transition_atcc_action() after observed
+        # risk selects a non-zero action.  This keeps action=0 identical to the
+        # native Silo/OCC publication path in genuinely cold workloads.
         snapshot_ids = (
             tuple(dict.fromkeys(str(value) for value in snapshot_object_ids))
             if snapshot_object_ids is not None
@@ -1169,6 +1275,20 @@ class AgentTransactionManager:
         initial_protection = LockClass(
             int(metadata.get("retry_protection_mask", 0) or 0) & 0xF
         )
+        if (
+            metadata.get("paper_atcc", False)
+            and (
+                initial_protection != LockClass.NONE
+                or retry_count > 0
+                or metadata.get("retry_conflict_read_targets")
+                or metadata.get("retry_conflict_write_targets")
+                or metadata.get("_deferred_reasoning_replay", False)
+            )
+        ):
+            # Retries need version metadata for exact protection. Deferred
+            # replay also uses it for the short, admitted native-publish
+            # suffix while leaving the reasoning interval outside the txn.
+            self._enable_paper_versioning()
         materialize_initial_snapshot = bool(
             snapshot_ids
             and self.paper_versioning_enabled
@@ -1180,24 +1300,25 @@ class AgentTransactionManager:
         metadata["snapshot_epoch"] = snapshot_epoch
         txn = AgentTransaction(self, str(task_id), snapshot, metadata)
         if materialize_initial_snapshot:
-            if metadata.get("paper_atcc_optimized", False):
-                snapshot_epoch, snapshot = self.version_manager.snapshot_and_pin(
-                    txn.context.tid,
-                    snapshot_ids,
-                    materialized=bool(snapshot_ids),
-                )
-            else:
-                # Strict ATCC never permits a publisher to bypass an RLock and
-                # never treats an old pinned version as satisfying retroactive
-                # validation. It needs an atomic initial snapshot, not retained
-                # MVCC history for the whole retry lifetime.
-                snapshot_epoch, snapshot = self.version_manager.snapshot_current(
-                    snapshot_ids
-                )
+            online_observed_snapshot = (
+                str(metadata.get("access_set_visibility", "")).strip().lower()
+                == "online_observed"
+            )
+            snapshot_epoch, snapshot = self.version_manager.snapshot_and_pin(
+                txn.context.tid,
+                snapshot_ids,
+                # The known conflict subset is preloaded, but future accesses
+                # remain unknown and still require historical versions.
+                materialized=bool(snapshot_ids) and not online_observed_snapshot,
+                coverage_object_ids=(
+                    self._catalog
+                    if online_observed_snapshot
+                    else snapshot_ids
+                ),
+            )
             txn.snapshot.update(snapshot)
-            if metadata.get("paper_atcc_optimized", False):
-                txn.context.snapshot_epoch = int(snapshot_epoch)
-                txn.metadata["snapshot_epoch"] = int(snapshot_epoch)
+            txn.context.snapshot_epoch = int(snapshot_epoch)
+            txn.metadata["snapshot_epoch"] = int(snapshot_epoch)
             if txn.events:
                 txn.events[0].detail["snapshot_objects"] = len(snapshot)
         read_only_background = bool(
@@ -1300,21 +1421,15 @@ class AgentTransactionManager:
         ):
             return (), int(txn.context.action.protected)
         details = self._conflict_details(txn, conflict_object_ids)
-        context_metadata = dict(txn.metadata.get("context", {}) or {})
         agentic_metadata = dict(txn.metadata.get("agentic", {}) or {})
         online_ycsb_high_mixed = bool(
             str(txn.metadata.get("access_set_visibility", "")).strip().lower()
             == "online_observed"
             and str(txn.metadata.get("workload", "")).strip().lower() == "ycsb"
-            and str(context_metadata.get("level", "")).strip().lower() == "high"
             and int(agentic_metadata.get("background_workers", 0) or 0) > 0
         )
         tpcc_root_only = bool(
             str(txn.metadata.get("workload", "")).strip().lower() == "tpcc"
-            and str(
-                dict(txn.metadata.get("context", {}) or {}).get("level", "")
-            ).strip().lower()
-            == "high"
             and int(
                 dict(txn.metadata.get("agentic", {}) or {}).get(
                     "background_workers", 0
@@ -1550,6 +1665,33 @@ class AgentTransactionManager:
             or getattr(plan, "family", "") == "paper-atcc"
         )
 
+        if (
+            paper_atcc
+            and not coordinated_backend
+            and not self.paper_versioning_enabled
+            and txn.context.action.protected == LockClass.NONE
+            and not txn.context.held_read_locks
+            and not txn.context.held_write_locks
+            and not txn.metadata.get("_deferred_reasoning_replay", False)
+            and not self.atcc_locks.has_object_protection(
+                txn.write_set, txn.context
+            )
+        ):
+            # Genuine action-0: use exactly the native OCC validate/install
+            # path. No ATCC lock-table probe, VersionManager publication, or
+            # paper-specific validation is needed until risk is observed.
+            txn.context.transition(TransactionStatus.COMMITTING)
+            return self._commit_after_admission(
+                txn,
+                strategy_impl,
+                plan,
+                started_wait,
+                paper_atcc=False,
+                release_atcc_locks=False,
+                allow_native_publish=False,
+                native_publication_held=False,
+            )
+
         if coordinated_backend and not txn.write_set:
             # A read-only backend transaction needs only native OCC read
             # validation. It owns no private writes and therefore must not
@@ -1594,9 +1736,7 @@ class AgentTransactionManager:
                     allow_native_publish=False,
                     native_publication_held=False,
                 ),
-                allow_reader_bypass=bool(
-                    txn.metadata.get("paper_atcc_optimized", False)
-                ),
+                allow_reader_bypass=True,
                 timing_callback=lambda elapsed_ms: self.add_commit_timing(
                     txn, "lock", elapsed_ms
                 ),
@@ -1957,7 +2097,10 @@ class AgentTransactionManager:
                 )
                 self._observe_strategy(strategy_impl, plan, result, txn)
                 return result
-        if paper_atcc and not txn.context.is_background:
+        if (
+            paper_atcc
+            and not txn.context.is_background
+        ):
             # A blind write has no semantic dependency on the value/version
             # captured when its private buffer was created. Commit admission
             # already excludes same-key publishers and protected writers, so
@@ -2134,6 +2277,7 @@ class AgentTransactionManager:
             or txn.context.held_write_locks
         ):
             self.atcc_locks.release_all(txn.context)
+        self.release_hotspot_admission(txn)
         if self.paper_versioning_enabled:
             self.version_manager.finish(txn.context.tid, committed=True)
         self._live_transactions.pop(txn.context.tid, None)
@@ -2211,6 +2355,7 @@ class AgentTransactionManager:
         self._record(txn)
         self.interceptor.finish(txn)
         self.atcc_locks.release_all(txn.context)
+        self.release_hotspot_admission(txn)
         if self.paper_versioning_enabled:
             self.version_manager.finish(txn.context.tid, committed=False)
         self._live_transactions.pop(txn.context.tid, None)

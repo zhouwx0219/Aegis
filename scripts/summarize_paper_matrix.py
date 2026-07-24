@@ -15,6 +15,9 @@ from typing import Iterable
 
 GROUP_FIELDS = (
     "run_id",
+    "experiment",
+    "parameter",
+    "parameter_value",
     "workload",
     "workload_variant",
     "level",
@@ -25,14 +28,30 @@ GROUP_FIELDS = (
     "agent_ratio",
     "agent_workers",
     "background_workers",
+    "agent_count",
+    "worker_count",
     "cc_label",
     "cc_family",
     "source_system",
     "system",
     "cc",
+    "paper_switching",
+    "paper_priority",
+    "paper_performance_guards",
+    "paper_delayed_write_apply",
+    "paper_policy_mode",
+    "paper_policy_path",
+    "atcc_retry_cache_enabled",
+    "paper_deferred_replay_enabled",
+    "max_attempts",
+    "retry_budget",
+    "priority_quantum_scale",
+    "policy_invocation_ops",
+    "throughput_metric",
 )
 
 METRICS = (
+    "throughput",
     "total_tps",
     "agent_tps",
     "agent_task_tps",
@@ -59,6 +78,11 @@ METRICS = (
     "background_commit_rate",
     "agent_avg_tokens",
     "agent_total_tokens",
+    "agent_committed_reasoning_tokens",
+    "agent_wasted_reasoning_tokens",
+    "agent_tokens_per_committed_txn",
+    "agent_wasted_tokens_per_commit",
+    "agent_wasted_token_ratio",
     "agent_initial_reasoning_invocations",
     "agent_retry_reasoning_invocations",
     "agent_cached_retry_replays",
@@ -78,6 +102,7 @@ METRICS = (
     "background_aborts",
     "background_retries",
     "wasted_reasoning_ms",
+    "wasted_reasoning_ms_per_commit",
     "read_conflicts",
     "write_conflicts",
     "version_conflict_count",
@@ -142,12 +167,16 @@ METRICS = (
 )
 
 PRIMARY_SEED_METRICS = (
+    "throughput",
     "agent_tps",
     "total_tps",
     "background_tps",
     "agent_attempt_abort_rate",
     "agent_p99_latency_ms",
     "agent_total_tokens",
+    "agent_wasted_reasoning_tokens",
+    "agent_wasted_tokens_per_commit",
+    "agent_wasted_token_ratio",
     "agent_initial_reasoning_tokens",
     "agent_retry_reasoning_tokens",
     "agent_retry_cache_saved_tokens",
@@ -156,6 +185,7 @@ PRIMARY_SEED_METRICS = (
 
 SUM_ACROSS_SEEDS = {
     "agent_total_tokens",
+    "agent_wasted_reasoning_tokens",
     "agent_attempts",
     "agent_commits",
     "agent_aborts",
@@ -173,6 +203,10 @@ SUM_ACROSS_SEEDS = {
 }
 
 COMPARISON_FIELDS = (
+    "best_baseline_cc",
+    "best_baseline_throughput_mean",
+    "throughput_speedup_vs_best",
+    "throughput_gain_pct_vs_best",
     "best_agent_baseline_cc",
     "best_agent_baseline_agent_tps_mean",
     "agent_tps_speedup_vs_best",
@@ -187,10 +221,17 @@ COMPARISON_FIELDS = (
     "background_tps_gain_pct_vs_best",
     "abort_rate_delta_vs_best_agent_baseline",
     "p99_reduction_vs_best_agent_baseline",
+    "best_agent_baseline_wasted_tokens_per_commit_mean",
+    "wasted_tokens_reduction_factor_vs_best_agent_baseline",
+    "best_agent_baseline_wasted_reasoning_ms_per_commit_mean",
+    "wasted_reasoning_reduction_factor_vs_best_agent_baseline",
 )
 
 CURVE_FIELDS = (
     "previous_clients",
+    "throughput_ratio_vs_previous_client",
+    "throughput_change_pct_vs_previous_client",
+    "throughput_curve_drop_gt_10pct",
     "agent_tps_ratio_vs_previous_client",
     "agent_tps_change_pct_vs_previous_client",
     "agent_curve_drop_gt_10pct",
@@ -243,6 +284,10 @@ def aggregate(rows: Iterable[dict[str, str]]) -> list[dict[str, object]]:
         ok_rows = [row for row in group if str(row.get("status", "")).lower() == "ok"]
         seeds = sorted({str(row.get("seed", "")) for row in ok_rows}, key=seed_key)
         summary: dict[str, object] = {field: first.get(field, "") for field in GROUP_FIELDS}
+        summary["cc_label"] = system_label(first)
+        summary["cc_family"] = (
+            "atcc" if is_atcc(first) else "traditional"
+        )
         summary.update(
             {
                 "n_rows": len(group),
@@ -257,7 +302,11 @@ def aggregate(rows: Iterable[dict[str, str]]) -> list[dict[str, object]]:
             }
         )
         for metric in METRICS:
-            values = [value for row in ok_rows if (value := number(row.get(metric))) is not None]
+            values = [
+                value
+                for row in ok_rows
+                if (value := metric_value(row, metric)) is not None
+            ]
             metric_stats(summary, metric, values)
             if metric in SUM_ACROSS_SEEDS:
                 summary[f"{metric}_sum_across_seeds"] = fmt(sum(values)) if values else ""
@@ -287,19 +336,20 @@ def aggregate(rows: Iterable[dict[str, str]]) -> list[dict[str, object]]:
 
 
 def add_baseline_comparisons(rows: list[dict[str, object]]) -> None:
-    configs: dict[tuple[str, str, str], list[dict[str, object]]] = defaultdict(list)
+    configs: dict[tuple[str, ...], list[dict[str, object]]] = defaultdict(list)
     for row in rows:
         configs[config_key(row)].append(row)
         for field in COMPARISON_FIELDS:
             row[field] = ""
     for config_rows in configs.values():
-        atcc = next((row for row in config_rows if row.get("cc_family") == "atcc"), None)
-        baselines = [row for row in config_rows if row.get("cc_family") == "traditional"]
+        atcc = next((row for row in config_rows if is_atcc(row)), None)
+        baselines = [row for row in config_rows if not is_atcc(row)]
         if atcc is None or not baselines:
             continue
         best_agent = best_row(baselines, "agent_tps_mean")
         best_total = best_row(baselines, "total_tps_mean")
         best_background = best_row(baselines, "background_tps_mean")
+        add_speedup(atcc, "", best_agent, "throughput")
         add_speedup(atcc, "agent", best_agent, "agent_tps")
         add_speedup(atcc, "total", best_total, "total_tps")
         if number(atcc.get("background_workers")):
@@ -314,6 +364,20 @@ def add_baseline_comparisons(rows: list[dict[str, object]]) -> None:
             atcc["p99_reduction_vs_best_agent_baseline"] = fmt(
                 (baseline_p99 - atcc_p99) / baseline_p99
             )
+        add_reduction_factor(
+            atcc,
+            best_agent,
+            metric="agent_wasted_tokens_per_commit",
+            baseline_field="best_agent_baseline_wasted_tokens_per_commit_mean",
+            factor_field="wasted_tokens_reduction_factor_vs_best_agent_baseline",
+        )
+        add_reduction_factor(
+            atcc,
+            best_agent,
+            metric="wasted_reasoning_ms_per_commit",
+            baseline_field="best_agent_baseline_wasted_reasoning_ms_per_commit_mean",
+            factor_field="wasted_reasoning_reduction_factor_vs_best_agent_baseline",
+        )
 
 
 def add_speedup(
@@ -324,8 +388,9 @@ def add_speedup(
 ) -> None:
     atcc_value = number(atcc.get(f"{metric}_mean"))
     baseline_value = number(baseline.get(f"{metric}_mean"))
-    atcc[f"best_{prefix}_baseline_cc"] = baseline.get("cc_label", baseline.get("cc", ""))
-    atcc[f"best_{prefix}_baseline_{metric}_mean"] = fmt(baseline_value)
+    field_prefix = f"{prefix}_" if prefix else ""
+    atcc[f"best_{field_prefix}baseline_cc"] = system_label(baseline)
+    atcc[f"best_{field_prefix}baseline_{metric}_mean"] = fmt(baseline_value)
     if atcc_value is None or baseline_value in (None, 0.0):
         return
     speedup = atcc_value / baseline_value
@@ -333,27 +398,58 @@ def add_speedup(
     atcc[f"{metric}_gain_pct_vs_best"] = fmt((speedup - 1.0) * 100.0)
 
 
+def add_reduction_factor(
+    atcc: dict[str, object],
+    baseline: dict[str, object],
+    *,
+    metric: str,
+    baseline_field: str,
+    factor_field: str,
+) -> None:
+    atcc_value = number(atcc.get(f"{metric}_mean"))
+    baseline_value = number(baseline.get(f"{metric}_mean"))
+    atcc[baseline_field] = fmt(baseline_value)
+    if baseline_value in (None, 0.0) or atcc_value is None:
+        return
+    atcc[factor_field] = "inf" if atcc_value == 0.0 else fmt(
+        baseline_value / atcc_value
+    )
+
+
 def add_curve_diagnostics(rows: list[dict[str, object]]) -> None:
-    curves: dict[tuple[str, str, str], list[dict[str, object]]] = defaultdict(list)
+    curves: dict[tuple[str, ...], list[dict[str, object]]] = defaultdict(list)
     for row in rows:
         for field in CURVE_FIELDS:
             row[field] = ""
         curves[
             (
+                str(row.get("experiment", "")),
+                str(row.get("parameter", "")),
                 str(row.get("workload_variant", "")),
                 str(row.get("agent_ratio", "")),
-                str(row.get("cc_label", "")),
+                system_label(row),
             )
         ].append(row)
     for curve in curves.values():
-        curve.sort(key=lambda row: int(number(row.get("clients")) or 0))
+        curve.sort(
+            key=lambda row: number(row.get("parameter_value"))
+            if number(row.get("parameter_value")) is not None
+            else number(row.get("clients")) or 0
+        )
         for previous, current in zip(curve, curve[1:]):
             current["previous_clients"] = previous.get("clients", "")
-            for metric in ("agent_tps", "total_tps", "background_tps"):
+            for metric in ("throughput", "agent_tps", "total_tps", "background_tps"):
                 old = number(previous.get(f"{metric}_mean"))
                 new = number(current.get(f"{metric}_mean"))
                 ratio_value = new / old if new is not None and old not in (None, 0.0) else None
                 current[f"{metric}_ratio_vs_previous_client"] = fmt(ratio_value)
+                if metric == "throughput" and ratio_value is not None:
+                    current["throughput_change_pct_vs_previous_client"] = fmt(
+                        (ratio_value - 1.0) * 100.0
+                    )
+                    current["throughput_curve_drop_gt_10pct"] = str(
+                        ratio_value < 0.90
+                    ).lower()
                 if metric == "agent_tps" and ratio_value is not None:
                     current["agent_tps_change_pct_vs_previous_client"] = fmt(
                         (ratio_value - 1.0) * 100.0
@@ -412,11 +508,38 @@ def best_row(rows: list[dict[str, object]], metric: str) -> dict[str, object]:
     return max(rows, key=lambda row: number(row.get(metric)) or float("-inf"))
 
 
-def config_key(row: dict[str, object]) -> tuple[str, str, str]:
+def config_key(row: dict[str, object]) -> tuple[str, ...]:
     return (
+        str(row.get("experiment", "")),
+        str(row.get("parameter", "")),
+        str(row.get("parameter_value", "")),
         str(row.get("workload_variant", "")),
         str(row.get("agent_ratio", "")),
         str(row.get("clients", "")),
+        str(row.get("agent_count", "")),
+        str(row.get("worker_count", "")),
+    )
+
+
+def system_label(row: dict[str, object]) -> str:
+    explicit = str(row.get("cc_label", "") or "").strip()
+    if explicit:
+        return explicit
+    system = str(row.get("system", "") or "").strip()
+    cc = str(row.get("cc", "") or "").strip()
+    if system.lower() in {"cast-das", "castdas"} and cc:
+        return cc
+    return system or cc
+
+
+def is_atcc(row: dict[str, object]) -> bool:
+    family = str(row.get("cc_family", "") or "").strip().lower()
+    label = system_label(row).strip().lower()
+    cc = str(row.get("cc", "") or "").strip().lower()
+    return bool(
+        family == "atcc"
+        or label in {"aegis", "atcc"}
+        or cc.startswith("paper-atcc")
     )
 
 
@@ -425,16 +548,29 @@ def sort_key(row: dict[str, object]) -> tuple[object, ...]:
                 "tpcc_low_w100": 3, "tpcc_high_w1": 4}
     strategies = {"ATCC": 0, "OCC": 1, "2PL-wait-die": 2, "Silo": 3, "Polaris": 4}
     return (
+        str(row.get("experiment", "")),
+        str(row.get("parameter", "")),
+        number(row.get("parameter_value")) or 0.0,
         variants.get(str(row.get("workload_variant", "")), 99),
         int(number(row.get("clients")) or 0),
         -float(number(row.get("agent_ratio")) or 0.0),
-        strategies.get(str(row.get("cc_label", "")), 99),
+        strategies.get(system_label(row), 99),
     )
 
 
 def read_csv(path: Path) -> list[dict[str, str]]:
     with path.open(newline="", encoding="utf-8-sig") as handle:
         return list(csv.DictReader(handle))
+
+
+def metric_value(row: dict[str, object], metric: str) -> float | None:
+    if metric == "wasted_reasoning_ms_per_commit":
+        wasted = number(row.get("wasted_reasoning_ms"))
+        commits = number(row.get("agent_completed_tasks"))
+        if wasted is None or commits in (None, 0.0):
+            return None
+        return wasted / commits
+    return number(row.get(metric))
 
 
 def number(value: object) -> float | None:

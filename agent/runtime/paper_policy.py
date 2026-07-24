@@ -64,7 +64,6 @@ class CompiledPolicyEntry:
                 (self.blocked_bucket, bucket_log(state.blocked_time_ms), 1.0),
                 (self.retry_bucket, min(3, state.retry_count), 2.0),
                 (self.current_action, int(state.current_action), 4.0),
-                (self.priority_bucket, bucket_log(state.priority), 0.5),
                 (
                     0 if self.recent_conflict_kind == normalize_conflict_kind(state.recent_conflict_kind) else 1,
                     0,
@@ -190,39 +189,7 @@ class CompiledPhasePolicy:
             policy_group_key(state),
             (),
         )
-        supported = dict(
-            self.refinement_actor.get("group_action_support", {}) or {}
-        ).get(policy_group_key(state), ())
         features = state_features(state)
-        supported_candidates = tuple(
-            action
-            for action in (int(value) for value in supported)
-            if action in valid_actions(state.current_action)
-        )
-        if supported_candidates:
-            return LockAction(
-                LockClass(
-                    max(
-                        supported_candidates,
-                        key=lambda action: (
-                            sum(
-                                (
-                                    dot(actor_weights[bit_index], features)
-                                    + (
-                                        float(group_logits[bit_index])
-                                        if len(group_logits) > bit_index
-                                        else 0.0
-                                    )
-                                )
-                                * (1.0 if action & bit else -1.0)
-                                for bit_index, bit in enumerate((1, 2, 4, 8))
-                                if not int(state.current_action) & bit
-                            ),
-                            -action,
-                        ),
-                    )
-                )
-            )
         if self.refinement_actor.get("type") == "factorized-bernoulli-lock-bits":
             action = int(state.current_action) & 0xF
             for bit_index, bit in enumerate((1, 2, 4, 8)):
@@ -283,6 +250,44 @@ class CompiledPhasePolicy:
     @classmethod
     def load(cls, path: str | Path) -> "CompiledPhasePolicy":
         return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+
+
+class StaticThresholdPhasePolicy:
+    """Naive one-signal threshold baseline for the switching ablation.
+
+    Unlike the learned policy, this baseline does not inspect transaction
+    shape, reasoning cost, retry state, hotspot ratio, or queue state.  A
+    fixed global conflict-abort threshold switches observed hot writes from
+    OCC to pessimistic protection.  The action remains monotonic.
+    """
+
+    CONFLICT_ABORT_THRESHOLD = 0.20
+
+    def __init__(
+        self,
+        conflict_abort_threshold: float | None = None,
+        protection_mask: int = int(LockClass.HOT_WRITE),
+    ):
+        threshold = (
+            self.CONFLICT_ABORT_THRESHOLD
+            if conflict_abort_threshold is None
+            else float(conflict_abort_threshold)
+        )
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError("static conflict threshold must be in [0, 1]")
+        self.conflict_abort_threshold = threshold
+        self.protection_mask = LockClass(int(protection_mask) & 0xF)
+
+    def select(self, state: PhaseAwareState) -> LockAction:
+        current = LockClass(int(state.current_action) & 0xF)
+        selected = current
+        if (
+            str(state.phase) in {"refine", "commit"}
+            and float(state.global_conflict_abort_rate)
+            >= self.conflict_abort_threshold
+        ):
+            selected |= self.protection_mask
+        return LockAction(selected)
 
 
 class AtomicPolicyManager:
@@ -351,7 +356,6 @@ def _entry_key(entry: CompiledPolicyEntry) -> tuple[object, ...]:
         entry.blocked_bucket,
         entry.retry_bucket,
         entry.current_action,
-        entry.priority_bucket,
         entry.recent_conflict_kind,
         entry.active_bucket,
         entry.waiter_bucket,
@@ -384,7 +388,6 @@ def _state_key(state: PhaseAwareState) -> tuple[object, ...]:
         bucket_log(state.blocked_time_ms),
         min(3, state.retry_count),
         int(state.current_action),
-        bucket_log(state.priority),
         normalize_conflict_kind(state.recent_conflict_kind),
         bucket_size(state.global_active_transactions),
         bucket_size(state.global_waiter_count),
